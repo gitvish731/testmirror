@@ -1,109 +1,17 @@
-// perf/k6/vendor/handleSummary.js
-// Minimal, ES5-safe HTML summary (works with k6 v0.46+ without extended mode)
+// ---- thresholds: warn locally, enforce in CI ----
+const THRESHOLDS_ON = (__ENV.THRESHOLDS || 'true').toLowerCase() !== 'false';
 
-function pad2(n) { return (n < 10 ? '0' : '') + n; }
-function fmtDate(d) {
-  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
-         ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
-}
-function esc(s) { return String(s).replace(/[&<>"]/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]; }); }
-function fmtNum(n) { return (n == null || isNaN(n)) ? '-' : Number(n).toLocaleString(); }
-function fmtMs(n)  { return (n == null || isNaN(n)) ? '-' : Number(n).toFixed(1) + ' ms'; }
-
-// get percentile value from a trend metric (keys look like 'p(90)', 'p(95)', etc.)
-function pct(metric, key) {
-  if (!metric || !metric.values) return null;
-  return metric.values[key];
-}
-
-// try to read checks (pass/fail) – prefer root_group.checks if present
-function aggregateChecks(data) {
-  var passes = 0, fails = 0;
-  try {
-    var ch = (data.root_group && data.root_group.checks) ? data.root_group.checks : [];
-    for (var i = 0; i < ch.length; i++) {
-      passes += ch[i].passes || 0;
-      fails  += ch[i].fails  || 0;
-    }
-  } catch (e) {}
-  // fallback to metric "checks"
-  if (passes + fails === 0 && data.metrics && data.metrics.checks && data.metrics.checks.values) {
-    var v = data.metrics.checks.values;
-    passes = v.passes || 0; fails = v.fails || 0;
-  }
-  return { passes: passes, fails: fails };
-}
-
-// Build a simple table row
-function tr(cells) {
-  var t = '<tr>';
-  for (var i = 0; i < cells.length; i++) t += '<td>' + cells[i] + '</td>';
-  return t + '</tr>';
-}
-
-module.exports = function handleSummary(data) {
-  var now = new Date();
-  var title = 'SDLC Auto Gov Load Test – ' + fmtDate(now);
-
-  // Core metrics
-  var checksAgg = aggregateChecks(data);
-  var httpReqs  = (data.metrics && data.metrics.http_reqs && data.metrics.http_reqs.values) ? data.metrics.http_reqs.values.count : 0;
-  var durTrend  = (data.metrics) ? data.metrics.http_req_duration : null;
-
-  var p50  = pct(durTrend, 'med');
-  var p90  = pct(durTrend, 'p(90)');
-  var p95  = pct(durTrend, 'p(95)');
-  var p99  = pct(durTrend, 'p(99)');
-  var avg  = durTrend && durTrend.values ? durTrend.values.avg : null;
-  var min  = durTrend && durTrend.values ? durTrend.values.min : null;
-  var max  = durTrend && durTrend.values ? durTrend.values.max : null;
-
-  // Table: headline
-  var headline =
-    '<table>' +
-      tr(['Metric', 'Value']) +
-      tr(['Checks (pass/fail)', esc(fmtNum(checksAgg.passes) + ' / ' + fmtNum(checksAgg.fails))]) +
-      tr(['Requests', esc(fmtNum(httpReqs))]) +
-      tr(['Latency p95', esc(fmtMs(p95))]) +
-    '</table>';
-
-  // Latency table
-  var latTable =
-    '<h3>Latency (http_req_duration)</h3>' +
-    '<table>' +
-      tr(['avg', esc(fmtMs(avg))]) +
-      tr(['min', esc(fmtMs(min))]) +
-      tr(['p50/median', esc(fmtMs(p50))]) +
-      tr(['p90', esc(fmtMs(p90))]) +
-      tr(['p95', esc(fmtMs(p95))]) +
-      tr(['p99', esc(fmtMs(p99))]) +
-      tr(['max', esc(fmtMs(max))]) +
-    '</table>';
-
-  // Raw JSON (collapsible)
-  var raw =
-    '<details><summary>Raw JSON</summary><pre>' + esc(JSON.stringify(data, null, 2)) + '</pre></details>';
-
-  var html =
-    '<!doctype html><html><head><meta charset="utf-8">' +
-    '<title>' + esc(title) + '</title>' +
-    '<style>' +
-      'body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.35;margin:24px;}' +
-      'h1{margin:0 0 16px;font-size:20px}' +
-      'table{border-collapse:collapse;margin:16px 0;min-width:380px}' +
-      'td{border:1px solid #ddd;padding:6px 10px;font-size:13px}' +
-      'td:first-child{background:#fafafa;font-weight:600;white-space:nowrap}' +
-      'details{margin-top:16px}' +
-      'pre{background:#111;color:#ddd;padding:12px;border-radius:6px;overflow:auto}' +
-    '</style>' +
-    '</head><body>' +
-      '<h1>' + esc(title) + '</h1>' +
-      headline +
-      latTable +
-      raw +
-    '</body></html>';
-
-  return {
-    'perf/k6/reports/summary.html': html
-  };
+const localishThresholds = {
+  http_req_failed:   [{ threshold: 'rate<0.05',   abortOnFail: false }], // warn if >5% errors
+  http_req_duration: [{ threshold: 'p(95)<60000', abortOnFail: false }], // warn if p95 > 60s
 };
+
+export const options = {
+  // keep your existing scenarios/executors here
+  thresholds: THRESHOLDS_ON ? localishThresholds : {},
+};
+
+
+//----------------------
+
+THRESHOLDS=false k6 run perf/k6/scenarios/from-playwright.http.js
