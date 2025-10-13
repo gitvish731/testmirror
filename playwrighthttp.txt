@@ -1,126 +1,298 @@
-// perf/k6/vendor/handleSummary.js
-export function handleSummary(data) {
-  // ----- ES5 helpers -----
-  function pad(n){return (n<10?"0":"")+n;}
-  function nowStamp(){
-    var d=new Date();
-    return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+
-           pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
-  }
-  function metric(name){ return (data && data.metrics && data.metrics[name]) ? data.metrics[name] : null; }
-  function valuesOf(name){ var m=metric(name); return (m&&m.values)?m.values:{}; }
-  function num(v, def){ return (typeof v==="number")?v:def; }
-  function fmt(n, d){ if(typeof n!=="number") return "n/a"; var f=(typeof d==="number")?d:0; return n.toFixed(f); }
-  function bytes(n){
-    if(typeof n!=="number") return "n/a";
-    var u=["B","KB","MB","GB"]; var i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;}
-    return n.toFixed(1)+" "+u[i];
-  }
+/* perf/k6/vendor/handleSummary.js — HTML report w/ inline charts + sortable tables */
 
-  var ts = nowStamp();
+function pad2(n){return String(n).padStart(2,'0');}
+function fmtPct(x){return (x*100).toFixed(2)+'%';}
+function fmtMs(x){return `${Number(x).toFixed(1)} ms`;}
+function nowStamp(){const d=new Date();return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;}
+function parseTagKey(key){const i=key.indexOf('{');if(i<0)return{base:key,tags:{}};const base=key.slice(0,i);const inside=key.slice(i+1,-1);const tags={};inside.split(',').forEach(p=>{const j=p.indexOf(':');if(j>0){const k=p.slice(0,j).trim();const v=p.slice(j+1).trim();tags[k]=v;}});return{base,tags};}
+function val(metric,key){return metric&&metric.values&&key in metric.values?metric.values[key]:undefined;}
+function num0(x){return(typeof x==='number'&&isFinite(x))?x:0;}
 
-  // checks (prefer metric, fallback to root_group)
-  var checksV = valuesOf("checks");
-  var pass = num(checksV.passes, 0);
-  var fail = num(checksV.fails, 0);
-  if(pass===0 && fail===0 && data.root_group && data.root_group.checks){
-    if(typeof data.root_group.checks.passes!=="undefined") pass = Number(data.root_group.checks.passes);
-    if(typeof data.root_group.checks.fails!=="undefined")  fail = Number(data.root_group.checks.fails);
-  }
-  var passRate = (pass+fail)>0 ? (pass/(pass+fail))*100 : 0;
+// --- tiny SVG helpers
+function svgBar(value,max,opts={}){const width=opts.width??120,height=opts.height??8,bg=opts.bg??'#e5e7eb',fg=opts.fg??'#60a5fa';const ratio=max>0?Math.max(0,Math.min(1,value/max)):0;const w=Math.round(width*ratio);return `
+<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="${width}" height="${height}" rx="${height/2}" fill="${bg}"/>
+  <rect x="0" y="0" width="${w}" height="${height}" rx="${height/2}" fill="${fg}"/>
+</svg>`;}
+function svgSpark(values,opts={}){const width=opts.width??120,height=opts.height??28,stroke=opts.stroke??'#60a5fa',fill=opts.fill??'none',bg=opts.bg??'#f3f4f6';if(!values||!values.length){return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="${width}" height="${height}" fill="${bg}"/></svg>`;}const min=Math.min(...values),max=Math.max(...values),span=max-min||1,step=values.length>1?width/(values.length-1):width;let d='';for(let i=0;i<values.length;i++){const x=Math.round(i*step);const y=Math.round(height-((values[i]-min)/span)*height);d+=(i===0?'M':'L')+x+' '+y+' ';}return `
+<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="${width}" height="${height}" fill="${bg}"/>
+  <path d="${d.trim()}" stroke="${stroke}" stroke-width="2" fill="${fill}" />
+</svg>`;}
 
-  // requests / rps
-  var httpReqs = valuesOf("http_reqs");
-  var requests = num(httpReqs.count, 0);
-  var rps      = num(httpReqs.rate, 0);
+export default function handleSummary(data){
+  // Overall
+  const checks=data.metrics['checks'];
+  const httpReqs=data.metrics['http_reqs'];
+  const httpDur=data.metrics['http_req_duration'];
+  const httpTTFB=data.metrics['http_req_waiting'];
 
-  // failures
-  var httpFailed = valuesOf("http_req_failed");
-  var failRate   = num(httpFailed.rate, 0)*100;
+  const passes=num0(val(checks,'passes'));
+  const fails=num0(val(checks,'fails'));
+  const reqCount=num0(val(httpReqs,'count'));
+  const rps=num0(val(httpReqs,'rate'));
+  const p90=num0(val(httpDur,'p(90)'));
+  const p95=num0(val(httpDur,'p(95)'));
+  const p99=num0(val(httpDur,'p(99)'));
+  const ttfbP95=num0(val(httpTTFB,'p(95)'));
+  const vusMax=num0(val(data.metrics['vus_max'],'value'));
+  const iters=num0(val(data.metrics['iterations'],'count'));
+  const sentKB=num0(val(data.metrics['data_sent'],'count'))/1024;
+  const recvKB=num0(val(data.metrics['data_received'],'count'))/1024;
 
-  // vu / iterations
-  var vusMax     = num((valuesOf("vus_max")).max, 0);
-  var iterations = num((valuesOf("iterations")).count, 0);
+  // Build per-feature / per-endpoint using tags
+  const perFeature={};           // feature -> { reqs, p95s[], passes, fails }
+  const perEndpoint=[];          // { feature, endpoint, reqs, avg, p95, p99, failRate }
 
-  // data sent/received
-  var sentBytes = num((valuesOf("data_sent")).count, 0);
-  var recvBytes = num((valuesOf("data_received")).count, 0);
+  for(const [key,metric] of Object.entries(data.metrics)){
+    if(!key.startsWith('http_req_duration{') && !key.startsWith('http_reqs{') && !key.startsWith('checks{')) continue;
+    const {base,tags}=parseTagKey(key);
+    if(!tags.feature||!tags.endpoint) continue;
 
-  // latency (http_req_duration)
-  var dV = valuesOf("http_req_duration");
-  var dAvg = num(dV.avg, undefined);
-  var dMin = num(dV.min, undefined);
-  var dMax = num(dV.max, undefined);
-  var dP90 = num(dV["p(90)"], undefined);
-  var dP95 = num(dV["p(95)"], undefined);
-  var dP99 = num(dV["p(99)"], undefined);
+    if(!perFeature[tags.feature]) perFeature[tags.feature]={reqs:0,p95s:[],passes:0,fails:0};
 
-  // waiting (TTFB)
-  var wV = valuesOf("http_req_waiting");
-  var wAvg = num(wV.avg, undefined);
-  var wP95 = num(wV["p(95)"], undefined);
-
-  // mini SVGs
-  function passFailBar(passCount, failCount, width){
-    var total = passCount + failCount; if(total<=0) total=1;
-    var w = width||380, h=14, pw = Math.round((passCount/total)*w), fw = w - pw;
-    return '<svg width="'+w+'" height="'+h+'" xmlns="http://www.w3.org/2000/svg">'+
-           '<rect width="'+pw+'" height="'+h+'" fill="#2ca02c"/>'+
-           '<rect x="'+pw+'" width="'+fw+'" height="'+h+'" fill="#d62728"/>'+
-           '</svg>';
-  }
-  function durationRuler(min, p90, p95, p99, max, width){
-    if(typeof max!=="number" || max<=0) return "<em>n/a</em>";
-    var w = width||420, h=22, scale = function(x){ return Math.max(0, Math.min(w, Math.round((x/max)*w))); };
-    var mx = scale(max), mn = scale(num(min,0)), p90x = scale(p90||0), p95x=scale(p95||0), p99x=scale(p99||0);
-    return '<svg width="'+w+'" height="'+h+'" xmlns="http://www.w3.org/2000/svg">'+
-           '<rect x="0" y="8" width="'+mx+'" height="6" fill="#eee" stroke="#ccc"/>'+
-           '<line x1="'+p90x+'" y1="6" x2="'+p90x+'" y2="20" stroke="#1f77b4" stroke-width="2"/>'+
-           '<line x1="'+p95x+'" y1="4" x2="'+p95x+'" y2="22" stroke="#ff7f0e" stroke-width="2"/>'+
-           '<line x1="'+p99x+'" y1="2" x2="'+p99x+'" y2="20" stroke="#d62728" stroke-width="2"/>'+
-           '<circle cx="'+mn+'" cy="11" r="2" fill="#555"/>'+
-           '<circle cx="'+mx+'" cy="11" r="2" fill="#555"/>'+
-           '</svg>'+
-           '<div style="font-size:12px;margin-top:2px;">'+
-           'min '+fmt(min,1)+' ms &nbsp; p90 '+fmt(p90,1)+' ms &nbsp; p95 '+fmt(p95,1)+' ms &nbsp; p99 '+fmt(p99,1)+' ms &nbsp; max '+fmt(max,1)+' ms'+
-           '</div>';
+    if(base==='http_reqs'){
+      const c=num0(val(metric,'count'));
+      perFeature[tags.feature].reqs+=c;
+      let row=perEndpoint.find(r=>r.feature===tags.feature&&r.endpoint===tags.endpoint);
+      if(!row) perEndpoint.push(row={feature:tags.feature,endpoint:tags.endpoint,reqs:0,avg:0,p95:0,p99:0,failRate:0});
+      row.reqs+=c;
+    }
+    if(base==='http_req_duration'){
+      const avgV=num0(val(metric,'avg'));
+      const p95V=num0(val(metric,'p(95)'));
+      const p99V=num0(val(metric,'p(99)'));
+      let row=perEndpoint.find(r=>r.feature===tags.feature&&r.endpoint===tags.endpoint);
+      if(!row) perEndpoint.push(row={feature:tags.feature,endpoint:tags.endpoint,reqs:0,avg:0,p95:0,p99:0,failRate:0});
+      row.avg=avgV||row.avg; row.p95=p95V||row.p95; row.p99=p99V||row.p99;
+      perFeature[tags.feature].p95s.push(p95V);
+    }
+    if(base==='checks'){
+      const p=num0(val(metric,'passes'));
+      const f=num0(val(metric,'fails'));
+      perFeature[tags.feature].passes+=p; perFeature[tags.feature].fails+=f;
+      let row=perEndpoint.find(r=>r.feature===tags.feature&&r.endpoint===tags.endpoint);
+      if(!row) perEndpoint.push(row={feature:tags.feature,endpoint:tags.endpoint,reqs:0,avg:0,p95:0,p99:0,failRate:0});
+      const total=p+f; row.failRate=total?(f/total):row.failRate;
+    }
   }
 
-  var ts = nowStamp();
-  var txt = "\n=== k6 summary @ "+ts+" ===\n";
-  txt += "checks: pass="+pass+" fail="+fail+" ("+fmt(passRate,1)+"%)\n";
-  txt += "requests: "+requests+"  rps="+fmt(rps,2)+"  failures="+fmt(failRate,2)+"%\n";
-  txt += "http_req_duration: avg="+fmt(dAvg,1)+"ms p95="+fmt(dP95,1)+"ms max="+fmt(dMax,1)+"ms\n";
-  txt += "vus_max: "+vusMax+"  iterations: "+iterations+"\n";
+  const perFeatureRows=Object.entries(perFeature).map(([feature,v])=>{
+    const p95agg=v.p95s.length?(v.p95s.reduce((a,b)=>a+b,0)/v.p95s.length):0;
+    const totalChecks=v.passes+v.fails;
+    const failRate=totalChecks?(v.fails/totalChecks):0;
+    return {feature,reqs:v.reqs,p95:p95agg,failRate,spark:v.p95s.slice(0,40)};
+  });
 
-  var html = "<!doctype html><html><head><meta charset=\"utf-8\">"+
-    "<title>SDLC Auto Gov Load Test - "+ts+"</title>"+
-    "<style>body{font-family:system-ui,Arial,sans-serif;padding:16px;color:#222}h1,h2{margin:0 0 8px}table{border-collapse:collapse;margin-top:10px}td,th{border:1px solid #ddd;padding:6px 10px}th{background:#f8f8f8;text-align:left}small{color:#666}</style>"+
-    "</head><body>"+
-    "<h2>SDLC Auto Gov Load Test – "+ts+"</h2>"+
-    "<table>"+
-      "<tr><th>Checks</th><td>"+pass+" pass / "+fail+" fail ("+fmt(passRate,1)+"%)</td><td>"+passFailBar(pass, fail, 320)+"</td></tr>"+
-      "<tr><th>Requests</th><td colspan=\"2\">"+requests+" total &nbsp; · &nbsp; RPS "+fmt(rps,2)+" &nbsp; · &nbsp; Fail rate "+fmt(failRate,2)+"%</td></tr>"+
-      "<tr><th>Latency (http_req_duration)</th><td colspan=\"2\">avg "+fmt(dAvg,1)+" ms</td></tr>"+
-      "<tr><th></th><td colspan=\"2\">"+ durationRuler(dMin, dP90, dP95, dP99, dMax, 420) +"</td></tr>"+
-      "<tr><th>Waiting (TTFB)</th><td colspan=\"2\">avg "+fmt(wAvg,1)+" ms &nbsp; · &nbsp; p95 "+fmt(wP95,1)+" ms</td></tr>"+
-      "<tr><th>VUs / Iterations</th><td colspan=\"2\">vus_max "+vusMax+" &nbsp; · &nbsp; iterations "+iterations+"</td></tr>"+
-      "<tr><th>Traffic</th><td colspan=\"2\">sent "+bytes(sentBytes)+" &nbsp; · &nbsp; received "+bytes(recvBytes)+"</td></tr>"+
-    "</table>"+
-    "<h3>Raw JSON</h3><pre>"+JSON.stringify(data, null, 2)+"</pre>"+
-    "</body></html>";
+  // sort endpoints default by feature asc + reqs desc
+  perEndpoint.sort((a,b)=>a.feature.localeCompare(b.feature)||b.reqs-a.reqs);
+  const maxP95Endpoint=perEndpoint.reduce((m,r)=>Math.max(m,r.p95||0),0);
+
+  const title=`SDLC Auto Gov Load Test — ${nowStamp()}`;
+
+  // Inline sorter script (no deps)
+  const sorterJS=`
+(function(){
+  function getCellVal(td){
+    const v = (td.getAttribute('data-sort') ?? td.textContent).trim();
+    if(v.endsWith(' ms')) return parseFloat(v);
+    if(v.endsWith('%')) return parseFloat(v);
+    if(/^-?\\d+(?:\\.\\d+)?$/.test(v)) return parseFloat(v);
+    return v.toLowerCase();
+  }
+  function makeSortable(tableId){
+    const table=document.getElementById(tableId); if(!table) return;
+    const ths=table.tHead.querySelectorAll('th');
+    ths.forEach((th,idx)=>{
+      th.style.cursor='pointer';
+      th.addEventListener('click',()=>{
+        const tbody=table.tBodies[0];
+        const rows=[...tbody.querySelectorAll('tr')];
+        const dir=th.getAttribute('data-dir')==='asc'?'desc':'asc';
+        ths.forEach(h=>h.removeAttribute('data-dir'));
+        th.setAttribute('data-dir',dir);
+        const mult=dir==='asc'?1:-1;
+        rows.sort((r1,r2)=>{
+          const v1=getCellVal(r1.children[idx]);
+          const v2=getCellVal(r2.children[idx]);
+          if(typeof v1==='number' && typeof v2==='number') return (v1-v2)*mult;
+          return v1.localeCompare(v2)*mult;
+        });
+        rows.forEach(r=>tbody.appendChild(r));
+      });
+    });
+  }
+  makeSortable('tbl-features');
+  makeSortable('tbl-endpoints');
+})();`;
+
+  const html=`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>${title}</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}
+    h1{font-weight:600;margin:0 0 16px}
+    h2{margin:20px 0 8px}
+    .kpis{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:12px;margin:16px 0 24px}
+    .card{border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,0.04)}
+    .label{color:#6b7280;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+    .value{font-size:18px;font-weight:600;margin-top:6px}
+    .bar{height:6px;border-radius:4px;background:linear-gradient(90deg,#22c55e,#16a34a);margin-top:8px}
+    table{border-collapse:collapse;width:100%;margin:6px 0 18px}
+    th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px;vertical-align:middle}
+    th{background:#f9fafb;color:#374151;position:sticky;top:0}
+    th[data-dir="asc"]::after{content:" \\25B2";color:#6b7280}
+    th[data-dir="desc"]::after{content:" \\25BC";color:#6b7280}
+    .muted{color:#6b7280;font-size:12px}
+    .right{text-align:right;white-space:nowrap}
+    .pill{display:inline-block;padding:2px 8px;border-radius:9999px;background:#eef2ff;color:#3730a3;font-size:12px}
+    .mini{display:flex;align-items:center;gap:8px}
+    .mini .num{width:90px;text-align:right;color:#374151}
+  </style>
+</head>
+<body>
+  <h1>${title}</h1>
+
+  <div class="kpis">
+    <div class="card">
+      <div class="label">Checks (pass/fail)</div>
+      <div class="value">${passes} / ${fails} (${fmtPct(passes/Math.max(passes+fails,1))})</div>
+      <div class="bar"></div>
+    </div>
+    <div class="card">
+      <div class="label">Requests / RPS</div>
+      <div class="value">${reqCount} total • ${rps.toFixed(2)} rps</div>
+      <div class="muted">Iterations: ${iters} • VUs max: ${vusMax}</div>
+    </div>
+    <div class="card">
+      <div class="label">Latency (p90 / p95 / p99)</div>
+      <div class="value">${fmtMs(p90)} / ${fmtMs(p95)} / ${fmtMs(p99)}</div>
+      <div class="muted">TTFB p95: ${fmtMs(ttfbP95)} • Traffic: sent ${sentKB.toFixed(1)} KB, recv ${recvKB.toFixed(1)} KB</div>
+    </div>
+  </div>
+
+  <h2>Per Feature</h2>
+  <table id="tbl-features">
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th class="right">Requests</th>
+        <th>Latency p95 (spark)</th>
+        <th class="right">Fail&nbsp;rate</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${perFeatureRows.map(r=>`
+        <tr>
+          <td data-sort="${r.feature.toLowerCase()}"><span class="pill">${r.feature}</span></td>
+          <td class="right" data-sort="${r.reqs}">${r.reqs}</td>
+          <td data-sort="${r.p95}">
+            <div class="mini">
+              ${svgBar(r.p95, Math.max(p95, maxP95Endpoint))}
+              <span class="num">${fmtMs(r.p95)}</span>
+            </div>
+            <div class="muted">${svgSpark(r.spark)}</div>
+          </td>
+          <td class="right" data-sort="${r.failRate}">
+            <div class="mini">
+              ${svgBar(r.failRate,1,{fg:'#f59e0b'})}
+              <span class="num">${fmtPct(r.failRate)}</span>
+            </div>
+          </td>
+        </tr>
+      `).join('')}
+    </tbody>
+  </table>
+
+  <h2>Per Endpoint</h2>
+  <table id="tbl-endpoints">
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th>Endpoint</th>
+        <th class="right">Requests</th>
+        <th>Latency p95</th>
+        <th class="right">Avg</th>
+        <th class="right">p99</th>
+        <th>Fail rate</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${perEndpoint.map(r=>`
+        <tr>
+          <td data-sort="${r.feature.toLowerCase()}"><span class="pill">${r.feature}</span></td>
+          <td data-sort="${r.endpoint.toLowerCase()}">${r.endpoint}</td>
+          <td class="right" data-sort="${r.reqs}">${r.reqs}</td>
+          <td data-sort="${r.p95}">
+            <div class="mini">
+              ${svgBar(r.p95, maxP95Endpoint)}
+              <span class="num">${fmtMs(r.p95)}</span>
+            </div>
+          </td>
+          <td class="right" data-sort="${r.avg}">${fmtMs(r.avg)}</td>
+          <td class="right" data-sort="${r.p99}">${fmtMs(r.p99)}</td>
+          <td data-sort="${r.failRate}">
+            <div class="mini">
+              ${svgBar(r.failRate,1,{fg:'#f59e0b'})}
+              <span class="num">${fmtPct(r.failRate)}</span>
+            </div>
+          </td>
+        </tr>
+      `).join('')}
+    </tbody>
+  </table>
+
+  <h3>Raw JSON</h3>
+  <pre class="muted">${JSON.stringify(data,null,2)}</pre>
+
+  <script>${sorterJS}</script>
+</body>
+</html>
+  `;
 
   return {
-    stdout: txt,
-    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
-    "perf/k6/reports/summary.html": html
+    'perf/k6/reports/summary.html': html,
+    'perf/k6/reports/summary.json': JSON.stringify(data,null,2),
   };
 }
 
 
+//------------------------------------------------------------------------
 
-//--------------------------------------------------------------
+for (const ep of endpoints) {
+  const tags = { feature, endpoint: ep.name }; // 👈 tag each request & check
 
-import { handleSummary as _handleSummary } from '../vendor/handleSummary.js';
-export { _handleSummary as handleSummary };
+  if (ep.method === 'GET') {
+    const res = http.get(ep.url, { headers, tags });
+    check(
+      res,
+      {
+        'status ok': (r) => r.status === (ep.expectStatus || 200),
+        'body has text': (r) =>
+          !ep.expectText || r.body.includes(ep.expectText),
+      },
+      tags // 👈 important: pass tags here too
+    );
+
+  } else {
+    // POST / PUT / PATCH / DELETE
+    const res = http.request(ep.method, ep.url, ep.body || null, {
+      headers,
+      tags,
+    });
+    check(
+      res,
+      {
+        'status ok': (r) => r.status === (ep.expectStatus || 200),
+        'body has text': (r) =>
+          !ep.expectText || r.body.includes(ep.expectText),
+      },
+      tags
+    );
+  }
+}
+
 
