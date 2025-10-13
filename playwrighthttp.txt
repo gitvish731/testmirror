@@ -1,42 +1,34 @@
 /* k6 runtime imports (CommonJS-friendly) */
 const http = require('k6/http');
 const { check, sleep } = require('k6');
-const reporter = require('../vendor/handleSummary.js'); // expects module.exports = { handleSummary }
-const openFile = open; // k6 global 'open' (reads local files)
+const reporter = require('../vendor/handleSummary.js'); // module.exports = { handleSummary }
+const openFile = open; // k6 global 'open'
 
 /* ===== 1) Load endpoints map (JSON first, TS fallback) ===== */
 let ENDPOINTS_BY_FEATURE = {};
 try {
   ENDPOINTS_BY_FEATURE = JSON.parse(openFile('../sources/endpoints.byFeature.json'));
-} catch (_) {
-  // Fallback to require() if you ever need it (kept for safety)
+} catch (e) {
   ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
 }
 
-/* ===== 2) Env controls =====
-   FEATURES: comma separated feature names (exact, case-sensitive) — default all
-   ENDPOINT_FILTER: substring filter on endpoint name (optional)
-   BASE_URL: if provided, will replace the original host in each URL
-   TOKEN: bearer token to use for POST/PATCH/DELETE (process.env.token style)
-   RPS, DURATION, PREALLOC, MAXVUS: load shape knobs
-   THRESHOLDS_ON: 'false' to disable default thresholds
-*/
+/* ===== 2) Env controls ===== */
 const ENV = __ENV || {};
 const FEATURE_NAMES = (ENV.FEATURES || '')
   .split(',')
-  .map(s => s.trim())
+  .map(function (s) { return s.trim(); })
   .filter(Boolean);
 
 const ENDPOINT_FILTER = (ENV.ENDPOINT_FILTER || '').trim();
 const BASE_URL = (ENV.BASE_URL || '').trim();
-const TOKEN = ENV.token || ENV.TOKEN || '';   // keep parity with playwright env
+const TOKEN = ENV.token || ENV.TOKEN || '';
 const RPS = Number(ENV.RPS || 1);
 const DURATION = ENV.DURATION || '30s';
 const PREALLOC = Number(ENV.PREALLOC || 6);
 const MAXVUS = Number(ENV.MAXVUS || 60);
 const THRESHOLDS_ON = String(ENV.THRESHOLDS_ON || 'true').toLowerCase() !== 'false';
 
-/* ===== 3) Options (single scenario; simple + robust) ===== */
+/* ===== 3) Options ===== */
 export const options = {
   scenarios: {
     console: {
@@ -51,127 +43,102 @@ export const options = {
   },
   thresholds: THRESHOLDS_ON
     ? {
-        http_req_failed: ['rate<0.20'],          // relax or tune as you wish
-        http_req_duration: ['p(95)<60000'],      // 95th percentile under 60s
+        http_req_failed: ['rate<0.20'],
+        http_req_duration: ['p(95)<60000'],
       }
     : {},
 };
 
-/* ===== 4) Small helpers ===== */
+/* ===== 4) Helpers ===== */
 function replaceBase(urlStr) {
   if (!BASE_URL) return urlStr;
   try {
-    const u = new URL(urlStr);
-    const base = new URL(BASE_URL);
+    var u = new URL(urlStr);
+    var base = new URL(BASE_URL);
     u.protocol = base.protocol;
     u.host = base.host;
     return u.toString();
-  } catch (_) {
+  } catch (e) {
     return urlStr;
   }
 }
 
 function minifyBody(body) {
   if (body == null) return null;
-  const s = String(body).trim();
+  var s = String(body).trim();
   if (!s) return null;
-  // try JSON minify if possible, else just trimmed text
   try {
     return JSON.stringify(JSON.parse(s));
-  } catch {
+  } catch (e) {
     return s.replace(/\s+/g, ' ');
   }
 }
 
 function buildHeaders(method) {
-  // GET: no Content-Type, no Authorization
   if (method === 'GET') return {};
-  const h = { 'Content-Type': 'application/json' };
-  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
+  var h = { 'Content-Type': 'application/json' };
+  if (TOKEN) h.Authorization = 'Bearer ' + TOKEN;
   return h;
 }
 
 /* ===== 5) Select feature(s) & endpoints ===== */
 function selectedEndpoints() {
-  let featuresToUse = FEATURE_NAMES.length
-    ? FEATURE_NAMES
-    : Object.keys(ENDPOINTS_BY_FEATURE);
-
-  const list = [];
-  for (let i = 0; i < featuresToUse.length; i += 1) {
-    const feature = featuresToUse[i];
-    const eps = ENDPOINTS_BY_FEATURE[feature] || [];
-    for (let j = 0; j < eps.length; j += 1) {
-      const ep = eps[j];
+  var featuresToUse = FEATURE_NAMES.length ? FEATURE_NAMES : Object.keys(ENDPOINTS_BY_FEATURE);
+  var list = [];
+  for (var i = 0; i < featuresToUse.length; i += 1) {
+    var feature = featuresToUse[i];
+    var eps = ENDPOINTS_BY_FEATURE[feature] || [];
+    for (var j = 0; j < eps.length; j += 1) {
+      var ep = eps[j];
       if (ENDPOINT_FILTER && String(ep.name).indexOf(ENDPOINT_FILTER) === -1) continue;
-      list.push({ feature, ep });
+      list.push({ feature: feature, ep: ep });
     }
   }
   console.log(
-    `Selected ${list.length} endpoint(s) across FEATURES: ${featuresToUse.join(', ')}`
+    'Selected ' + list.length + ' endpoint(s) across FEATURES: ' + featuresToUse.join(', ')
   );
   return list;
 }
 
-/* ===== 6) Runner (tags added to requests & checks) ===== */
+/* ===== 6) Runner (tags on requests & checks) ===== */
 export default function () {
-  const entries = selectedEndpoints();
-  if (!entries.length) {
-    // nothing to do; avoid spinning
-    sleep(1);
-    return;
-  }
+  var entries = selectedEndpoints();
+  if (!entries.length) { sleep(1); return; }
 
-  // Walk a bounded slice so one VU iteration doesn’t attempt everything at once.
-  // This keeps constant-arrival-rate stable while still sampling many endpoints.
-  const sliceSize = Math.min(10, entries.length);
-  for (let i = 0; i < sliceSize; i += 1) {
-    const pair = entries[(i + __ITER) % entries.length];
-    const feature = pair.feature;
-    const ep = pair.ep;
+  var sliceSize = Math.min(10, entries.length);
+  for (var i = 0; i < sliceSize; i += 1) {
+    var pair = entries[(i + __ITER) % entries.length];
+    var feature = pair.feature;
+    var ep = pair.ep;
 
-    const url = replaceBase(ep.url);
-    const method = (ep.method || 'GET').toUpperCase();
-    const headers = buildHeaders(method);
-    const tags = { feature, endpoint: String(ep.name || `${method} ${url}`) };
+    var url = replaceBase(ep.url);
+    var method = (ep.method || 'GET').toUpperCase();
+    var headers = buildHeaders(method);
+    var tags = { feature: feature, endpoint: String(ep.name || (method + ' ' + url)) };
 
-    let body = minifyBody(ep.body);
-    let res;
-
+    var body = minifyBody(ep.body);
+    var res;
     if (method === 'GET') {
-      // GET: headers only, no body, with tags
-      res = http.get(url, { headers, tags });
+      res = http.get(url, { headers: headers, tags: tags });
     } else {
-      // POST / PUT / PATCH / DELETE via http.request to keep one path
-      res = http.request(method, url, body, { headers, tags });
+      res = http.request(method, url, body, { headers: headers, tags: tags });
     }
 
-    // expectations
-    const expectStatus = ep.expect && typeof ep.expect.status === 'number'
-      ? ep.expect.status
-      : 200;
+    var expectStatus = (ep.expect && typeof ep.expect.status === 'number') ? ep.expect.status : 200;
+    var mustContain = (ep.expect && typeof ep.expect.text === 'string') ? ep.expect.text : null;
 
-    const mustContain = ep.expect && typeof ep.expect.text === 'string'
-      ? ep.expect.text
-      : null;
-
-    // checks with tags (so summary can group them)
-    const ok1 = check(res, { 'status ok': (r) => r.status === expectStatus }, tags);
+    check(res, { 'status ok': function (r) { return r.status === expectStatus; } }, tags);
 
     if (mustContain) {
-      // normalize to string for safety
-      const text = String(res && res.body ? res.body : '');
-      // simple substring check
-      check(res, { 'body has text': () => text.indexOf(mustContain) !== -1 }, tags);
+      var text = String(res && res.body ? res.body : '');
+      check(res, { 'body has text': function () { return text.indexOf(mustContain) !== -1; } }, tags);
     }
 
-    // small pause to avoid hammering same endpoint in one iteration
     sleep(0.1);
   }
 }
 
 /* ===== 7) HTML report hook ===== */
 export function handleSummary(data) {
-  // The vendor module returns { 'perf/k6/reports/summary.html': htmlString, stdout?: string }
   return reporter.handleSummary(data);
 }
