@@ -1,61 +1,60 @@
 export function handleSummary(data) {
   // ---- helpers ----
-  const pad = (n) => (n < 10 ? "0" : "") + n;
-  const d = new Date();
-  const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  var d = new Date();
+  var ts = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+           " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
 
-  // ---- metrics (robust across k6 versions) ----
-  const m = data.metrics || {};
+  var m = data && data.metrics ? data.metrics : {};
 
   // checks: prefer metrics.checks.values, fallback to root_group.checks
-  const checksValues = (m.checks && m.checks.values) || {};
-  let pass = Number(checksValues.passes ?? 0);
-  let fail = Number(checksValues.fails  ?? 0);
+  var checksValues = (m.checks && m.checks.values) ? m.checks.values : {};
+  var pass = (typeof checksValues.passes !== "undefined") ? Number(checksValues.passes) : 0;
+  var fail = (typeof checksValues.fails  !== "undefined") ? Number(checksValues.fails)  : 0;
   if (pass === 0 && fail === 0 && data.root_group && data.root_group.checks) {
-    pass = Number(data.root_group.checks.passes ?? 0);
-    fail = Number(data.root_group.checks.fails  ?? 0);
+    if (typeof data.root_group.checks.passes !== "undefined") pass = Number(data.root_group.checks.passes);
+    if (typeof data.root_group.checks.fails  !== "undefined") fail = Number(data.root_group.checks.fails);
   }
 
-  // requests: prefer http_reqs.values.count, else iterations.values.count
-  const httpReqsValues = (m.http_reqs && m.http_reqs.values) || {};
-  const iterValues     = (m.iterations && m.iterations.values) || {};
-  const requests = Number(httpReqsValues.count ?? iterValues.count ?? 0);
+  // requests: http_reqs.values.count, fallback to iterations.values.count
+  var httpReqsValues = (m.http_reqs && m.http_reqs.values) ? m.http_reqs.values : {};
+  var iterValues     = (m.iterations && m.iterations.values) ? m.iterations.values : {};
+  var requests = 0;
+  if (typeof httpReqsValues.count !== "undefined") {
+    requests = Number(httpReqsValues.count);
+  } else if (typeof iterValues.count !== "undefined") {
+    requests = Number(iterValues.count);
+  }
 
   // http duration p95
-  const p95 = (m.http_req_duration && m.http_req_duration.values)
-    ? m.http_req_duration.values["p(95)"]
-    : undefined;
+  var p95 = (m.http_req_duration && m.http_req_duration.values)
+              ? m.http_req_duration.values["p(95)"]
+              : undefined;
 
   // ---- text summary ----
-  let txt = "";
-  txt += `\n=== k6 summary @ ${ts} ===\n`;
-  txt += `checks: pass=${pass} fail=${fail}\n`;
-  txt += `requests: ${requests}\n`;
-  txt += `http_req_duration p(95): ${p95 !== undefined ? p95 + " ms" : "n/a"}\n`;
+  var txt = "";
+  txt += "\n=== k6 summary @ " + ts + " ===\n";
+  txt += "checks: pass=" + pass + " fail=" + fail + "\n";
+  txt += "requests: " + requests + "\n";
+  txt += "http_req_duration p(95): " + (typeof p95 !== "undefined" ? (p95 + " ms") : "n/a") + "\n";
 
   // ---- html summary ----
-  const html = `<!doctype html><html><head><meta charset="utf-8">
-<title>SDLC Auto Gov Load Test - ${ts}</title>
-<style>
- body{font-family:system-ui,Arial,sans-serif;padding:16px}
- table{border-collapse:collapse;margin-top:10px}
- td,th{border:1px solid #ccc;padding:6px 10px}
- pre{white-space:pre-wrap}
-</style></head><body>
-<h2>SDLC Auto Gov Load Test – ${ts}</h2>
-<table>
-  <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td>Checks (pass/fail)</td><td>${pass} / ${fail}</td></tr>
-  <tr><td>Requests</td><td>${requests}</td></tr>
-  <tr><td>http_req_duration p(95)</td><td>${p95 !== undefined ? p95 + " ms" : "n/a"}</td></tr>
-</table>
-<h3>Raw JSON</h3>
-<pre>${JSON.stringify(data, null, 2)}</pre>
-</body></html>`;
+  var html = "<!doctype html><html><head><meta charset=\"utf-8\">" +
+"<title>SDLC Auto Gov Load Test - " + ts + "</title>" +
+"<style>body{font-family:system-ui,Arial,sans-serif;padding:16px}table{border-collapse:collapse;margin-top:10px}td,th{border:1px solid #ccc;padding:6px 10px}pre{white-space:pre-wrap}</style>" +
+"</head><body>" +
+"<h2>SDLC Auto Gov Load Test – " + ts + "</h2>" +
+"<table><tr><th>Metric</th><th>Value</th></tr>" +
+"<tr><td>Checks (pass/fail)</td><td>" + pass + " / " + fail + "</td></tr>" +
+"<tr><td>Requests</td><td>" + requests + "</td></tr>" +
+"<tr><td>http_req_duration p(95)</td><td>" + (typeof p95 !== "undefined" ? (p95 + " ms") : "n/a") + "</td></tr>" +
+"</table>" +
+"<h3>Raw JSON</h3><pre>" + JSON.stringify(data, null, 2) + "</pre>" +
+"</body></html>";
 
   return {
     stdout: txt,
     "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
-    "perf/k6/reports/summary.html": html,
+    "perf/k6/reports/summary.html": html
   };
 }
