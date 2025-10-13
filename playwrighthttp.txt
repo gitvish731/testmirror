@@ -1,144 +1,161 @@
-/* k6 runtime imports (CommonJS-friendly) */
-const http = require('k6/http');
-const { check, sleep } = require('k6');
-const reporter = require('../vendor/handleSummary.js'); // module.exports = { handleSummary }
-const openFile = open; // k6 global 'open'
+// perf/k6/vendor/handleSummary.js
+// Minimal-ES5 reporter with feature/endpoint breakdown (using tags)
+// Works on k6 v0.46 (Goja), no modern syntax.
 
-/* ===== 1) Load endpoints map (JSON first, TS fallback) ===== */
-let ENDPOINTS_BY_FEATURE = {};
-try {
-  ENDPOINTS_BY_FEATURE = JSON.parse(openFile('../sources/endpoints.byFeature.json'));
-} catch (e) {
-  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
+function safe(obj, k, d) {
+  return (obj && Object.prototype.hasOwnProperty.call(obj, k)) ? obj[k] : d;
 }
 
-/* ===== 2) Env controls ===== */
-const ENV = __ENV || {};
-const FEATURE_NAMES = (ENV.FEATURES || '')
-  .split(',')
-  .map(function (s) { return s.trim(); })
-  .filter(Boolean);
+function getTrendValues(metric) {
+  var v = (metric && metric.values) || {};
+  // Avoid ternaries that sometimes confuse the parser; do it long-form.
+  var p95 = 0, p90 = 0, avg = 0, min = 0, max = 0, med = 0;
+  if (v['p(95)'] != null) p95 = v['p(95)'];
+  if (v['p(90)'] != null) p90 = v['p(90)'];
+  if (v.avg != null) avg = v.avg;
+  if (v.min != null) min = v.min;
+  if (v.max != null) max = v.max;
+  if (v.med != null) med = v.med;
+  return { p95: p95, p90: p90, avg: avg, min: min, max: max, med: med };
+}
 
-const ENDPOINT_FILTER = (ENV.ENDPOINT_FILTER || '').trim();
-const BASE_URL = (ENV.BASE_URL || '').trim();
-const TOKEN = ENV.token || ENV.TOKEN || '';
-const RPS = Number(ENV.RPS || 1);
-const DURATION = ENV.DURATION || '30s';
-const PREALLOC = Number(ENV.PREALLOC || 6);
-const MAXVUS = Number(ENV.MAXVUS || 60);
-const THRESHOLDS_ON = String(ENV.THRESHOLDS_ON || 'true').toLowerCase() !== 'false';
+function ms(x) { return Math.round(Number(x || 0)); }
 
-/* ===== 3) Options ===== */
-export const options = {
-  scenarios: {
-    console: {
-      executor: 'constant-arrival-rate',
-      rate: RPS,
-      timeUnit: '1s',
-      duration: DURATION,
-      preAllocatedVUs: PREALLOC,
-      maxVUs: MAXVUS,
-      gracefulStop: '30s',
-    },
-  },
-  thresholds: THRESHOLDS_ON
-    ? {
-        http_req_failed: ['rate<0.20'],
-        http_req_duration: ['p(95)<60000'],
-      }
-    : {},
-};
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
-/* ===== 4) Helpers ===== */
-function replaceBase(urlStr) {
-  if (!BASE_URL) return urlStr;
-  try {
-    var u = new URL(urlStr);
-    var base = new URL(BASE_URL);
-    u.protocol = base.protocol;
-    u.host = base.host;
-    return u.toString();
-  } catch (e) {
-    return urlStr;
+function nowStamp() {
+  function pad2(n){ return (n<10?'0':'') + n; }
+  var d = new Date();
+  return d.getFullYear() + '-' + pad2(d.getMonth()+1) + '-' + pad2(d.getDate()) + ' ' +
+         pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+
+// Build breakdowns from submetrics (k6 adds tag-based submetrics to many metrics)
+function buildBreakdown(metrics) {
+  var byFeature = {};      // { feature: { total: N, endpoints: { name: N } } }
+  var reqs = safe(metrics, 'http_reqs', null);
+  var subs = (reqs && reqs.submetrics) || [];
+
+  for (var i = 0; i < subs.length; i += 1) {
+    var sm = subs[i];
+    var tags = sm.tags || {};
+    var feat = tags.feature || 'unknown';
+    var ep   = tags.endpoint || 'unknown';
+
+    if (!byFeature[feat]) byFeature[feat] = { total: 0, endpoints: {} };
+    byFeature[feat].total += safe(sm, 'values', {}).count || 0;
+
+    if (!byFeature[feat].endpoints[ep]) byFeature[feat].endpoints[ep] = 0;
+    byFeature[feat].endpoints[ep] += safe(sm, 'values', {}).count || 0;
   }
+  return byFeature;
 }
 
-function minifyBody(body) {
-  if (body == null) return null;
-  var s = String(body).trim();
-  if (!s) return null;
-  try {
-    return JSON.stringify(JSON.parse(s));
-  } catch (e) {
-    return s.replace(/\s+/g, ' ');
-  }
-}
-
-function buildHeaders(method) {
-  if (method === 'GET') return {};
-  var h = { 'Content-Type': 'application/json' };
-  if (TOKEN) h.Authorization = 'Bearer ' + TOKEN;
-  return h;
-}
-
-/* ===== 5) Select feature(s) & endpoints ===== */
-function selectedEndpoints() {
-  var featuresToUse = FEATURE_NAMES.length ? FEATURE_NAMES : Object.keys(ENDPOINTS_BY_FEATURE);
-  var list = [];
-  for (var i = 0; i < featuresToUse.length; i += 1) {
-    var feature = featuresToUse[i];
-    var eps = ENDPOINTS_BY_FEATURE[feature] || [];
+function renderBreakdownTable(bd) {
+  var out = '';
+  var feats = [];
+  for (var f in bd) if (Object.prototype.hasOwnProperty.call(bd, f)) feats.push(f);
+  feats.sort();
+  for (var i = 0; i < feats.length; i += 1) {
+    var f = feats[i];
+    out += '<h3 style="margin:16px 0 6px">Feature: ' + escapeHtml(f) +
+           ' <span style="font-weight:normal">(requests: ' + bd[f].total + ')</span></h3>';
+    out += '<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;min-width:420px">';
+    out += '<tr><th align="left">Endpoint</th><th align="right">Requests</th></tr>';
+    var eps = [];
+    var eobj = bd[f].endpoints;
+    for (var ep in eobj) if (Object.prototype.hasOwnProperty.call(eobj, ep)) eps.push(ep);
+    eps.sort();
     for (var j = 0; j < eps.length; j += 1) {
-      var ep = eps[j];
-      if (ENDPOINT_FILTER && String(ep.name).indexOf(ENDPOINT_FILTER) === -1) continue;
-      list.push({ feature: feature, ep: ep });
+      var epn = eps[j];
+      out += '<tr><td>' + escapeHtml(epn) + '</td><td align="right">' + eobj[epn] + '</td></tr>';
     }
+    out += '</table>';
   }
-  console.log(
-    'Selected ' + list.length + ' endpoint(s) across FEATURES: ' + featuresToUse.join(', ')
-  );
-  return list;
+  if (!feats.length) out += '<p style="opacity:.75">No per-feature data (did the runner send tags?).</p>';
+  return out;
 }
 
-/* ===== 6) Runner (tags on requests & checks) ===== */
-export default function () {
-  var entries = selectedEndpoints();
-  if (!entries.length) { sleep(1); return; }
+function renderSummaryHTML(data) {
+  var m = data.metrics || {};
+  var checks = safe(m, 'checks', {});
+  var reqs   = safe(m, 'http_reqs', {});
+  var dur    = getTrendValues(safe(m, 'http_req_duration', {}));
+  var vusMax = safe(safe(m, 'vus_max', {}), 'values', {}).value || 0;
+  var iters  = safe(safe(m, 'iterations', {}), 'values', {}).count || 0;
 
-  var sliceSize = Math.min(10, entries.length);
-  for (var i = 0; i < sliceSize; i += 1) {
-    var pair = entries[(i + __ITER) % entries.length];
-    var feature = pair.feature;
-    var ep = pair.ep;
+  var passes = safe(safe(checks, 'values', {}), 'passes', 0);
+  var fails  = safe(safe(checks, 'values', {}), 'fails', 0);
+  var totalReq = safe(safe(reqs, 'values', {}), 'count', 0);
 
-    var url = replaceBase(ep.url);
-    var method = (ep.method || 'GET').toUpperCase();
-    var headers = buildHeaders(method);
-    var tags = { feature: feature, endpoint: String(ep.name || (method + ' ' + url)) };
+  var bd = buildBreakdown(m);
 
-    var body = minifyBody(ep.body);
-    var res;
-    if (method === 'GET') {
-      res = http.get(url, { headers: headers, tags: tags });
-    } else {
-      res = http.request(method, url, body, { headers: headers, tags: tags });
-    }
+  var html = '';
+  html += '<!doctype html><meta charset="utf-8">';
+  html += '<title>SDLC Auto Gov Load Test – ' + escapeHtml(nowStamp()) + '</title>';
+  html += '<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px">';
+  html += '<h1 style="margin:0 0 16px">SDLC Auto Gov Load Test – ' + escapeHtml(nowStamp()) + '</h1>';
 
-    var expectStatus = (ep.expect && typeof ep.expect.status === 'number') ? ep.expect.status : 200;
-    var mustContain = (ep.expect && typeof ep.expect.text === 'string') ? ep.expect.text : null;
+  html += '<table border="1" cellspacing="0" cellpadding="8" style="border-collapse:collapse;min-width:520px">';
+  html += '<tr><th align="left">Checks (pass/fail)</th><td>' + passes + ' / ' + fails + '</td></tr>';
+  html += '<tr><th align="left">Requests</th><td>' + totalReq + ' total</td></tr>';
+  html += '<tr><th align="left">Latency p(95)</th><td>' + ms(dur.p95) + ' ms</td></tr>';
+  html += '<tr><th align="left">Latency avg / min / max</th><td>' +
+          ms(dur.avg) + ' ms / ' + ms(dur.min) + ' ms / ' + ms(dur.max) + ' ms</td></tr>';
+  html += '<tr><th align="left">Iterations</th><td>' + iters + '</td></tr>';
+  html += '<tr><th align="left">VUs max</th><td>' + vusMax + '</td></tr>';
+  html += '</table>';
 
-    check(res, { 'status ok': function (r) { return r.status === expectStatus; } }, tags);
+  // Simple latency bar (min/avg/p95/max)
+  var bar = function(label, value, max) {
+    var width = max > 0 ? Math.round((value / max) * 400) : 0;
+    if (width < 1 && value > 0) width = 1;
+    return '<div style="display:flex;align-items:center;margin:6px 0">' +
+           '<div style="width:80px;opacity:.75">' + escapeHtml(label) + '</div>' +
+           '<div style="background:#e5e7eb;height:10px;width:420px;position:relative">' +
+           '<div style="background:#3b82f6;height:10px;width:' + width + 'px"></div>' +
+           '</div>' +
+           '<div style="margin-left:8px;width:90px;text-align:right">' + ms(value) + ' ms</div>' +
+           '</div>';
+  };
+  var maxRef = Math.max(ms(dur.max), ms(dur.p95), ms(dur.avg));
+  html += '<h3 style="margin:18px 0 6px">Latency bars</h3>';
+  html += bar('avg', ms(dur.avg), maxRef);
+  html += bar('p(95)', ms(dur.p95), maxRef);
+  html += bar('max', ms(dur.max), maxRef);
 
-    if (mustContain) {
-      var text = String(res && res.body ? res.body : '');
-      check(res, { 'body has text': function () { return text.indexOf(mustContain) !== -1; } }, tags);
-    }
+  html += '<h2 style="margin:22px 0 6px">Feature / Endpoint breakdown</h2>';
+  html += renderBreakdownTable(bd);
 
-    sleep(0.1);
-  }
+  // Raw (truncated)
+  var raw = JSON.stringify({
+    checks: safe(m, 'checks', {}),
+    http_req_duration: safe(m, 'http_req_duration', {}),
+    http_reqs: safe(m, 'http_reqs', {}),
+    iterations: safe(m, 'iterations', {}),
+    vus_max: safe(m, 'vus_max', {})
+  }, null, 2);
+  html += '<details style="margin-top:18px"><summary><b>Raw JSON (truncated)</b></summary>' +
+          '<pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid #e5e7eb;padding:12px;border-radius:6px;max-height:420px;overflow:auto">' +
+          escapeHtml(raw) + '</pre></details>';
+
+  html += '</div>';
+  return html;
 }
 
-/* ===== 7) HTML report hook ===== */
-export function handleSummary(data) {
-  return reporter.handleSummary(data);
+function handleSummary(data) {
+  var html = renderSummaryHTML(data);
+  return {
+    // Keep existing JSON for debugging
+    'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
+    // New richer HTML
+    'perf/k6/reports/summary.html': html
+  };
 }
+
+module.exports = { handleSummary: handleSummary };
