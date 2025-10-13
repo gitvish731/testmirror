@@ -1,134 +1,41 @@
-// perf/k6/scenarios/from-playwright.http.js
-/* eslint-disable no-undef */
-const http = require('k6/http');
-const { check, sleep } = require('k6');
+export function handleSummary(data) {
+  function pad(n){ return (n<10?'0':'')+n; }
+  var d = new Date();
+  var ts = d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+
+           pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
 
-// Read the generated endpoints at init time (path is relative to THIS file)
-const endpointsByFeature = JSON.parse(open('../sources/endpoints.byFeature.json'));
+  var checks = data.metrics && data.metrics.checks || {};
+  var httpReqDur = data.metrics && data.metrics.http_req_duration || {};
+  var p95 = httpReqDur.values ? httpReqDur.values['p(95)'] : 'n/a';
+  var pass = checks.passes || 0;
+  var fail = checks.fails || 0;
 
-// --- Env / knobs (all optional) ---
-var ENV       = (__ENV.ENV || 'dev').toLowerCase();                 // dev | uat
-var BASE_URL  = __ENV.BASE_URL || '';                               // if set, overrides host
-var TOKEN     = __ENV.TOKEN || '';                                  // for POST/PATCH/DELETE
-var FEATURES  = (__ENV.FEATURES || '').split(',').map(function(s){return s.trim();}).filter(Boolean);
-var EP_FILTER = __ENV.ENDPOINT_FILTER ? new RegExp(__ENV.ENDPOINT_FILTER) : null;
+  var outTxt = '';
+  outTxt += '\n=== k6 summary @ '+ts+' ===\n';
+  outTxt += 'checks: pass='+pass+' fail='+fail+'\n';
+  outTxt += 'http_req_duration p(95): '+p95+' ms\n';
+  outTxt += 'iterations: '+(data.metrics.iterations && data.metrics.iterations.count || 0)+'\n';
 
-var RPS       = Number(__ENV.RPS || 5);
-var DURATION  = __ENV.DURATION || '30s';
-var PREALLOC  = Number(__ENV.PREALLOC || 5);
-var MAXVUS    = Number(__ENV.MAXVUS || 50);
+  var html = ''
+    + '<!doctype html><html><head><meta charset="utf-8">'
+    + '<title>k6 Load Test '+ts+'</title>'
+    + '<style>body{font-family:system-ui,Arial,sans-serif;padding:16px}'
+    + 'table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px 10px}</style>'
+    + '</head><body>'
+    + '<h2>k6 Load Test – '+ts+'</h2>'
+    + '<table><tr><th>Metric</th><th>Value</th></tr>'
+    + '<tr><td>Checks (pass/fail)</td><td>'+pass+' / '+fail+'</td></tr>'
+    + '<tr><td>http_req_duration p(95)</td><td>'+p95+' ms</td></tr>'
+    + '<tr><td>Iterations</td><td>'+(data.metrics.iterations && data.metrics.iterations.count || 0)+'</td></tr>'
+    + '</table>'
+    + '<h3>Raw JSON</h3>'
+    + '<pre style="white-space:pre-wrap;font-size:12px">'
+    + (typeof JSON!=='undefined' ? JSON.stringify(data,null,2) : '') + '</pre>'
+    + '</body></html>';
 
-// --- Helpers ---
-function swapEnvInHost(url) {
-  // If BASE_URL provided, force that base (replace protocol+host)
-  if (BASE_URL) {
-    // crude but safe: keep path+query of original
-    var idx = url.indexOf('://');
-    if (idx >= 0) {
-      var slash = url.indexOf('/', idx + 3);
-      if (slash >= 0) return BASE_URL.replace(/\/+$/, '') + url.slice(slash);
-    }
-    return BASE_URL.replace(/\/+$/, '') + '/' + url.replace(/^https?:\/\/[^/]+\/?/, '');
-  }
-
-  // otherwise, swap "-dev" / "-test" in host when present
-  var host = (ENV === 'dev') ? '-dev' : '-test';
-  // replace "-dev" or "-test" just before domain
-  return url
-    .replace(/-dev(\.[^.\/]+(?:\/|$))/, function(_, tail){ return host + tail; })
-    .replace(/-test(\.[^.\/]+(?:\/|$))/, function(_, tail){ return host + tail; });
+  return {
+    stdout: outTxt,
+    'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
+    'perf/k6/reports/summary.html': html
+  };
 }
-
-function buildHeaders(method) {
-  var h = {};
-  if (method !== 'GET') {
-    h['Content-Type'] = 'application/json';
-  }
-  if (method !== 'GET' && TOKEN) {
-    h['Authorization'] = 'Bearer ' + TOKEN;
-  }
-  return h;
-}
-
-function send(method, url, body, headers) {
-  if (method === 'GET')           return http.get(url, { headers: headers });
-  if (method === 'POST')          return http.post(url, body || null, { headers: headers });
-  if (method === 'PUT')           return http.put(url, body || null, { headers: headers });
-  if (method === 'PATCH')         return http.patch(url, body || null, { headers: headers });
-  if (method === 'DELETE')        return http.del(url, null, { headers: headers });
-  return http.get(url, { headers: headers });
-}
-
-// --- Select endpoints for this run ---
-function pickEndpoints() {
-  var selected = [];
-  var featureKeys = FEATURES.length ? FEATURES : Object.keys(endpointsByFeature);
-
-  for (var i = 0; i < featureKeys.length; i++) {
-    var feature = featureKeys[i];
-    var items = endpointsByFeature[feature] || [];
-    for (var j = 0; j < items.length; j++) {
-      var ep = items[j];
-      if (EP_FILTER && !EP_FILTER.test(ep.name)) continue;
-      selected.push({ feature: feature, ep: ep });
-    }
-  }
-  return selected;
-}
-
-var CHOSEN = pickEndpoints();
-
-// --- k6 options: one scenario per endpoint (equal share) ---
-export let options = {
-  scenarios: (function() {
-    var sc = {};
-    for (var i = 0; i < CHOSEN.length; i++) {
-      var name = CHOSEN[i].feature + ' :: ' + CHOSEN[i].ep.name;
-      sc['ep_' + i] = {
-        executor: 'constant-arrival-rate',
-        rate: RPS,                 // same RPS for each selected endpoint
-        timeUnit: '1s',
-        duration: DURATION,
-        preAllocatedVUs: PREALLOC,
-        maxVUs: MAXVUS,
-        exec: 'ep_' + i
-      };
-    }
-    return sc;
-  })()
-};
-
-// Dynamically create one exec func per endpoint
-for (var k = 0; k < CHOSEN.length; k++) {
-  (function(idx){
-    var feature = CHOSEN[idx].feature;
-    var ep      = CHOSEN[idx].ep;
-
-    exports['ep_' + idx] = function () {
-      var url = swapEnvInHost(ep.url || ep.path || ep.full || '');
-      var headers = buildHeaders(ep.method || 'GET');
-      var body = ep.body || null;
-
-      var res = send(ep.method || 'GET', url, body, headers);
-
-      // Checks
-      var okStatus = true;
-      var okText = true;
-
-      if (ep.expect && ep.expect.status) {
-        okStatus = check(res, { 'status ok': function(r){ return r.status === ep.expect.status; } });
-      }
-      if (ep.expect && ep.expect.text) {
-        okText = check(res, { 'body has text': function(r){ return (r.body || '').indexOf(ep.expect.text) >= 0; } });
-      }
-
-      if (!okStatus || !okText) {
-        // small sleep so failing requests don’t tight-loop
-        sleep(0.1);
-      }
-    };
-  })(k);
-}
-
-// No-op default export (keeps k6 happy if it looks for default)
-export default function () { sleep(1); }
