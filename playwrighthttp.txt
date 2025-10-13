@@ -1,56 +1,114 @@
+// perf/k6/vendor/handleSummary.js
 export function handleSummary(data) {
-  // ---- helpers ----
-  function pad(n) { return (n < 10 ? "0" : "") + n; }
-  var d = new Date();
-  var ts = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
-           " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
-
-  var m = data && data.metrics ? data.metrics : {};
-
-  // checks: prefer metrics.checks.values, fallback to root_group.checks
-  var checksValues = (m.checks && m.checks.values) ? m.checks.values : {};
-  var pass = (typeof checksValues.passes !== "undefined") ? Number(checksValues.passes) : 0;
-  var fail = (typeof checksValues.fails  !== "undefined") ? Number(checksValues.fails)  : 0;
-  if (pass === 0 && fail === 0 && data.root_group && data.root_group.checks) {
-    if (typeof data.root_group.checks.passes !== "undefined") pass = Number(data.root_group.checks.passes);
-    if (typeof data.root_group.checks.fails  !== "undefined") fail = Number(data.root_group.checks.fails);
+  // ----- ES5 helpers -----
+  function pad(n){return (n<10?"0":"")+n;}
+  function nowStamp(){
+    var d=new Date();
+    return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+
+           pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+  }
+  function metric(name){ return (data && data.metrics && data.metrics[name]) ? data.metrics[name] : null; }
+  function valuesOf(name){ var m=metric(name); return (m&&m.values)?m.values:{}; }
+  function num(v, def){ return (typeof v==="number")?v:def; }
+  function fmt(n, d){ if(typeof n!=="number") return "n/a"; var f=(typeof d==="number")?d:0; return n.toFixed(f); }
+  function bytes(n){
+    if(typeof n!=="number") return "n/a";
+    var u=["B","KB","MB","GB"]; var i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;}
+    return n.toFixed(1)+" "+u[i];
   }
 
-  // requests: http_reqs.values.count, fallback to iterations.values.count
-  var httpReqsValues = (m.http_reqs && m.http_reqs.values) ? m.http_reqs.values : {};
-  var iterValues     = (m.iterations && m.iterations.values) ? m.iterations.values : {};
-  var requests = 0;
-  if (typeof httpReqsValues.count !== "undefined") {
-    requests = Number(httpReqsValues.count);
-  } else if (typeof iterValues.count !== "undefined") {
-    requests = Number(iterValues.count);
+  var ts = nowStamp();
+
+  // checks (prefer metric, fallback to root_group)
+  var checksV = valuesOf("checks");
+  var pass = num(checksV.passes, 0);
+  var fail = num(checksV.fails, 0);
+  if(pass===0 && fail===0 && data.root_group && data.root_group.checks){
+    if(typeof data.root_group.checks.passes!=="undefined") pass = Number(data.root_group.checks.passes);
+    if(typeof data.root_group.checks.fails!=="undefined")  fail = Number(data.root_group.checks.fails);
+  }
+  var passRate = (pass+fail)>0 ? (pass/(pass+fail))*100 : 0;
+
+  // requests / rps
+  var httpReqs = valuesOf("http_reqs");
+  var requests = num(httpReqs.count, 0);
+  var rps      = num(httpReqs.rate, 0);
+
+  // failures
+  var httpFailed = valuesOf("http_req_failed");
+  var failRate   = num(httpFailed.rate, 0)*100;
+
+  // vu / iterations
+  var vusMax     = num((valuesOf("vus_max")).max, 0);
+  var iterations = num((valuesOf("iterations")).count, 0);
+
+  // data sent/received
+  var sentBytes = num((valuesOf("data_sent")).count, 0);
+  var recvBytes = num((valuesOf("data_received")).count, 0);
+
+  // latency (http_req_duration)
+  var dV = valuesOf("http_req_duration");
+  var dAvg = num(dV.avg, undefined);
+  var dMin = num(dV.min, undefined);
+  var dMax = num(dV.max, undefined);
+  var dP90 = num(dV["p(90)"], undefined);
+  var dP95 = num(dV["p(95)"], undefined);
+  var dP99 = num(dV["p(99)"], undefined);
+
+  // waiting (TTFB)
+  var wV = valuesOf("http_req_waiting");
+  var wAvg = num(wV.avg, undefined);
+  var wP95 = num(wV["p(95)"], undefined);
+
+  // mini SVGs
+  function passFailBar(passCount, failCount, width){
+    var total = passCount + failCount; if(total<=0) total=1;
+    var w = width||380, h=14, pw = Math.round((passCount/total)*w), fw = w - pw;
+    return '<svg width="'+w+'" height="'+h+'" xmlns="http://www.w3.org/2000/svg">'+
+           '<rect width="'+pw+'" height="'+h+'" fill="#2ca02c"/>'+
+           '<rect x="'+pw+'" width="'+fw+'" height="'+h+'" fill="#d62728"/>'+
+           '</svg>';
+  }
+  function durationRuler(min, p90, p95, p99, max, width){
+    if(typeof max!=="number" || max<=0) return "<em>n/a</em>";
+    var w = width||420, h=22, scale = function(x){ return Math.max(0, Math.min(w, Math.round((x/max)*w))); };
+    var mx = scale(max), mn = scale(num(min,0)), p90x = scale(p90||0), p95x=scale(p95||0), p99x=scale(p99||0);
+    return '<svg width="'+w+'" height="'+h+'" xmlns="http://www.w3.org/2000/svg">'+
+           '<rect x="0" y="8" width="'+mx+'" height="6" fill="#eee" stroke="#ccc"/>'+
+           '<line x1="'+p90x+'" y1="6" x2="'+p90x+'" y2="20" stroke="#1f77b4" stroke-width="2"/>'+
+           '<line x1="'+p95x+'" y1="4" x2="'+p95x+'" y2="22" stroke="#ff7f0e" stroke-width="2"/>'+
+           '<line x1="'+p99x+'" y1="2" x2="'+p99x+'" y2="20" stroke="#d62728" stroke-width="2"/>'+
+           '<circle cx="'+mn+'" cy="11" r="2" fill="#555"/>'+
+           '<circle cx="'+mx+'" cy="11" r="2" fill="#555"/>'+
+           '</svg>'+
+           '<div style="font-size:12px;margin-top:2px;">'+
+           'min '+fmt(min,1)+' ms &nbsp; p90 '+fmt(p90,1)+' ms &nbsp; p95 '+fmt(p95,1)+' ms &nbsp; p99 '+fmt(p99,1)+' ms &nbsp; max '+fmt(max,1)+' ms'+
+           '</div>';
   }
 
-  // http duration p95
-  var p95 = (m.http_req_duration && m.http_req_duration.values)
-              ? m.http_req_duration.values["p(95)"]
-              : undefined;
+  var ts = nowStamp();
+  var txt = "\n=== k6 summary @ "+ts+" ===\n";
+  txt += "checks: pass="+pass+" fail="+fail+" ("+fmt(passRate,1)+"%)\n";
+  txt += "requests: "+requests+"  rps="+fmt(rps,2)+"  failures="+fmt(failRate,2)+"%\n";
+  txt += "http_req_duration: avg="+fmt(dAvg,1)+"ms p95="+fmt(dP95,1)+"ms max="+fmt(dMax,1)+"ms\n";
+  txt += "vus_max: "+vusMax+"  iterations: "+iterations+"\n";
 
-  // ---- text summary ----
-  var txt = "";
-  txt += "\n=== k6 summary @ " + ts + " ===\n";
-  txt += "checks: pass=" + pass + " fail=" + fail + "\n";
-  txt += "requests: " + requests + "\n";
-  txt += "http_req_duration p(95): " + (typeof p95 !== "undefined" ? (p95 + " ms") : "n/a") + "\n";
-
-  // ---- html summary ----
-  var html = "<!doctype html><html><head><meta charset=\"utf-8\">" +
-"<title>SDLC Auto Gov Load Test - " + ts + "</title>" +
-"<style>body{font-family:system-ui,Arial,sans-serif;padding:16px}table{border-collapse:collapse;margin-top:10px}td,th{border:1px solid #ccc;padding:6px 10px}pre{white-space:pre-wrap}</style>" +
-"</head><body>" +
-"<h2>SDLC Auto Gov Load Test – " + ts + "</h2>" +
-"<table><tr><th>Metric</th><th>Value</th></tr>" +
-"<tr><td>Checks (pass/fail)</td><td>" + pass + " / " + fail + "</td></tr>" +
-"<tr><td>Requests</td><td>" + requests + "</td></tr>" +
-"<tr><td>http_req_duration p(95)</td><td>" + (typeof p95 !== "undefined" ? (p95 + " ms") : "n/a") + "</td></tr>" +
-"</table>" +
-"<h3>Raw JSON</h3><pre>" + JSON.stringify(data, null, 2) + "</pre>" +
-"</body></html>";
+  var html = "<!doctype html><html><head><meta charset=\"utf-8\">"+
+    "<title>SDLC Auto Gov Load Test - "+ts+"</title>"+
+    "<style>body{font-family:system-ui,Arial,sans-serif;padding:16px;color:#222}h1,h2{margin:0 0 8px}table{border-collapse:collapse;margin-top:10px}td,th{border:1px solid #ddd;padding:6px 10px}th{background:#f8f8f8;text-align:left}small{color:#666}</style>"+
+    "</head><body>"+
+    "<h2>SDLC Auto Gov Load Test – "+ts+"</h2>"+
+    "<table>"+
+      "<tr><th>Checks</th><td>"+pass+" pass / "+fail+" fail ("+fmt(passRate,1)+"%)</td><td>"+passFailBar(pass, fail, 320)+"</td></tr>"+
+      "<tr><th>Requests</th><td colspan=\"2\">"+requests+" total &nbsp; · &nbsp; RPS "+fmt(rps,2)+" &nbsp; · &nbsp; Fail rate "+fmt(failRate,2)+"%</td></tr>"+
+      "<tr><th>Latency (http_req_duration)</th><td colspan=\"2\">avg "+fmt(dAvg,1)+" ms</td></tr>"+
+      "<tr><th></th><td colspan=\"2\">"+ durationRuler(dMin, dP90, dP95, dP99, dMax, 420) +"</td></tr>"+
+      "<tr><th>Waiting (TTFB)</th><td colspan=\"2\">avg "+fmt(wAvg,1)+" ms &nbsp; · &nbsp; p95 "+fmt(wP95,1)+" ms</td></tr>"+
+      "<tr><th>VUs / Iterations</th><td colspan=\"2\">vus_max "+vusMax+" &nbsp; · &nbsp; iterations "+iterations+"</td></tr>"+
+      "<tr><th>Traffic</th><td colspan=\"2\">sent "+bytes(sentBytes)+" &nbsp; · &nbsp; received "+bytes(recvBytes)+"</td></tr>"+
+    "</table>"+
+    "<h3>Raw JSON</h3><pre>"+JSON.stringify(data, null, 2)+"</pre>"+
+    "</body></html>";
 
   return {
     stdout: txt,
@@ -58,3 +116,11 @@ export function handleSummary(data) {
     "perf/k6/reports/summary.html": html
   };
 }
+
+
+
+//--------------------------------------------------------------
+
+import { handleSummary as _handleSummary } from '../vendor/handleSummary.js';
+export { _handleSummary as handleSummary };
+
