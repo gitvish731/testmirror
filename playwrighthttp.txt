@@ -1,41 +1,51 @@
 export function handleSummary(data) {
   function pad(n){ return (n<10?'0':'')+n; }
-  var d = new Date();
-  var ts = d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+
-           pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+  const d = new Date();
+  const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 
-  var checks = data.metrics && data.metrics.checks || {};
-  var httpReqDur = data.metrics && data.metrics.http_req_duration || {};
-  var p95 = httpReqDur.values ? httpReqDur.values['p(95)'] : 'n/a';
-  var pass = checks.passes || 0;
-  var fail = checks.fails || 0;
+  // Totals (defensive across k6 versions)
+  const rootChecks = (data.root_group && data.root_group.checks) || {};
+  const pass = Number(rootChecks.passes || 0);
+  const fail = Number(rootChecks.fails  || 0);
 
-  var outTxt = '';
-  outTxt += '\n=== k6 summary @ '+ts+' ===\n';
-  outTxt += 'checks: pass='+pass+' fail='+fail+'\n';
-  outTxt += 'http_req_duration p(95): '+p95+' ms\n';
-  outTxt += 'iterations: '+(data.metrics.iterations && data.metrics.iterations.count || 0)+'\n';
+  const http = (data.metrics && data.metrics.http_req_duration) || {};
+  const httpP95 = http.values ? http.values['p(95)'] : undefined;
 
-  var html = ''
-    + '<!doctype html><html><head><meta charset="utf-8">'
-    + '<title>k6 Load Test '+ts+'</title>'
-    + '<style>body{font-family:system-ui,Arial,sans-serif;padding:16px}'
-    + 'table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px 10px}</style>'
-    + '</head><body>'
-    + '<h2>k6 Load Test – '+ts+'</h2>'
-    + '<table><tr><th>Metric</th><th>Value</th></tr>'
-    + '<tr><td>Checks (pass/fail)</td><td>'+pass+' / '+fail+'</td></tr>'
-    + '<tr><td>http_req_duration p(95)</td><td>'+p95+' ms</td></tr>'
-    + '<tr><td>Iterations</td><td>'+(data.metrics.iterations && data.metrics.iterations.count || 0)+'</td></tr>'
-    + '</table>'
-    + '<h3>Raw JSON</h3>'
-    + '<pre style="white-space:pre-wrap;font-size:12px">'
-    + (typeof JSON!=='undefined' ? JSON.stringify(data,null,2) : '') + '</pre>'
-    + '</body></html>';
+  const httpReqs = (data.metrics && data.metrics.http_reqs) || {};
+  const requests = Number(httpReqs.count || 0);
+
+  // Text summary
+  let outTxt = '';
+  outTxt += `\n=== k6 summary @ ${ts} ===\n`;
+  outTxt += `checks: pass=${pass} fail=${fail}\n`;
+  outTxt += `http_req_duration p(95): ${httpP95 !== undefined ? httpP95 + ' ms' : 'n/a'}\n`;
+  outTxt += `requests: ${requests}\n`;
+
+  // Minimal HTML report
+  const html = `<!doctype html><html><head><meta charset="utf-8">
+<title>SDLC Auto Gov Load Test - ${ts}</title>
+<style>
+ body{font-family:system-ui,Arial,sans-serif;padding:16px}
+ table{border-collapse:collapse;margin-top:10px}
+ td,th{border:1px solid #ccc;padding:6px 10px}
+ code,pre{font-family:ui-monospace,Consolas,monospace}
+</style>
+</head><body>
+<h2>SDLC Auto Gov Load Test – ${ts}</h2>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Checks (pass/fail)</td><td>${pass} / ${fail}</td></tr>
+  <tr><td>http_req_duration p(95)</td><td>${httpP95 !== undefined ? httpP95 + ' ms' : 'n/a'}</td></tr>
+  <tr><td>Requests</td><td>${requests}</td></tr>
+</table>
+
+<h3>Raw JSON</h3>
+<pre>${(typeof JSON!=='undefined' ? JSON.stringify(data, null, 2) : '')}</pre>
+</body></html>`;
 
   return {
     stdout: outTxt,
     'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
-    'perf/k6/reports/summary.html': html
+    'perf/k6/reports/summary.html': html,
   };
 }
