@@ -1,6 +1,9 @@
+node -e "const fs=require('fs');const p='perf/k6/sources/endpoints.byFeature.json';const out='perf/k6/sources/endpoints.byFeature.js';fs.writeFileSync(out,'export default '+fs.readFileSync(p));console.log('wrote',out)"
+
+//------------------------------------------------
+
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { open } from 'k6/io';
 export { handleSummary } from '../vendor/handleSummary.js';
 
 // ---------- ENV / Defaults ----------
@@ -16,8 +19,8 @@ const MAXVUS         = Number(__ENV.MAXVUS || '40');
 const THRESHOLDS_ON  = (__ENV.THRESHOLDS || 'true').toLowerCase() !== 'false';
 const EP_RATES       = safeJson(__ENV.EP_RATES) || {};
 
-// ---------- Load Endpoints JSON ----------
-const EP_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
+// ---------- Load Endpoints (no k6/io) ----------
+import EP_BY_FEATURE from '../sources/endpoints.byFeature.js';
 
 // ---------- Feature / endpoint selection ----------
 const SELECTED_FEATURES = normalizeList(FEATURES_RAW);
@@ -26,7 +29,7 @@ const pickedFeatures = SELECTED_FEATURES.length
   ? allFeatures.filter(function (f) { return SELECTED_FEATURES.indexOf(f) !== -1; })
   : allFeatures;
 
-// Flatten endpoints with feature context (no for..of)
+// Flatten endpoints with feature context
 var ENDPOINTS = [];
 for (var i = 0; i < pickedFeatures.length; i++) {
   var feature = pickedFeatures[i];
@@ -34,12 +37,10 @@ for (var i = 0; i < pickedFeatures.length; i++) {
     return matchesFilter(ep.name, ENDPOINT_FILTER);
   });
   for (var j = 0; j < list.length; j++) {
-    var ep = list[j];
-    var merged = {};
-    // manual spread to avoid older-engine quirks
-    for (var k in ep) { if (Object.prototype.hasOwnProperty.call(ep, k)) merged[k] = ep[k]; }
-    merged.feature = feature;
-    ENDPOINTS.push(merged);
+    var src = list[j], ep = {};
+    for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k)) ep[k] = src[k]; }
+    ep.feature = feature;
+    ENDPOINTS.push(ep);
   }
 }
 if (ENDPOINTS.length === 0) {
@@ -55,11 +56,8 @@ function withEnvHost(url) {
     }
     var u = new URL(url, BASE_URL || 'http://placeholder');
     if (/^\w+:\/\//.test(url)) {
-      if (ENV === 'dev') {
-        u.hostname = u.hostname.replace(/-test(\.|-)/, '-dev$1');
-      } else if (ENV === 'uat') {
-        u.hostname = u.hostname.replace(/-dev(\.|-)/, '-test$1');
-      }
+      if (ENV === 'dev')      u.hostname = u.hostname.replace(/-test(\.|-)/, '-dev$1');
+      else if (ENV === 'uat') u.hostname = u.hostname.replace(/-dev(\.|-)/,  '-test$1');
     }
     return u.toString();
   } catch (_) {
@@ -85,7 +83,6 @@ for (var s = 0; s < ENDPOINTS.length; s++) {
       exec: 'exec_ep_' + idx,
       tags: { feature: ep.feature, endpoint: ep.name, method: ep.method }
     };
-    // register exec function in module scope
     globalThis['exec_ep_' + idx] = function () { runOne(ep); };
   })(s);
 }
