@@ -1,136 +1,55 @@
-import http from 'k6/http';
-import { check, sleep } from 'k6';
+// perf/k6/vendor/handleSummary.js
+// Tiny, dependency-free HTML report + JSON dump
+const TITLE = `SDLC Auto Gov Load Test – ${new Date().toISOString().replace('T',' ').slice(0,19)}`;
 
-// -----------------------------------------------------------------------------
-// 1) Load endpoints map (CommonJS wrapper first, JSON fallback)
-// -----------------------------------------------------------------------------
-var ENDPOINTS_BY_FEATURE;
-try {
-  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
-} catch (e) {
-  ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
-}
+function pad(n){ return (n<10?'0':'')+n; }
+function fmtMs(x){ return (Math.round(x*100)/100) + ' ms'; }
 
-// -----------------------------------------------------------------------------
-// 2) Env
-// -----------------------------------------------------------------------------
-var ENV         = (__ENV.ENV || 'dev').toLowerCase();
-var BASE_URL    = __ENV.BASE_URL || '';
-var TOKEN       = __ENV.TOKEN || '';
-var FEATURES_IN = ('' + (__ENV.FEATURES || '')).split(','); // may be ['']
-for (var i = 0; i < FEATURES_IN.length; i++) FEATURES_IN[i] = FEATURES_IN[i].trim();
-var ENDPOINT_FILTER = ('' + (__ENV.ENDPOINT_FILTER || '')).trim();
-if (ENDPOINT_FILTER === '') ENDPOINT_FILTER = null;
+export function handleSummary(data) {
+  const checks = data.metrics.checks ? data.metrics.checks.values : { passes: 0, fails: 0 };
+  const http = data.metrics.http_req_duration ? data.metrics.http_req_duration.values : {};
+  const iters = data.metrics.iterations ? data.metrics.iterations.values.count : 0;
+  const vusMax = data.metrics.vus_max ? data.metrics.vus_max.values.value : 0;
 
-var DURATION = __ENV.DURATION || '30s';
-var RPS      = Number(__ENV.RPS || '1');
-var PREALLOC = Number(__ENV.PREALLOC || '5');
-var MAXVUS   = Number(__ENV.MAXVUS || '40');
+  const html = `
+<!doctype html><meta charset="utf-8">
+<title>${TITLE}</title>
+<style>
+ body{font:14px system-ui,Segoe UI,Arial,sans-serif;padding:24px;line-height:1.4}
+ h1{margin:0 0 12px}
+ table{border-collapse:collapse;margin:12px 0;min-width:520px}
+ th,td{border:1px solid #ddd;padding:8px 10px;text-align:left}
+ .bar{height:6px;background:#e5e5e5;border-radius:3px;overflow:hidden}
+ .bar>i{display:block;height:100%;background:#3b82f6}
+ .ok{color:#059669}.bad{color:#dc2626}
+ pre{background:#f7f7f7;border:1px solid #eee;padding:12px;overflow:auto}
+</style>
+<h1>${TITLE}</h1>
+<table>
+  <tr><th>Checks (pass/fail)</th><td>${checks.passes||0} / ${checks.fails||0}</td></tr>
+  <tr><th>Requests</th><td>${data.metrics.http_reqs ? data.metrics.http_reqs.values.count : 0} total</td></tr>
+  <tr><th>Latency p(95)</th><td>${http['p(95)']!=null ? fmtMs(http['p(95)']) : 'n/a'}</td></tr>
+  <tr><th>Iterations</th><td>${iters}</td></tr>
+  <tr><th>VUs max</th><td>${vusMax}</td></tr>
+</table>
+<div class="bar"><i style="width:${Math.min(100, (http['p(95)']||0)/5000*100)}%"></i></div>
+<h3>Raw JSON (truncated)</h3>
+<pre>${JSON.stringify({
+  checks: data.metrics.checks,
+  http_req_duration: data.metrics.http_req_duration,
+  http_reqs: data.metrics.http_reqs,
+  iterations: data.metrics.iterations,
+  vus_max: data.metrics.vus_max
+}, null, 2)}</pre>`;
 
-var THRESHOLDS_ON = ('' + (__ENV.THRESHOLDS_ON || 'false')).toLowerCase() === 'true';
-
-// -----------------------------------------------------------------------------
-// 3) Feature & endpoint selection
-// -----------------------------------------------------------------------------
-var allFeatures = [];
-for (var f in ENDPOINTS_BY_FEATURE) if (Object.prototype.hasOwnProperty.call(ENDPOINTS_BY_FEATURE, f)) allFeatures.push(f);
-
-var SELECTED_FEATURES = [];
-if (FEATURES_IN.length && FEATURES_IN[0] !== '') {
-  for (var a = 0; a < FEATURES_IN.length; a++) {
-    var name = FEATURES_IN[a];
-    if (name && ENDPOINTS_BY_FEATURE[name]) SELECTED_FEATURES.push(name);
-  }
-} else {
-  SELECTED_FEATURES = allFeatures.slice();
-}
-
-var ENDPOINTS = [];
-for (var fi = 0; fi < SELECTED_FEATURES.length; fi++) {
-  var feature = SELECTED_FEATURES[fi];
-  var src = ENDPOINTS_BY_FEATURE[feature] || [];
-  for (var ei = 0; ei < src.length; ei++) {
-    var ep = src[ei];
-    if (!ENDPOINT_FILTER || (('' + ep.name).indexOf(ENDPOINT_FILTER) !== -1)) {
-      // store { feature, ...ep } without spread
-      var rec = { feature: feature, name: ep.name, method: ep.method, url: ep.url, body: ep.body, expect: ep.expect, auth: ep.auth };
-      ENDPOINTS.push(rec);
-    }
-  }
-}
-
-console.log('>> Selected ' + ENDPOINTS.length + ' endpoint(s) across FEATURES=[' + SELECTED_FEATURES.join(', ') + ']' + (ENDPOINT_FILTER ? (" filter='" + ENDPOINT_FILTER + "'") : ''));
-
-// -----------------------------------------------------------------------------
-// 4) Options (no Object.fromEntries)
-// -----------------------------------------------------------------------------
-var scenarios = {};
-for (var si = 0; si < ENDPOINTS.length; si++) {
-  var id = 'ep_' + si;
-  scenarios[id] = {
-    executor: 'constant-arrival-rate',
-    rate: RPS,
-    timeUnit: '1s',
-    duration: DURATION,
-    preAllocatedVUs: PREALLOC,
-    maxVUs: MAXVUS,
-    exec: id,
+  return {
+    'perf/k6/reports/summary.html': html,
+    'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
   };
 }
 
-export const options = {
-  scenarios: scenarios,
-  thresholds: THRESHOLDS_ON ? {
-    http_req_failed:   ['rate<0.01'],
-    http_req_duration: ['p(95)<2000'],
-  } : {},
-};
 
-// -----------------------------------------------------------------------------
-// 5) One test function per endpoint (no destructuring / for..of)
-// -----------------------------------------------------------------------------
-for (var xi = 0; xi < ENDPOINTS.length; xi++) {
-  (function (index) {
-    var ep = ENDPOINTS[index];
-    var fnName = 'ep_' + index;
+//--------------------------------------
 
-    exports[fnName] = function () {
-      var url = (BASE_URL || '') + ep.url;
-      var tags = { feature: ep.feature, endpoint: ep.name };
-
-      // headers: add Bearer only when TOKEN provided
-      var headers = {};
-      if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
-
-      var params = { headers: headers, tags: tags };
-      var res;
-
-      var m = ('' + ep.method).toUpperCase();
-      if (m === 'GET') {
-        res = http.get(url, params);
-      } else if (m === 'POST') {
-        res = http.post(url, ep.body || '', params);
-      } else if (m === 'PATCH') {
-        res = http.patch(url, ep.body || '', params);
-      } else if (m === 'DELETE') {
-        res = http.del(url, null, params);
-      } else {
-        console.warn('Unsupported method: ' + ep.method);
-        return;
-      }
-
-      // expected status (fallback 2xx)
-      var okStatus = (ep.expect && typeof ep.expect.status === 'number')
-        ? function (r) { return r.status === ep.expect.status; }
-        : function (r) { return r.status >= 200 && r.status < 300; };
-
-      var checks = {
-        'status ok': okStatus,
-        'body has text': function (r) { return !!(r && r.body && r.body.length > 0); }
-      };
-
-      check(res, checks, tags);
-      sleep(1);
-    };
-  })(xi);
-}
+import { handleSummary as vendorHandleSummary } from '../vendor/handleSummary.js';
+export function handleSummary(data) { return vendorHandleSummary(data); }
