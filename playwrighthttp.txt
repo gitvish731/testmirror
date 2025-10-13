@@ -1,195 +1,177 @@
-/* perf/k6/vendor/handleSummary.js */
-function fmt(n, digits = 0) {
-  if (n == null || Number.isNaN(n)) return '–';
-  return Number(n).toLocaleString(undefined, { maximumFractionDigits: digits });
-}
-function ms(n) { return `${fmt(n, 0)} ms`; }
-function pct(n) { return `${fmt(n * 100, 2)}%`; }
+/* k6 runtime imports (CommonJS-friendly) */
+const http = require('k6/http');
+const { check, sleep } = require('k6');
+const reporter = require('../vendor/handleSummary.js'); // expects module.exports = { handleSummary }
+const openFile = open; // k6 global 'open' (reads local files)
 
-function parseTagKey(key) {
-  // Accept shapes like: http_req_duration{feature:ReportingAPIAlpha1,endpoint:GetProjects}
-  const m = key.match(/^([\w_]+)\{(.+)\}$/);
-  if (!m) return null;
-  const metric = m[1];
-  const tagsStr = m[2];
-  const tags = {};
-  for (const pair of tagsStr.split(',')) {
-    const [k, ...rest] = pair.split(':');
-    const v = rest.join(':'); // allow ':' inside values just in case
-    tags[k.trim()] = (v || '').trim();
-  }
-  return { metric, tags };
+/* ===== 1) Load endpoints map (JSON first, TS fallback) ===== */
+let ENDPOINTS_BY_FEATURE = {};
+try {
+  ENDPOINTS_BY_FEATURE = JSON.parse(openFile('../sources/endpoints.byFeature.json'));
+} catch (_) {
+  // Fallback to require() if you ever need it (kept for safety)
+  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
 }
 
-function collectByTag(data) {
-  const byFeature = new Map();      // feature -> { p95[], reqs[], endpoints: Map }
-  const byEndpoint = [];            // flat list for table
+/* ===== 2) Env controls =====
+   FEATURES: comma separated feature names (exact, case-sensitive) — default all
+   ENDPOINT_FILTER: substring filter on endpoint name (optional)
+   BASE_URL: if provided, will replace the original host in each URL
+   TOKEN: bearer token to use for POST/PATCH/DELETE (process.env.token style)
+   RPS, DURATION, PREALLOC, MAXVUS: load shape knobs
+   THRESHOLDS_ON: 'false' to disable default thresholds
+*/
+const ENV = __ENV || {};
+const FEATURE_NAMES = (ENV.FEATURES || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-  const metrics = data.metrics || {};
+const ENDPOINT_FILTER = (ENV.ENDPOINT_FILTER || '').trim();
+const BASE_URL = (ENV.BASE_URL || '').trim();
+const TOKEN = ENV.token || ENV.TOKEN || '';   // keep parity with playwright env
+const RPS = Number(ENV.RPS || 1);
+const DURATION = ENV.DURATION || '30s';
+const PREALLOC = Number(ENV.PREALLOC || 6);
+const MAXVUS = Number(ENV.MAXVUS || 60);
+const THRESHOLDS_ON = String(ENV.THRESHOLDS_ON || 'true').toLowerCase() !== 'false';
 
-  // submetric helpers
-  const trend = (k) => metrics[k] && metrics[k].values ? metrics[k].values : null;
-  const counter = (k) => metrics[k] && metrics[k].values ? metrics[k].values : null;
-
-  for (const key of Object.keys(metrics)) {
-    const parsed = parseTagKey(key);
-    if (!parsed) continue;
-
-    const { metric, tags } = parsed;
-    const feature = tags.feature;
-    const endpoint = tags.endpoint;
-
-    // only aggregate items that have both feature and endpoint tags
-    if (!feature || !endpoint) continue;
-
-    if (metric === 'http_req_duration') {
-      const t = trend(key);
-      const p95 = t?.['p(95)'] ?? t?.p95 ?? null;
-
-      // matching http_reqs counter for the same tag set, if present
-      const reqKey = `http_reqs{feature:${feature},endpoint:${endpoint}}`;
-      const c = counter(reqKey);
-      const reqs = c?.count ?? null;
-
-      // feature bucket
-      if (!byFeature.has(feature)) {
-        byFeature.set(feature, { p95s: [], reqs: [], endpoints: new Map() });
+/* ===== 3) Options (single scenario; simple + robust) ===== */
+export const options = {
+  scenarios: {
+    console: {
+      executor: 'constant-arrival-rate',
+      rate: RPS,
+      timeUnit: '1s',
+      duration: DURATION,
+      preAllocatedVUs: PREALLOC,
+      maxVUs: MAXVUS,
+      gracefulStop: '30s',
+    },
+  },
+  thresholds: THRESHOLDS_ON
+    ? {
+        http_req_failed: ['rate<0.20'],          // relax or tune as you wish
+        http_req_duration: ['p(95)<60000'],      // 95th percentile under 60s
       }
-      const F = byFeature.get(feature);
-      if (p95 != null) F.p95s.push(p95);
-      if (reqs != null) F.reqs.push(reqs);
+    : {},
+};
 
-      // endpoint line
-      byEndpoint.push({
-        feature, endpoint,
-        p90: t?.['p(90)'] ?? null,
-        p95,
-        p99: t?.['p(99)'] ?? null,
-        avg: t?.avg ?? null,
-        min: t?.min ?? null,
-        max: t?.max ?? null,
-        reqs: reqs ?? 0,
-      });
+/* ===== 4) Small helpers ===== */
+function replaceBase(urlStr) {
+  if (!BASE_URL) return urlStr;
+  try {
+    const u = new URL(urlStr);
+    const base = new URL(BASE_URL);
+    u.protocol = base.protocol;
+    u.host = base.host;
+    return u.toString();
+  } catch (_) {
+    return urlStr;
+  }
+}
 
-      // store under feature->endpoint (for future extensions if needed)
-      if (!F.endpoints.has(endpoint)) F.endpoints.set(endpoint, byEndpoint[byEndpoint.length - 1]);
+function minifyBody(body) {
+  if (body == null) return null;
+  const s = String(body).trim();
+  if (!s) return null;
+  // try JSON minify if possible, else just trimmed text
+  try {
+    return JSON.stringify(JSON.parse(s));
+  } catch {
+    return s.replace(/\s+/g, ' ');
+  }
+}
+
+function buildHeaders(method) {
+  // GET: no Content-Type, no Authorization
+  if (method === 'GET') return {};
+  const h = { 'Content-Type': 'application/json' };
+  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
+  return h;
+}
+
+/* ===== 5) Select feature(s) & endpoints ===== */
+function selectedEndpoints() {
+  let featuresToUse = FEATURE_NAMES.length
+    ? FEATURE_NAMES
+    : Object.keys(ENDPOINTS_BY_FEATURE);
+
+  const list = [];
+  for (let i = 0; i < featuresToUse.length; i += 1) {
+    const feature = featuresToUse[i];
+    const eps = ENDPOINTS_BY_FEATURE[feature] || [];
+    for (let j = 0; j < eps.length; j += 1) {
+      const ep = eps[j];
+      if (ENDPOINT_FILTER && String(ep.name).indexOf(ENDPOINT_FILTER) === -1) continue;
+      list.push({ feature, ep });
     }
   }
+  console.log(
+    `Selected ${list.length} endpoint(s) across FEATURES: ${featuresToUse.join(', ')}`
+  );
+  return list;
+}
 
-  // summarize features (avg of endpoint p95s, sum of reqs)
-  const featureRows = [];
-  for (const [feature, v] of byFeature.entries()) {
-    const p95 =
-      v.p95s.length ? v.p95s.reduce((a, b) => a + b, 0) / v.p95s.length : null;
-    const reqs = v.reqs.length ? v.reqs.reduce((a, b) => a + b, 0) : 0;
-    featureRows.push({ feature, p95, reqs, endpoints: v.endpoints.size });
+/* ===== 6) Runner (tags added to requests & checks) ===== */
+export default function () {
+  const entries = selectedEndpoints();
+  if (!entries.length) {
+    // nothing to do; avoid spinning
+    sleep(1);
+    return;
   }
 
-  // stable sorts
-  featureRows.sort((a, b) => (b.reqs - a.reqs) || (b.p95 - a.p95));
-  byEndpoint.sort((a, b) => (b.reqs - a.reqs) || (b.p95 - a.p95));
+  // Walk a bounded slice so one VU iteration doesn’t attempt everything at once.
+  // This keeps constant-arrival-rate stable while still sampling many endpoints.
+  const sliceSize = Math.min(10, entries.length);
+  for (let i = 0; i < sliceSize; i += 1) {
+    const pair = entries[(i + __ITER) % entries.length];
+    const feature = pair.feature;
+    const ep = pair.ep;
 
-  return { featureRows, endpointRows: byEndpoint };
+    const url = replaceBase(ep.url);
+    const method = (ep.method || 'GET').toUpperCase();
+    const headers = buildHeaders(method);
+    const tags = { feature, endpoint: String(ep.name || `${method} ${url}`) };
+
+    let body = minifyBody(ep.body);
+    let res;
+
+    if (method === 'GET') {
+      // GET: headers only, no body, with tags
+      res = http.get(url, { headers, tags });
+    } else {
+      // POST / PUT / PATCH / DELETE via http.request to keep one path
+      res = http.request(method, url, body, { headers, tags });
+    }
+
+    // expectations
+    const expectStatus = ep.expect && typeof ep.expect.status === 'number'
+      ? ep.expect.status
+      : 200;
+
+    const mustContain = ep.expect && typeof ep.expect.text === 'string'
+      ? ep.expect.text
+      : null;
+
+    // checks with tags (so summary can group them)
+    const ok1 = check(res, { 'status ok': (r) => r.status === expectStatus }, tags);
+
+    if (mustContain) {
+      // normalize to string for safety
+      const text = String(res && res.body ? res.body : '');
+      // simple substring check
+      check(res, { 'body has text': () => text.indexOf(mustContain) !== -1 }, tags);
+    }
+
+    // small pause to avoid hammering same endpoint in one iteration
+    sleep(0.1);
+  }
 }
 
-function renderTable(headers, rows) {
-  const thead = `<thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>`;
-  const tbody = `<tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody>`;
-  return `<table>${thead}${tbody}</table>`;
-}
-
+/* ===== 7) HTML report hook ===== */
 export function handleSummary(data) {
-  // ===== top cards =====
-  const checks = data.metrics?.checks?.values || {};
-  const http = data.metrics?.http_req_duration?.values || {};
-  const iters = data.metrics?.iterations?.values || {};
-  const vusMax = data.metrics?.vus_max?.values || {};
-  const title = `SDLC Auto Gov Load Test – ${new Date().toISOString().replace('T',' ').slice(0,19)}`;
-
-  // ===== per-feature/endpoint aggregation from tags =====
-  const { featureRows, endpointRows } = collectByTag(data);
-
-  // feature table
-  const featureTable = renderTable(
-    ['Feature', 'Requests', 'Endpoints', 'p95 (ms)'],
-    featureRows.map(r => [r.feature, fmt(r.reqs), fmt(r.endpoints), ms(r.p95)])
-  );
-
-  // endpoint table (top 50 to keep page snappy)
-  const endpointTable = renderTable(
-    ['Feature', 'Endpoint', 'Requests', 'avg', 'p90', 'p95', 'p99', 'min', 'max'],
-    endpointRows.slice(0, 50).map(r => [
-      r.feature, r.endpoint, fmt(r.reqs),
-      ms(r.avg), ms(r.p90), ms(r.p95), ms(r.p99), ms(r.min), ms(r.max),
-    ])
-  );
-
-  // tiny bar “chart” for percentiles (CSS only)
-  const p50 = http['p(50)'] ?? 0;
-  const p90 = http['p(90)'] ?? 0;
-  const p95 = http['p(95)'] ?? 0;
-  const p99 = http['p(99)'] ?? 0;
-  const max = Math.max(p50, p90, p95, p99, 1);
-  const bar = (v, label) =>
-    `<div class="bar"><div class="fill" style="width:${(v / max) * 100}%"></div><span>${label} ${ms(v)}</span></div>`;
-
-  const css = `
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#0a0a0a;background:#fff}
-    h1{font-size:22px;margin:0 0 16px}
-    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:16px 0}
-    .card{border:1px solid #e5e7eb;border-radius:10px;padding:12px;background:#fafafa}
-    .card h3{margin:0 0 6px;font-size:12px;color:#555;text-transform:uppercase;letter-spacing:.06em}
-    .card .v{font-size:18px;font-weight:600}
-    .bar{display:flex;align-items:center;gap:8px;margin:6px 0}
-    .bar .fill{height:8px;background:#3b82f6;border-radius:8px}
-    table{border-collapse:separate;border-spacing:0;width:100%;margin:18px 0;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-    th,td{padding:8px 10px;border-bottom:1px solid #eee;font-size:13px}
-    thead th{background:#f8fafc;font-weight:600;text-align:left}
-    tbody tr:nth-child(even){background:#fcfcfc}
-    .muted{color:#6b7280}
-  </style>`;
-
-  const html = `
-  <!doctype html><meta charset="utf-8"><title>${title}</title>${css}
-  <h1>${title}</h1>
-
-  <div class="cards">
-    <div class="card"><h3>Checks (pass/fail)</h3><div class="v">${fmt(checks.passes || 0)} / ${fmt(checks.fails || 0)}</div></div>
-    <div class="card"><h3>Requests</h3><div class="v">${fmt(data.metrics?.http_reqs?.values?.count || 0)} total</div></div>
-    <div class="card"><h3>Latency p95</h3><div class="v">${ms(p95)}</div></div>
-    <div class="card"><h3>Iterations</h3><div class="v">${fmt(iters.count || 0)}</div></div>
-    <div class="card"><h3>VUs max</h3><div class="v">${fmt(vusMax.value || 0)}</div></div>
-  </div>
-
-  <div class="card">
-    <h3>Percentiles</h3>
-    ${bar(p50,'p(50)')}
-    ${bar(p90,'p(90)')}
-    ${bar(p95,'p(95)')}
-    ${bar(p99,'p(99)')}
-  </div>
-
-  <h2>Features</h2>
-  ${featureRows.length ? featureTable : '<p class="muted">No feature tags were detected.</p>'}
-
-  <h2>Endpoints (Top 50)</h2>
-  ${endpointRows.length ? endpointTable : '<p class="muted">No endpoint tags were detected.</p>'}
-
-  <details><summary>Raw JSON (truncated)</summary><pre>${JSON.stringify(data, null, 2).slice(0, 120000)}${data.length > 120000 ? '\n…' : ''}</pre></details>
-  `;
-
-  // also keep the lightweight text summary in stdout
-  const text = [
-    `Checks:  ${fmt(checks.passes || 0)} pass / ${fmt(checks.fails || 0)} fail`,
-    `Requests: ${fmt(data.metrics?.http_reqs?.values?.count || 0)}`,
-    `Latency p95: ${ms(p95)}`,
-  ].join('\n');
-
-  return {
-    'stdout': text + '\n',
-    'perf/k6/reports/summary.html': html,
-  };
+  // The vendor module returns { 'perf/k6/reports/summary.html': htmlString, stdout?: string }
+  return reporter.handleSummary(data);
 }
-
-export default handleSummary;
