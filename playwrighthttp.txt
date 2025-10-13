@@ -1,202 +1,100 @@
-// perf/k6/scenarios/from-playwright.http.js
-/* eslint-disable no-undef */
-/**
- * k6 runner (no transpile). Reads endpoints map, builds scenarios per endpoint,
- * tags every request, and writes rich HTML report via vendor/handleSummary.js
- */
+// Minimal, ES5-safe HTML summary renderer for k6
+// No arrow funcs, no destructuring, no optional chaining.
 
-const http = require('k6/http');
-const { check, sleep } = require('k6');
-const handleSummary = require('../vendor/handleSummary.js');
-
-// ---- Load endpoints map (CommonJS wrapper; first JSON, fallback to .js)
-let ENDPOINTS_BY_FEATURE;
-try {
-  ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
-} catch (_) {
-  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
+function pad(n) { return (n < 10 ? "0" : "") + n; }
+function fmtMs(x) { return Math.round(x) + " ms"; }
+function fmtNum(x) { return String(x); }
+function safe(obj, a, b) {
+  return obj && obj[a] && obj[a][b] && obj[a][b].values ? obj[a][b].values : (obj && obj[a] && obj[a].values ? obj[a].values : null);
 }
-
-// ---- Read environment / knobs
-const ENV = (String(__ENV.ENV || 'dev').toLowerCase());
-const FEATURES_RAW = String(__ENV.FEATURES || '').trim();
-const ENDPOINT_FILTER = String(__ENV.ENDPOINT_FILTER || '').toLowerCase() || null;
-
-const RPS   = Number(__ENV.RPS || '1');        // per-scenario arrival rate
-const DURATION = String(__ENV.DURATION || '30s');
-const PREALLOC = Number(__ENV.PREALLOC || '5');
-const MAXVUS   = Number(__ENV.MAXVUS || '60');
-
-const TOKEN = String(__ENV.TOKEN || __ENV.GRAFEAS_LOGIN_TOKEN || '');
-const BASE_URL = String(__ENV.BASE_URL || '');
-
-// consistency for the reporter
-const THRESHOLDS_ON = (String(__ENV.THRESHOLDS_ON || 'false').toLowerCase() === 'true');
-
-// ---- Helper: host override for dev / uat if full URL provided
-function withHost(url) {
-  try {
-    const u = new URL(url);
-    if (ENV === 'dev') u.hostname = u.hostname.replace(/-test\b/i, '-dev');
-    if (ENV === 'uat') u.hostname = u.hostname.replace(/-dev\b/i, '-test');
-    return u.toString();
-  } catch (_) {
-    // relative path + optional BASE_URL
-    if (!BASE_URL) return url;
-    const u = new URL(url, BASE_URL);
-    return u.toString();
-  }
-}
-
-// ---- Select features/endpoints (no modern syntax)
-function selectEndpoints(map) {
-  // features list
-  var selectedFeatures = [];
-  if (FEATURES_RAW) {
-    var parts = FEATURES_RAW.split(',').map(function (s) { return String(s || '').trim(); })
-      .filter(function (s) { return !!s; });
-    selectedFeatures = parts;
-  } else {
-    selectedFeatures = Object.keys(map);
-  }
-
-  var out = [];
-  for (var i = 0; i < selectedFeatures.length; i++) {
-    var feat = selectedFeatures[i];
-    var list = map[feat] || [];
-    for (var j = 0; j < list.length; j++) {
-      var ep = list[j];
-      // endpoint name filter (only skip when a filter exists AND it doesn't match)
-      var nm = String(ep && ep.name ? ep.name : '').toLowerCase();
-      if (ENDPOINT_FILTER && nm.indexOf(ENDPOINT_FILTER) === -1) continue;
-
-      // build plain object (avoid spread)
-      var rec = {
-        feature: feat,
-        name: ep.name,
-        method: ep.method,
-        url: withHost(ep.url || ep.path || ep.uri || ''),
-        headers: ep.headers || {},
-        auth: ep.auth || null,
-        body: ep.body,
-        expect: ep.expect || {}
-      };
-      out.push(rec);
-    }
+function val(values, key, def) { return values && values[key] != null ? values[key] : def; }
+function spark(vals) {
+  // quick ASCII sparkline: map to 8 levels
+  var chars = "▁▂▃▄▅▆▇█";
+  if (!vals || !vals.length) return "";
+  var min = vals[0], max = vals[0], i;
+  for (i = 1; i < vals.length; i++) { if (vals[i] < min) min = vals[i]; if (vals[i] > max) max = vals[i]; }
+  var out = "", range = (max - min) || 1;
+  for (i = 0; i < vals.length; i++) {
+    var idx = Math.round(((vals[i] - min) / range) * (chars.length - 1));
+    out += chars.charAt(idx);
   }
   return out;
 }
 
-var ENDPOINTS = selectEndpoints(ENDPOINTS_BY_FEATURE);
+function renderHTML(data) {
+  var now = new Date();
+  var title = "SDLC Auto Gov Load Test – " + now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate()) +
+              " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
 
-// print a concise selection summary
-console.log(
-  'Selected ' + ENDPOINTS.length + ' endpoint(s) across FEATURES: [' +
-  Object.keys(ENDPOINTS_BY_FEATURE).join(', ') + '] ' +
-  (ENDPOINT_FILTER ? ' with ENDPOINT_FILTER=' + ENDPOINT_FILTER : '')
-);
+  var checksV = safe(data, "checks", "default") || safe(data, "checks", ""); // handle k6 versions
+  var httpV   = safe(data, "http_req_duration", "default") || safe(data, "http_req_duration", "");
+  var reqsV   = safe(data, "http_reqs", "default") || safe(data, "http_reqs", "");
+  var vusV    = safe(data, "vus_max", "default") || safe(data, "vus_max", "");
+  var itersV  = safe(data, "iterations", "default") || safe(data, "iterations", "");
 
-// ---- Build scenarios: one per endpoint
-var scenarios = {};
-for (var s = 0; s < ENDPOINTS.length; s++) {
-  var ep = ENDPOINTS[s];
-  var scenName = 'ep_' + s; // stable, short
-  scenarios[scenName] = {
-    executor: 'constant-arrival-rate',
-    rate: RPS,
-    timeUnit: '1s',
-    duration: DURATION,
-    preAllocatedVUs: PREALLOC,
-    maxVUs: MAXVUS,
-    exec: scenName,
-  };
+  var checksPass = val(checksV, "passes", 0);
+  var checksFail = val(checksV, "fails", 0);
+  var reqCount   = val(reqsV, "count", 0);
+  var p95        = val(httpV, "p(95)", 0);
+  var avg        = val(httpV, "avg", 0);
+  var min        = val(httpV, "min", 0);
+  var max        = val(httpV, "max", 0);
+  var iterations = val(itersV, "count", 0);
+  var vusMax     = val(vusV, "value", val(vusV, "max", 0)); // k6 versions differ
 
-  // Dynamically create the scenario function without modern syntax
-  (function register(epIdx, epDef, fnName) {
-    // headers per request (auth only for write methods)
-    function buildHeaders(method) {
-      var h = {};
-      // copy user headers without mutating source
-      var src = epDef.headers || {};
-      for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) h[k] = src[k];
+  // Build a tiny distribution line using a few percentiles if present
+  var distVals = [];
+  var p50 = val(httpV, "med", null); if (p50 != null) distVals.push(p50);
+  var p90 = val(httpV, "p(90)", null); if (p90 != null) distVals.push(p90);
+  var p95v = val(httpV, "p(95)", null); if (p95v != null) distVals.push(p95v);
+  var p99 = val(httpV, "p(99)", null); if (p99 != null) distVals.push(p99);
 
-      if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
-        if (!h['Content-Type']) h['Content-Type'] = 'application/json';
-        if (epDef.auth === 'bearer' || TOKEN) {
-          // Token from env only (we avoid literal "Authorization": "Bearer")
-          if (TOKEN) h['Authorization'] = 'Bearer ' + TOKEN;
-        }
-      }
-      return h;
+  var html = "";
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<title>" + title + "</title>";
+  html += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}h1{font-size:20px;margin:0 0 16px}table{border-collapse:collapse;margin:12px 0;width:680px;max-width:100%}th,td{border:1px solid #ddd;padding:8px 10px;font-size:14px}th{background:#fafafa;text-align:left}code{background:#f5f5f5;padding:2px 4px;border-radius:4px}hr{border:0;border-top:1px solid #eee;margin:20px 0}</style>";
+  html += "</head><body>";
+  html += "<h1>" + title + "</h1>";
+
+  html += "<table>";
+  html += "<tr><th>Checks (pass/fail)</th><td>" + fmtNum(checksPass) + " / " + fmtNum(checksFail) + "</td></tr>";
+  html += "<tr><th>Requests</th><td>" + fmtNum(reqCount) + " total</td></tr>";
+  html += "<tr><th>Latency p95</th><td>" + fmtMs(p95) + "</td></tr>";
+  html += "<tr><th>Latency avg / min / max</th><td>" + fmtMs(avg) + " / " + fmtMs(min) + " / " + fmtMs(max) + "</td></tr>";
+  html += "<tr><th>Iterations</th><td>" + fmtNum(iterations) + "</td></tr>";
+  html += "<tr><th>VUs max</th><td>" + fmtNum(vusMax) + "</td></tr>";
+  html += "</table>";
+
+  if (distVals.length) {
+    html += "<div><strong>Latency distribution</strong><br><code>" + spark(distVals) + "</code></div>";
+  }
+
+  html += "<hr><details open><summary><strong>Raw JSON (truncated)</strong></summary>";
+  // Trim JSON to keep file size sane
+  var raw = JSON.stringify({
+    root_group: data.root_group,
+    options: data.options,
+    metrics: {
+      checks: data.metrics && data.metrics.checks,
+      http_req_duration: data.metrics && data.metrics.http_req_duration,
+      http_reqs: data.metrics && data.metrics.http_reqs,
+      iterations: data.metrics && data.metrics.iterations,
+      vus_max: data.metrics && data.metrics.vus_max
     }
+  }, null, 2);
+  html += "<pre style='white-space:pre-wrap'>" + raw.replace(/[<>&]/g, function(s){ return {"<":"&lt;",">":"&gt;","&":"&amp;"}[s]; }) + "</pre>";
+  html += "</details>";
 
-    // register global function k6 will call
-    global[fnName] = function () {
-      var method = String(epDef.method || 'GET').toUpperCase();
-      var url = epDef.url;
-      var headers = buildHeaders(method);
-
-      var tags = { feature: epDef.feature, endpoint: epDef.name || fnName, method: method };
-
-      var res;
-      if (method === 'GET') {
-        res = http.get(url, { headers: headers, tags: tags });
-      } else if (method === 'POST') {
-        res = http.post(url, epDef.body || '', { headers: headers, tags: tags });
-      } else if (method === 'PUT') {
-        res = http.put(url, epDef.body || '', { headers: headers, tags: tags });
-      } else if (method === 'PATCH') {
-        res = http.patch(url, epDef.body || '', { headers: headers, tags: tags });
-      } else if (method === 'DELETE') {
-        res = http.del(url, null, { headers: headers, tags: tags });
-      } else {
-        // fallback as generic request
-        res = http.request(method, url, epDef.body || '', { headers: headers, tags: tags });
-      }
-
-      var expectStatus = (epDef.expect && epDef.expect.status) ? Number(epDef.expect.status) : 200;
-      var ok = check(res, { 'status ok': function (r) { return r.status === expectStatus; } }, tags);
-
-      // Push per-request metadata for reporter (avoid spread)
-      if (!global.__k6_meta) global.__k6_meta = [];
-      global.__k6_meta.push({
-        feature: epDef.feature,
-        endpoint: epDef.name || fnName,
-        method: method,
-        status: res.status,
-        dur: res.timings ? res.timings.duration : null,
-        ttfb: res.timings ? res.timings.waiting : null
-      });
-
-      // Optional text contains
-      var need = epDef.expect && epDef.expect.text ? String(epDef.expect.text) : null;
-      if (need) {
-        check(res, { 'body has text': function (r) { return String(r.body || '').indexOf(need) !== -1; } }, tags);
-      }
-
-      sleep(0.1);
-      return ok;
-    };
-  })(s, ep, scenName);
+  html += "</body></html>";
+  return html;
 }
 
-// ---- Export k6 options and default
-var thresholds = {};
-if (THRESHOLDS_ON) {
-  thresholds['http_req_failed'] = ['rate<0.01'];
-  thresholds['http_req_duration{expected_response:true}'] = ['p(95)<1000'];
-}
-
-export const options = {
-  scenarios: scenarios,
-  thresholds: thresholds
+module.exports = function handleSummary(data) {
+  var html = renderHTML(data);
+  var out = {};
+  out["perf/k6/reports/summary.html"] = html;
+  // for convenience, also drop a JSON copy
+  out["perf/k6/reports/summary.json"] = JSON.stringify(data);
+  return out;
 };
-
-export default function () {
-  // will never be called; k6 uses named exec functions above
-}
-
-// ---- Summary (HTML written by handleSummary)
-export function handleSummary(data) {
-  return handleSummary(data);
-}
