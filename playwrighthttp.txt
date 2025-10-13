@@ -1,46 +1,233 @@
-// perf/k6/vendor/handleSummary.js
-// Tiny, dependency-free HTML report + JSON dump
-const TITLE = `SDLC Auto Gov Load Test – ${new Date().toISOString().replace('T',' ').slice(0,19)}`;
+// Rich, self-contained HTML summary for k6
+// - No external libs
+// - Optionally uses globalThis.__k6_meta pushed by the runner to show
+//   per-feature/endpoint breakdowns and “top slowest” tables.
 
-function pad(n){ return (n<10?'0':'')+n; }
-function fmtMs(x){ return (Math.round(x*100)/100) + ' ms'; }
+const TITLE_PREFIX = 'SDLC Auto Gov Load Test';
+
+function fmt(n) {
+  if (n == null || Number.isNaN(n)) return 'n/a';
+  return new Intl.NumberFormat('en-GB', { maximumFractionDigits: 2 }).format(n);
+}
+function fmtMs(n) { return n == null ? 'n/a' : `${fmt(n)} ms`; }
+function pct(n) { return n == null ? 'n/a' : `${fmt(n)}%`; }
+function safe(v, d = 0) { return v == null ? d : v; }
+function nowStamp() {
+  const d = new Date();
+  const parts = [
+    d.getFullYear(),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0'),
+    String(d.getHours()).padStart(2, '0'),
+    String(d.getMinutes()).padStart(2, '0'),
+    String(d.getSeconds()).padStart(2, '0'),
+  ];
+  return `${parts[0]}-${parts[1]}-${parts[2]} ${parts[3]}:${parts[4]}:${parts[5]}`;
+}
+
+// Tiny inline “percentile bar”
+function percentileBar(min, p50, p90, p95, max) {
+  const width = 480;
+  const scale = (x) => {
+    const lo = Math.min(min ?? 0, p95 ?? 0, p90 ?? 0, p50 ?? 0);
+    const hi = Math.max(max ?? 1, p95 ?? 1, p90 ?? 1, p50 ?? 1);
+    if (!Number.isFinite(x)) return 0;
+    return Math.max(0, Math.min(width, ((x - lo) / (hi - lo)) * width));
+  };
+  const px = { min: scale(min), p50: scale(p50), p90: scale(p90), p95: scale(p95), max: scale(max) };
+  return `
+<svg viewBox="0 0 ${width} 18" width="${width}" height="18" aria-label="latency bar">
+  <rect x="0" y="7" width="${width}" height="4" fill="#e5e7eb"/>
+  <rect x="${px.min}" y="6" width="2" height="6" fill="#9ca3af"/>
+  <rect x="${px.p50}" y="4" width="2" height="10" fill="#2563eb"/>
+  <rect x="${px.p90}" y="4" width="2" height="10" fill="#fb923c"/>
+  <rect x="${px.p95}" y="4" width="2" height="10" fill="#ef4444"/>
+  <rect x="${px.max}" y="6" width="2" height="6" fill="#111827"/>
+</svg>
+<div class="legend">
+  <span><i class="d0"></i>min ${fmtMs(min)}</span>
+  <span><i class="d50"></i>p50 ${fmtMs(p50)}</span>
+  <span><i class="d90"></i>p90 ${fmtMs(p90)}</span>
+  <span><i class="d95"></i>p95 ${fmtMs(p95)}</span>
+  <span><i class="dmax"></i>max ${fmtMs(max)}</span>
+</div>`;
+}
+
+// Build HTML table helper
+function table(cols, rows) {
+  return `
+<table>
+  <thead><tr>${cols.map(c => `<th>${c}</th>`).join('')}</tr></thead>
+  <tbody>
+    ${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}
+  </tbody>
+</table>`;
+}
+
+function collectMetaFromGlobal() {
+  // Expected shape when the runner pushes:
+  // __k6_meta.push({ feature, endpoint, method, status, dur, ttfb });
+  const meta = (globalThis && globalThis.__k6_meta) ? globalThis.__k6_meta : [];
+  // group by feature -> endpoint
+  const byFeat = new Map();
+  for (const m of meta) {
+    const f = m.feature || 'unknown';
+    const e = m.endpoint || 'unknown';
+    if (!byFeat.has(f)) byFeat.set(f, new Map());
+    const mapE = byFeat.get(f);
+    if (!mapE.has(e)) mapE.set(e, []);
+    mapE.get(e).push(m);
+  }
+  return { raw: meta, byFeat };
+}
+
+function topSlow(meta, k = 10) {
+  // average duration by endpoint (across features combined label)
+  const agg = new Map(); // key = feature|endpoint -> {count,sum}
+  for (const m of meta) {
+    const key = `${m.feature} | ${m.endpoint}`;
+    const a = agg.get(key) || { count: 0, sum: 0 };
+    a.count += 1;
+    a.sum += safe(m.dur, 0);
+    agg.set(key, a);
+  }
+  const rows = [...agg.entries()]
+    .map(([key, a]) => ({ key, avg: a.sum / Math.max(1, a.count), count: a.count }))
+    .sort((x, y) => y.avg - x.avg)
+    .slice(0, k);
+  return rows.map(r => [r.key, fmtMs(r.avg), fmt(r.count)]);
+}
+
+function errorsByEndpoint(meta) {
+  const bad = meta.filter(m => m.status >= 400);
+  if (!bad.length) return [];
+  const agg = new Map();
+  for (const m of bad) {
+    const key = `${m.feature} | ${m.endpoint}`;
+    agg.set(key, (agg.get(key) || 0) + 1);
+  }
+  return [...agg.entries()].sort((a, b) => b[1] - a[1]).map(([k, c]) => [k, fmt(c)]);
+}
 
 export function handleSummary(data) {
-  const checks = data.metrics.checks ? data.metrics.checks.values : { passes: 0, fails: 0 };
-  const http = data.metrics.http_req_duration ? data.metrics.http_req_duration.values : {};
-  const iters = data.metrics.iterations ? data.metrics.iterations.values.count : 0;
-  const vusMax = data.metrics.vus_max ? data.metrics.vus_max.values.value : 0;
+  // Overall metrics
+  const checks = data.metrics.checks?.values ?? {};
+  const http = data.metrics.http_req_duration?.values ?? {};
+  const ttfb = data.metrics.http_req_waiting?.values ?? {}; // TTFB = waiting
+  const httpReqs = data.metrics.http_reqs?.values ?? {};
+  const failed = data.metrics.http_req_failed?.values ?? {};
+  const iters = data.metrics.iterations?.values ?? {};
+  const vusMax = data.metrics.vus_max?.values ?? {};
+  const title = `${TITLE_PREFIX} – ${nowStamp()}`;
+
+  const p50 = http['p(50)'];
+  const p90 = http['p(90)'];
+  const p95 = http['p(95)'];
+  const min = http.min;
+  const max = http.max;
+
+  // Optional meta from runner tags
+  const meta = collectMetaFromGlobal();
+
+  // Build sections
+  const overviewRows = [
+    ['Checks (pass/fail)', `${fmt(checks.passes || 0)} / ${fmt(checks.fails || 0)}`],
+    ['Requests', `${fmt(httpReqs.count || 0)} total – RPS ${fmt(httpReqs.rate || 0)}`],
+    ['Latency p50/p90/p95/max', `${fmtMs(p50)} / ${fmtMs(p90)} / ${fmtMs(p95)} / ${fmtMs(max)}`],
+    ['TTFB p95', fmtMs(ttfb['p(95)'])],
+    ['Failures (http_req_failed)', pct(failed.rate ? failed.rate * 100 : 0)],
+    ['Iterations', fmt(iters.count || 0)],
+    ['VUs max', fmt(vusMax.value || 0)],
+  ];
+
+  const topSlowRows = topSlow(meta.raw, 10);
+  const errorRows = errorsByEndpoint(meta.raw);
+
+  // Per-feature → per-endpoint table(s)
+  const perFeatureHtml = [...meta.byFeat.entries()].map(([feat, mapE]) => {
+    const rows = [...mapE.entries()].map(([ep, list]) => {
+      const count = list.length;
+      const ok = list.filter(x => x.status < 400).length;
+      const fail = count - ok;
+      const avg = list.reduce((s, x) => s + safe(x.dur, 0), 0) / Math.max(1, count);
+      const p95local = list
+        .map(x => safe(x.dur, 0))
+        .sort((a, b) => a - b)[Math.max(0, Math.floor(count * 0.95) - 1)];
+      return [ep, fmt(count), fmt(ok), fmt(fail), fmtMs(avg), fmtMs(p95local)];
+    });
+    return `
+      <h3>Feature: ${feat}</h3>
+      ${table(['Endpoint', 'Reqs', 'Pass', 'Fail', 'Avg dur', 'p95 dur'], rows)}
+    `;
+  }).join('\n');
 
   const html = `
 <!doctype html><meta charset="utf-8">
-<title>${TITLE}</title>
+<title>${title}</title>
 <style>
- body{font:14px system-ui,Segoe UI,Arial,sans-serif;padding:24px;line-height:1.4}
- h1{margin:0 0 12px}
- table{border-collapse:collapse;margin:12px 0;min-width:520px}
- th,td{border:1px solid #ddd;padding:8px 10px;text-align:left}
- .bar{height:6px;background:#e5e5e5;border-radius:3px;overflow:hidden}
- .bar>i{display:block;height:100%;background:#3b82f6}
- .ok{color:#059669}.bad{color:#dc2626}
- pre{background:#f7f7f7;border:1px solid #eee;padding:12px;overflow:auto}
+  :root { --fg:#111827; --muted:#6b7280; --ok:#059669; --bad:#dc2626; --blue:#2563eb; }
+  body { font:14px system-ui,Segoe UI,Arial,sans-serif; color:var(--fg); margin:0; }
+  header { padding:20px 24px; border-bottom:1px solid #eee; }
+  main { padding:16px 24px 48px; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  .muted{ color:var(--muted); font-size:12px; }
+  table { border-collapse:collapse; margin:12px 0; width:100%; max-width:980px; }
+  th,td { border:1px solid #e5e7eb; padding:8px 10px; text-align:left; }
+  th { background:#f9fafb; }
+  .legend { display:flex; gap:12px; margin:6px 0 10px; font-size:12px; color:#374151;}
+  .legend i{ display:inline-block; width:10px; height:10px; margin-right:6px; vertical-align:-1px; }
+  .legend .d0{background:#9ca3af} .legend .d50{background:#2563eb}
+  .legend .d90{background:#fb923c} .legend .d95{background:#ef4444} .legend .dmax{background:#111827}
+  .grid { display:grid; grid-template-columns:1fr; gap:16px; max-width:1040px;}
+  @media (min-width: 980px){ .grid { grid-template-columns: 1fr 1fr; } }
+  section.card { border:1px solid #e5e7eb; border-radius:10px; padding:16px 18px; background:#fff; }
+  h2 { margin:0 0 8px; font-size:16px; }
+  pre { background:#f9fafb; border:1px solid #eee; padding:12px; overflow:auto; max-height:360px;}
+  details { margin-top:10px; }
 </style>
-<h1>${TITLE}</h1>
-<table>
-  <tr><th>Checks (pass/fail)</th><td>${checks.passes||0} / ${checks.fails||0}</td></tr>
-  <tr><th>Requests</th><td>${data.metrics.http_reqs ? data.metrics.http_reqs.values.count : 0} total</td></tr>
-  <tr><th>Latency p(95)</th><td>${http['p(95)']!=null ? fmtMs(http['p(95)']) : 'n/a'}</td></tr>
-  <tr><th>Iterations</th><td>${iters}</td></tr>
-  <tr><th>VUs max</th><td>${vusMax}</td></tr>
-</table>
-<div class="bar"><i style="width:${Math.min(100, (http['p(95)']||0)/5000*100)}%"></i></div>
-<h3>Raw JSON (truncated)</h3>
-<pre>${JSON.stringify({
-  checks: data.metrics.checks,
-  http_req_duration: data.metrics.http_req_duration,
-  http_reqs: data.metrics.http_reqs,
-  iterations: data.metrics.iterations,
-  vus_max: data.metrics.vus_max
-}, null, 2)}</pre>`;
+
+<header>
+  <h1>${title}</h1>
+  <div class="muted">A concise k6 summary with percentiles, throughput, and endpoint breakdowns.</div>
+</header>
+
+<main>
+  <div class="grid">
+    <section class="card">
+      <h2>Overview</h2>
+      ${table(['Metric', 'Value'], overviewRows)}
+    </section>
+
+    <section class="card">
+      <h2>Latency Distribution</h2>
+      ${percentileBar(min, p50, p90, p95, max)}
+    </section>
+
+    ${topSlowRows.length ? `
+    <section class="card">
+      <h2>Top 10 Slowest Endpoints (avg duration)</h2>
+      ${table(['Feature | Endpoint', 'Avg duration', 'Reqs'], topSlowRows)}
+    </section>` : ''}
+
+    ${errorRows.length ? `
+    <section class="card">
+      <h2>Errors by Endpoint (status ≥ 400)</h2>
+      ${table(['Feature | Endpoint', 'Errors'], errorRows)}
+    </section>` : ''}
+
+    ${perFeatureHtml ? `
+    <section class="card" style="grid-column:1 / -1">
+      <h2>Per Feature / Endpoint</h2>
+      ${perFeatureHtml}
+    </section>` : ''}
+  </div>
+
+  <details>
+    <summary>Raw JSON (full)</summary>
+    <pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>
+  </details>
+</main>
+`;
 
   return {
     'perf/k6/reports/summary.html': html,
@@ -48,8 +235,9 @@ export function handleSummary(data) {
   };
 }
 
-
-//--------------------------------------
-
-import { handleSummary as vendorHandleSummary } from '../vendor/handleSummary.js';
-export function handleSummary(data) { return vendorHandleSummary(data); }
+// Minimal HTML escaping for the raw JSON block
+function escapeHtml(s){
+  return s.replace(/[&<>"']/g, c => (
+    { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+  ));
+}
