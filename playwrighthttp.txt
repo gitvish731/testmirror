@@ -1,119 +1,136 @@
-rm -f perf/k6/sources/endpoints.byFeature.js
-node -e "const fs=require('fs');const p='perf/k6/sources/endpoints.byFeature.json';const out='perf/k6/sources/endpoints.byFeature.js';const txt=fs.readFileSync(p,'utf8').trim();fs.writeFileSync(out,'module.exports = '+txt+';\\n');console.log('wrote',out)"
-
-
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 
 // -----------------------------------------------------------------------------
-// 1️⃣ Load endpoints map (CommonJS wrapper first, JSON fallback)
+// 1) Load endpoints map (CommonJS wrapper first, JSON fallback)
 // -----------------------------------------------------------------------------
-let ENDPOINTS_BY_FEATURE;
+var ENDPOINTS_BY_FEATURE;
 try {
   ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
-} catch (_) {
+} catch (e) {
   ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
 }
 
 // -----------------------------------------------------------------------------
-// 2️⃣ Read environment variables
+// 2) Env
 // -----------------------------------------------------------------------------
-const ENV = (__ENV.ENV || 'dev').toLowerCase();
-const BASE_URL = __ENV.BASE_URL || '';
-const TOKEN = __ENV.TOKEN || '';
-const FEATURES_RAW = String(__ENV.FEATURES || '').split(',').map(s => s.trim()).filter(Boolean);
-const ENDPOINT_FILTER = String(__ENV.ENDPOINT_FILTER || '').trim() || null;
+var ENV         = (__ENV.ENV || 'dev').toLowerCase();
+var BASE_URL    = __ENV.BASE_URL || '';
+var TOKEN       = __ENV.TOKEN || '';
+var FEATURES_IN = ('' + (__ENV.FEATURES || '')).split(','); // may be ['']
+for (var i = 0; i < FEATURES_IN.length; i++) FEATURES_IN[i] = FEATURES_IN[i].trim();
+var ENDPOINT_FILTER = ('' + (__ENV.ENDPOINT_FILTER || '')).trim();
+if (ENDPOINT_FILTER === '') ENDPOINT_FILTER = null;
 
-const DURATION = __ENV.DURATION || '30s';
-const RPS = Number(__ENV.RPS || '1');
-const PREALLOC = Number(__ENV.PREALLOC || '5');
-const MAXVUS = Number(__ENV.MAXVUS || '40');
+var DURATION = __ENV.DURATION || '30s';
+var RPS      = Number(__ENV.RPS || '1');
+var PREALLOC = Number(__ENV.PREALLOC || '5');
+var MAXVUS   = Number(__ENV.MAXVUS || '40');
 
-const THRESHOLDS_ON = (__ENV.THRESHOLDS_ON || 'false').toLowerCase() === 'true';
+var THRESHOLDS_ON = ('' + (__ENV.THRESHOLDS_ON || 'false')).toLowerCase() === 'true';
 
 // -----------------------------------------------------------------------------
-// 3️⃣ Feature & endpoint filtering
+// 3) Feature & endpoint selection
 // -----------------------------------------------------------------------------
-const allFeatures = Object.keys(ENDPOINTS_BY_FEATURE);
-const SELECTED_FEATURES = FEATURES_RAW.length ? FEATURES_RAW : allFeatures;
+var allFeatures = [];
+for (var f in ENDPOINTS_BY_FEATURE) if (Object.prototype.hasOwnProperty.call(ENDPOINTS_BY_FEATURE, f)) allFeatures.push(f);
 
-const ENDPOINTS = [];
-for (const feature of SELECTED_FEATURES) {
-  const src = ENDPOINTS_BY_FEATURE[feature] || [];
-  for (const ep of src) {
-    if (!ENDPOINT_FILTER || String(ep.name).includes(ENDPOINT_FILTER)) {
-      ENDPOINTS.push({ feature, ...ep });
+var SELECTED_FEATURES = [];
+if (FEATURES_IN.length && FEATURES_IN[0] !== '') {
+  for (var a = 0; a < FEATURES_IN.length; a++) {
+    var name = FEATURES_IN[a];
+    if (name && ENDPOINTS_BY_FEATURE[name]) SELECTED_FEATURES.push(name);
+  }
+} else {
+  SELECTED_FEATURES = allFeatures.slice();
+}
+
+var ENDPOINTS = [];
+for (var fi = 0; fi < SELECTED_FEATURES.length; fi++) {
+  var feature = SELECTED_FEATURES[fi];
+  var src = ENDPOINTS_BY_FEATURE[feature] || [];
+  for (var ei = 0; ei < src.length; ei++) {
+    var ep = src[ei];
+    if (!ENDPOINT_FILTER || (('' + ep.name).indexOf(ENDPOINT_FILTER) !== -1)) {
+      // store { feature, ...ep } without spread
+      var rec = { feature: feature, name: ep.name, method: ep.method, url: ep.url, body: ep.body, expect: ep.expect, auth: ep.auth };
+      ENDPOINTS.push(rec);
     }
   }
 }
 
-console.log(
-  `>> Selected ${ENDPOINTS.length} endpoint(s) across FEATURES=[${SELECTED_FEATURES.join(', ')}]` +
-  (ENDPOINT_FILTER ? ` filter='${ENDPOINT_FILTER}'` : '')
-);
+console.log('>> Selected ' + ENDPOINTS.length + ' endpoint(s) across FEATURES=[' + SELECTED_FEATURES.join(', ') + ']' + (ENDPOINT_FILTER ? (" filter='" + ENDPOINT_FILTER + "'") : ''));
 
 // -----------------------------------------------------------------------------
-// 4️⃣ Test options
+// 4) Options (no Object.fromEntries)
 // -----------------------------------------------------------------------------
-export const options = {
-  scenarios: Object.fromEntries(
-    ENDPOINTS.map((ep, i) => [
-      `ep_${i}`,
-      {
-        executor: 'constant-arrival-rate',
-        rate: RPS,
-        timeUnit: '1s',
-        duration: DURATION,
-        preAllocatedVUs: PREALLOC,
-        maxVUs: MAXVUS,
-        exec: `ep_${i}`,
-      },
-    ])
-  ),
-  thresholds: THRESHOLDS_ON
-    ? {
-        http_req_failed: ['rate<0.01'],
-        http_req_duration: ['p(95)<2000'],
-      }
-    : {},
-};
-
-// -----------------------------------------------------------------------------
-// 5️⃣ Generate test functions dynamically for each endpoint
-// -----------------------------------------------------------------------------
-for (const [i, ep] of ENDPOINTS.entries()) {
-  const fnName = `ep_${i}`;
-  const tags = { feature: ep.feature, endpoint: ep.name };
-
-  exports[fnName] = function () {
-    const url = BASE_URL + ep.url;
-    const params = { headers: { Authorization: `Bearer ${TOKEN}` }, tags };
-
-    let res;
-    switch (ep.method.toUpperCase()) {
-      case 'GET':
-        res = http.get(url, params);
-        break;
-      case 'POST':
-        res = http.post(url, ep.body || '', params);
-        break;
-      case 'PATCH':
-        res = http.patch(url, ep.body || '', params);
-        break;
-      case 'DELETE':
-        res = http.del(url, null, params);
-        break;
-      default:
-        console.warn(`Unsupported method: ${ep.method}`);
-        return;
-    }
-
-    check(res, {
-      'status ok': (r) => r.status >= 200 && r.status < 300,
-      'body has text': (r) => r.body && r.body.length > 0,
-    }, tags);
-
-    sleep(1);
+var scenarios = {};
+for (var si = 0; si < ENDPOINTS.length; si++) {
+  var id = 'ep_' + si;
+  scenarios[id] = {
+    executor: 'constant-arrival-rate',
+    rate: RPS,
+    timeUnit: '1s',
+    duration: DURATION,
+    preAllocatedVUs: PREALLOC,
+    maxVUs: MAXVUS,
+    exec: id,
   };
 }
 
+export const options = {
+  scenarios: scenarios,
+  thresholds: THRESHOLDS_ON ? {
+    http_req_failed:   ['rate<0.01'],
+    http_req_duration: ['p(95)<2000'],
+  } : {},
+};
+
+// -----------------------------------------------------------------------------
+// 5) One test function per endpoint (no destructuring / for..of)
+// -----------------------------------------------------------------------------
+for (var xi = 0; xi < ENDPOINTS.length; xi++) {
+  (function (index) {
+    var ep = ENDPOINTS[index];
+    var fnName = 'ep_' + index;
+
+    exports[fnName] = function () {
+      var url = (BASE_URL || '') + ep.url;
+      var tags = { feature: ep.feature, endpoint: ep.name };
+
+      // headers: add Bearer only when TOKEN provided
+      var headers = {};
+      if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
+
+      var params = { headers: headers, tags: tags };
+      var res;
+
+      var m = ('' + ep.method).toUpperCase();
+      if (m === 'GET') {
+        res = http.get(url, params);
+      } else if (m === 'POST') {
+        res = http.post(url, ep.body || '', params);
+      } else if (m === 'PATCH') {
+        res = http.patch(url, ep.body || '', params);
+      } else if (m === 'DELETE') {
+        res = http.del(url, null, params);
+      } else {
+        console.warn('Unsupported method: ' + ep.method);
+        return;
+      }
+
+      // expected status (fallback 2xx)
+      var okStatus = (ep.expect && typeof ep.expect.status === 'number')
+        ? function (r) { return r.status === ep.expect.status; }
+        : function (r) { return r.status >= 200 && r.status < 300; };
+
+      var checks = {
+        'status ok': okStatus,
+        'body has text': function (r) { return !!(r && r.body && r.body.length > 0); }
+      };
+
+      check(res, checks, tags);
+      sleep(1);
+    };
+  })(xi);
+}
