@@ -1,76 +1,60 @@
 /* eslint-disable */
-// k6 runner built for your PW-exported endpoints map
-
 const http = require('k6/http');
 const { check, sleep } = require('k6');
+const { Counter, Trend } = require('k6/metrics');
 
-// ------------ config from env (strings) ------------
-const ENV = (__ENV.ENV || 'dev').toLowerCase();           // not used here but kept
-const FEATURES_RAW = __ENV.FEATURES || '';                // comma/space separated
-const ENDPOINT_FILTER = __ENV.ENDPOINT_FILTER || '';      // substring match (optional)
+// ---- custom tagged metrics for the report ----
+const REQS_BY_EP = new Counter('reqs_by_ep');           // increment 1 per request (tagged)
+const LAT_BY_EP  = new Trend('latency_by_ep', true);    // record duration per request (tagged, trends)
+
+/* ------------ config ------------ */
+const ENV = (__ENV.ENV || 'dev').toLowerCase();
+const FEATURES_RAW = __ENV.FEATURES || '';
+const ENDPOINT_FILTER = __ENV.ENDPOINT_FILTER || '';
 const DURATION = __ENV.DURATION || '20s';
-const RPS = Number(__ENV.RPS || '1');                     // per-endpoint constant arrival
+const RPS = Number(__ENV.RPS || '1');
 const PREALLOC = Number(__ENV.PREALLOC || '5');
 const MAXVUS = Number(__ENV.MAXVUS || '50');
-const SLEEP = Number(__ENV.SLEEP || '0');                 // think time per endpoint (s)
+const SLEEP = Number(__ENV.SLEEP || '0');
 
-// ------------ load endpoints map ------------
-/**
- * We try the JS map first (fast). If it isn’t there, we fall back to JSON via open().
- * Your generator already writes both: endpoints.byFeature.ts (compiled to .js) and .json
- */
+/* ------------ load endpoints map ------------ */
 let ENDPOINTS_BY_FEATURE = {};
 try {
-  // Prefer a compiled CommonJS export
   ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js').ENDPOINTS_BY_FEATURE
-                       || require('../sources/endpoints.byFeature.js').default
-                       || require('../sources/endpoints.byFeature.js');
+    || require('../sources/endpoints.byFeature.js').default
+    || require('../sources/endpoints.byFeature.js');
 } catch (_) {
-  // Fallback: JSON string via open()
-  try {
-    const raw = open('../sources/endpoints.byFeature.json');
-    ENDPOINTS_BY_FEATURE = JSON.parse(raw);
-  } catch (e2) {
-    throw new Error('Could not load endpoints map (byFeature.js/.json). ' + e2);
-  }
+  const raw = open('../sources/endpoints.byFeature.json');
+  ENDPOINTS_BY_FEATURE = JSON.parse(raw);
 }
 
-// ------------ feature / endpoint selection ------------
+/* ------------ selection ------------ */
 function normalizeList(s) {
-  return s
-    .split(/[,\n]/g)
-    .map(x => x.trim())
-    .filter(Boolean);
+  return s.split(/[,\n]/g).map(x => x.trim()).filter(Boolean);
 }
-
 const FEATURES = normalizeList(FEATURES_RAW);
 const SELECTED_FEATURES = FEATURES.length ? FEATURES : Object.keys(ENDPOINTS_BY_FEATURE);
 
-function matchesFilter(name, needle) {
+function includesI(hay, needle) {
   if (!needle) return true;
-  return String(name).toLowerCase().indexOf(String(needle).toLowerCase()) !== -1;
+  return String(hay).toLowerCase().includes(String(needle).toLowerCase());
 }
 
-// Flattened list of { feature, ep }
 const ENDPOINTS = [];
 for (const featureName of SELECTED_FEATURES) {
   const list = ENDPOINTS_BY_FEATURE[featureName] || [];
   for (const ep of list) {
-    if (matchesFilter(ep.name, ENDPOINT_FILTER)) {
+    if (includesI(ep.name, ENDPOINT_FILTER)) {
       ENDPOINTS.push({ feature: featureName, ep });
     }
   }
 }
 
 if (!ENDPOINTS.length) {
-  console.log('No endpoints selected. Check FEATURES="' + FEATURES_RAW + '" and ENDPOINT_FILTER="' + ENDPOINT_FILTER + '"');
+  console.log(`No endpoints selected. FEATURES="${FEATURES_RAW}" ENDPOINT_FILTER="${ENDPOINT_FILTER}"`);
 }
 
-// ------------ scenarios (one per endpoint) ------------
-/**
- * We give each endpoint a distinct scenario name (ep_#) and a constant-arrival-rate executor.
- * Each scenario’s default function multiplexes by reading its name at runtime.
- */
+/* ------------ scenarios ------------ */
 const scenarios = {};
 ENDPOINTS.forEach((item, idx) => {
   const name = `ep_${idx}`;
@@ -81,7 +65,7 @@ ENDPOINTS.forEach((item, idx) => {
     duration: DURATION,
     preAllocatedVUs: PREALLOC,
     maxVUs: MAXVUS,
-    tags: { feature: item.feature, endpoint: item.ep.name }, // scenario-level tags (nice to have)
+    tags: { feature: item.feature, endpoint: item.ep.name },
     exec: 'runner',
   };
 });
@@ -89,81 +73,217 @@ ENDPOINTS.forEach((item, idx) => {
 export const options = {
   scenarios,
   thresholds: {
-    // keep relaxed; you can tune later
     'http_req_failed': ['rate<0.05'],
     'http_req_duration{expected_response:true}': ['p(95)<60000'],
   },
 };
 
-// ------------ util ------------
-function buildHeaders(method) {
-  // If your generator already puts Authorization in each ep.auth,
-  // you can enrich here if needed. Keep minimal for now.
+/* ------------ utils ------------ */
+function buildHeaders(_method) {
+  // add headers here if you want; leaving empty uses what service expects by default
   return {};
 }
-
 function containsText(body, mustContain) {
   if (!mustContain) return true;
   if (body == null) return false;
-  try {
-    return String(body).indexOf(mustContain) !== -1;
-  } catch (_) {
-    return false;
-  }
+  return String(body).indexOf(String(mustContain)) !== -1;
 }
 
-// ------------ runner ------------
-/**
- * All scenarios call this. We figure out *which* endpoint to run by scenario.name.
- */
+/* ------------ runner ------------ */
 export function runner() {
-  // Figure out which scenario we’re in
-  const scenarioName = __ENV['__SCENARIO_NAME'] || ''; // k6 injects this internally
+  const scenarioName = __ENV['__SCENARIO_NAME'] || '';
   const idx = Number(String(scenarioName).replace(/^ep_/, ''));
   const item = ENDPOINTS[idx];
-
-  if (!item) {
-    // Safety: nothing to do
-    return;
-  }
+  if (!item) return;
 
   const { feature, ep } = item;
-  const tags = { feature, endpoint: ep.name }; // <<< CRITICAL for per-feature/per-endpoint summary
-  const hdrs = buildHeaders(ep.method);
-
-  // k6 request options with tags
-  const opts = { headers: hdrs, tags };
+  const tags = { feature, endpoint: ep.name };
+  const opts = { headers: buildHeaders(ep.method), tags };
 
   let res;
   const method = String(ep.method || 'GET').toUpperCase();
 
-  if (method === 'GET') {
-    res = http.get(ep.url, opts);
-  } else if (method === 'POST') {
-    res = http.post(ep.url, ep.body || '', opts);
-  } else if (method === 'PUT') {
-    res = http.put(ep.url, ep.body || '', opts);
-  } else if (method === 'PATCH') {
-    res = http.patch(ep.url, ep.body || '', opts);
-  } else if (method === 'DELETE') {
-    // k6.del(url, body?, params?)
-    res = http.del(ep.url, null, opts);
-  } else {
-    throw new Error('Unsupported method: ' + method);
-  }
+  if (method === 'GET')       res = http.get(ep.url, opts);
+  else if (method === 'POST') res = http.post(ep.url, ep.body || '', opts);
+  else if (method === 'PUT')  res = http.put(ep.url, ep.body || '', opts);
+  else if (method === 'PATCH')res = http.patch(ep.url, ep.body || '', opts);
+  else if (method === 'DELETE') res = http.del(ep.url, null, opts);
+  else throw new Error('Unsupported method: ' + method);
 
-  // Expectations from the generator
   const expectStatus = ep.expect && typeof ep.expect.status === 'number' ? ep.expect.status : 200;
-  const expectText = ep.expect && ep.expect.text ? String(ep.expect.text) : '';
+  const expectText   = ep.expect && ep.expect.text ? String(ep.expect.text) : '';
 
-  // checks — pass tags again so pass/fail aligns with the submetrics
+  // checks (tagged)
   check(res, {
     'status ok': (r) => r.status === expectStatus,
     'body has text': (r) => containsText(r.body, expectText),
   }, tags);
 
+  // record our own metrics with tags (so the HTML can always read them)
+  REQS_BY_EP.add(1, tags);
+  LAT_BY_EP.add(res.timings.duration, tags);
+
   if (SLEEP > 0) sleep(SLEEP);
 }
 
-// ------------ HTML summary ------------
+/* ------------ HTML summary ------------ */
 export { handleSummary } from '../vendor/handleSummary.js';
+
+
+///---------------------------------------------------------------------------------------------------------
+
+/* eslint-disable */
+import { textSummary } from './k6-text-summary-lite.js';
+
+// helpers
+const pad = (n) => String(n).padStart(2, '0');
+const hhmmss = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${hhmmss(d)}`;
+};
+
+function pickMetric(metrics, names) {
+  for (const n of names) {
+    if (metrics[n] && (metrics[n].submetrics || metrics[n].values)) return { name: n, m: metrics[n] };
+  }
+  return null;
+}
+
+function p95FromTrend(values) {
+  // values shape varies; we guard carefully
+  if (!values) return null;
+  const keys = Object.keys(values);
+  // direct p(95)
+  if ('p(95)' in values) return Number(values['p(95)']);
+  // sometimes p(95) is stored as 'p95'
+  if ('p95' in values) return Number(values['p95']);
+  // last resort try p(90) or max
+  if ('p(90)' in values) return Number(values['p(90)']);
+  if ('max' in values) return Number(values['max']);
+  return null;
+}
+
+function buildFeatureTable(metrics) {
+  // Prefer our custom metrics, then http_reqs
+  const sel = pickMetric(metrics, ['reqs_by_ep', 'http_reqs']);
+  if (!sel) return { rows: [], note: 'No request metrics.' };
+
+  const base = sel.m;
+  const subs = base.submetrics || {};
+  const rows = [];
+
+  // For latency, prefer our tagged trend
+  const latSel = pickMetric(metrics, ['latency_by_ep', 'http_req_duration{expected_response:true}', 'http_req_duration']);
+  const latBase = latSel ? latSel.m : null;
+  const latSubs = latBase && latBase.submetrics ? latBase.submetrics : {};
+
+  // submetric entry format: { tags: { feature, endpoint, ... }, values: {...} }
+  for (const key in subs) {
+    const sm = subs[key];
+    if (!sm || !sm.tags) continue;
+    const feat = sm.tags.feature;
+    const ep   = sm.tags.endpoint;
+    if (!feat || !ep) continue;
+
+    const count = sm.values && (sm.values.count || sm.values.rate || sm.values.iterations || 0);
+    // try to locate corresponding latency submetric with same tags
+    let p95 = null;
+    if (latBase) {
+      // iterate latency subs and find same feature/endpoint
+      for (const k2 in latSubs) {
+        const ls = latSubs[k2];
+        if (!ls || !ls.tags) continue;
+        if (ls.tags.feature === feat && ls.tags.endpoint === ep) {
+          p95 = p95FromTrend(ls.values);
+          break;
+        }
+      }
+    }
+    rows.push({ feature: feat, endpoint: ep, count: Number(count) || 0, p95: p95 });
+  }
+
+  // sort by feature then endpoint
+  rows.sort((a, b) => a.feature === b.feature ? a.endpoint.localeCompare(b.endpoint) : a.feature.localeCompare(b.feature));
+  return { rows, note: rows.length ? '' : 'No per-feature data (did the runner send tags?).' };
+}
+
+export function handleSummary(data) {
+  const metrics = data.metrics || {};
+
+  // headline numbers
+  const checks = metrics.checks && metrics.checks.values ? metrics.checks.values.passes || 0 : 0;
+  const reqs   = metrics.http_reqs && metrics.http_reqs.values ? metrics.http_reqs.values.count || 0 : 0;
+
+  // latency block
+  const lat = metrics['http_req_duration'] && metrics['http_req_duration'].values ? metrics['http_req_duration'].values : {};
+  const avg = lat.avg || 0, p95 = lat['p(95)'] || lat.p95 || 0, min = lat.min || 0, max = lat.max || 0;
+
+  const featTable = buildFeatureTable(metrics);
+
+  // HTML
+  const title = `SDLC Auto Gov Load Test – ${today()}`;
+  let html = `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+  <style>
+    body{font:14px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;color:#111}
+    h1{font-size:22px;margin:0 0 16px}
+    table{border-collapse:collapse;margin:12px 0;width:560px}
+    th,td{border:1px solid #ddd;padding:8px;text-align:left}
+    th{background:#f6f6f6}
+    .bar{height:10px;background:#2d6cdf}
+    .muted{color:#777}
+    .small{font-size:12px}
+    .grid{display:grid;grid-template-columns:520px 1fr;gap:24px;align-items:start}
+    .section{margin-top:12px}
+  </style></head><body>
+  <h1>${title}</h1>`;
+
+  html += `<table>
+    <tr><th>Checks (pass/fail)</th><td>${checks} / 0</td></tr>
+    <tr><th>Requests</th><td>${reqs} total</td></tr>
+    <tr><th>Latency p(95)</th><td>${p95} ms</td></tr>
+    <tr><th>Latency avg / min / max</th><td>${avg} ms / ${min} ms / ${max} ms</td></tr>
+    <tr><th>Iterations</th><td>${(metrics.iterations && metrics.iterations.values && metrics.iterations.values.count) || 0}</td></tr>
+    <tr><th>VUs max</th><td>${(metrics.vus_max && metrics.vus_max.values && metrics.vus_max.values.value) || 0}</td></tr>
+  </table>`;
+
+  // simple bars
+  const bar = (v, maxV) => `<div class="bar" style="width:${maxV ? (Math.min(v, maxV)/maxV*100) : 0}%"></div>`;
+  const scale = Math.max(max || 0, p95 || 0, avg || 0, 1);
+  html += `<div class="section">
+    <div class="small muted">Latency bars</div>
+    <table>
+      <tr><th>avg</th><td>${bar(avg, scale)} ${avg} ms</td></tr>
+      <tr><th>p(95)</th><td>${bar(p95, scale)} ${p95} ms</td></tr>
+      <tr><th>max</th><td>${bar(max, scale)} ${max} ms</td></tr>
+    </table>
+  </div>`;
+
+  // feature/endpoint table
+  html += `<div class="section">
+    <h3>Feature / Endpoint breakdown</h3>`;
+  if (!featTable.rows.length) {
+    html += `<div class="muted small">${featTable.note}</div>`;
+  } else {
+    html += `<table><tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>p(95) latency</th></tr>`;
+    for (const r of featTable.rows) {
+      html += `<tr><td>${r.feature}</td><td>${r.endpoint}</td><td>${r.count}</td><td>${r.p95 != null ? r.p95 + ' ms' : '-'}</td></tr>`;
+    }
+    html += `</table>`;
+  }
+  html += `</div>`;
+
+  // raw (truncated)
+  const safeJson = JSON.stringify(data, null, 2).slice(0, 4000); // keep page light
+  html += `<div class="section"><div class="small muted">Raw JSON (truncated)</div>
+    <pre class="small">${safeJson}</pre></div>`;
+
+  html += `</body></html>`;
+
+  return {
+    stdout: textSummary(data, { indent: ' ', enableColors: true }) + '\n',
+    'perf/k6/reports/summary.json': JSON.stringify(data),
+    'perf/k6/reports/summary.html': html,
+  };
+}
+
