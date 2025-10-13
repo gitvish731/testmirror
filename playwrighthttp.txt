@@ -1,100 +1,169 @@
-// Minimal, ES5-safe HTML summary renderer for k6
-// No arrow funcs, no destructuring, no optional chaining.
+// perf/k6/scenarios/from-playwright.http.js
+/* k6 runtime: CommonJS style (works without bundling) */
 
-function pad(n) { return (n < 10 ? "0" : "") + n; }
-function fmtMs(x) { return Math.round(x) + " ms"; }
-function fmtNum(x) { return String(x); }
-function safe(obj, a, b) {
-  return obj && obj[a] && obj[a][b] && obj[a][b].values ? obj[a][b].values : (obj && obj[a] && obj[a].values ? obj[a].values : null);
-}
-function val(values, key, def) { return values && values[key] != null ? values[key] : def; }
-function spark(vals) {
-  // quick ASCII sparkline: map to 8 levels
-  var chars = "▁▂▃▄▅▆▇█";
-  if (!vals || !vals.length) return "";
-  var min = vals[0], max = vals[0], i;
-  for (i = 1; i < vals.length; i++) { if (vals[i] < min) min = vals[i]; if (vals[i] > max) max = vals[i]; }
-  var out = "", range = (max - min) || 1;
-  for (i = 0; i < vals.length; i++) {
-    var idx = Math.round(((vals[i] - min) / range) * (chars.length - 1));
-    out += chars.charAt(idx);
-  }
-  return out;
-}
+const http = require('k6/http');
+const { sleep, check } = require('k6');
 
-function renderHTML(data) {
-  var now = new Date();
-  var title = "SDLC Auto Gov Load Test – " + now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate()) +
-              " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
+// ---- Config via env ----
+const ENV = String(__ENV.ENV || 'uat').toLowerCase();           // dev | uat
+const TOKEN = __ENV.TOKEN || __ENV.GRAFEAS_LOGIN_TOKEN || '';
+const FEATURES_RAW = String(__ENV.FEATURES || '').trim();        // comma-separated or empty for all
+const ENDPOINT_FILTER = String(__ENV.ENDPOINT_FILTER || '').trim();
 
-  var checksV = safe(data, "checks", "default") || safe(data, "checks", ""); // handle k6 versions
-  var httpV   = safe(data, "http_req_duration", "default") || safe(data, "http_req_duration", "");
-  var reqsV   = safe(data, "http_reqs", "default") || safe(data, "http_reqs", "");
-  var vusV    = safe(data, "vus_max", "default") || safe(data, "vus_max", "");
-  var itersV  = safe(data, "iterations", "default") || safe(data, "iterations", "");
+const DURATION = String(__ENV.DURATION || '30s');
+const RPS = Number(__ENV.RPS || 1);
+const PREALLOC = Number(__ENV.PREALLOC || 5);
+const MAXVUS = Number(__ENV.MAXVUS || 10);
 
-  var checksPass = val(checksV, "passes", 0);
-  var checksFail = val(checksV, "fails", 0);
-  var reqCount   = val(reqsV, "count", 0);
-  var p95        = val(httpV, "p(95)", 0);
-  var avg        = val(httpV, "avg", 0);
-  var min        = val(httpV, "min", 0);
-  var max        = val(httpV, "max", 0);
-  var iterations = val(itersV, "count", 0);
-  var vusMax     = val(vusV, "value", val(vusV, "max", 0)); // k6 versions differ
-
-  // Build a tiny distribution line using a few percentiles if present
-  var distVals = [];
-  var p50 = val(httpV, "med", null); if (p50 != null) distVals.push(p50);
-  var p90 = val(httpV, "p(90)", null); if (p90 != null) distVals.push(p90);
-  var p95v = val(httpV, "p(95)", null); if (p95v != null) distVals.push(p95v);
-  var p99 = val(httpV, "p(99)", null); if (p99 != null) distVals.push(p99);
-
-  var html = "";
-  html += "<!doctype html><html><head><meta charset='utf-8'>";
-  html += "<title>" + title + "</title>";
-  html += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;color:#111}h1{font-size:20px;margin:0 0 16px}table{border-collapse:collapse;margin:12px 0;width:680px;max-width:100%}th,td{border:1px solid #ddd;padding:8px 10px;font-size:14px}th{background:#fafafa;text-align:left}code{background:#f5f5f5;padding:2px 4px;border-radius:4px}hr{border:0;border-top:1px solid #eee;margin:20px 0}</style>";
-  html += "</head><body>";
-  html += "<h1>" + title + "</h1>";
-
-  html += "<table>";
-  html += "<tr><th>Checks (pass/fail)</th><td>" + fmtNum(checksPass) + " / " + fmtNum(checksFail) + "</td></tr>";
-  html += "<tr><th>Requests</th><td>" + fmtNum(reqCount) + " total</td></tr>";
-  html += "<tr><th>Latency p95</th><td>" + fmtMs(p95) + "</td></tr>";
-  html += "<tr><th>Latency avg / min / max</th><td>" + fmtMs(avg) + " / " + fmtMs(min) + " / " + fmtMs(max) + "</td></tr>";
-  html += "<tr><th>Iterations</th><td>" + fmtNum(iterations) + "</td></tr>";
-  html += "<tr><th>VUs max</th><td>" + fmtNum(vusMax) + "</td></tr>";
-  html += "</table>";
-
-  if (distVals.length) {
-    html += "<div><strong>Latency distribution</strong><br><code>" + spark(distVals) + "</code></div>";
-  }
-
-  html += "<hr><details open><summary><strong>Raw JSON (truncated)</strong></summary>";
-  // Trim JSON to keep file size sane
-  var raw = JSON.stringify({
-    root_group: data.root_group,
-    options: data.options,
-    metrics: {
-      checks: data.metrics && data.metrics.checks,
-      http_req_duration: data.metrics && data.metrics.http_req_duration,
-      http_reqs: data.metrics && data.metrics.http_reqs,
-      iterations: data.metrics && data.metrics.iterations,
-      vus_max: data.metrics && data.metrics.vus_max
-    }
-  }, null, 2);
-  html += "<pre style='white-space:pre-wrap'>" + raw.replace(/[<>&]/g, function(s){ return {"<":"&lt;",">":"&gt;","&":"&amp;"}[s]; }) + "</pre>";
-  html += "</details>";
-
-  html += "</body></html>";
-  return html;
-}
-
-module.exports = function handleSummary(data) {
-  var html = renderHTML(data);
-  var out = {};
-  out["perf/k6/reports/summary.html"] = html;
-  // for convenience, also drop a JSON copy
-  out["perf/k6/reports/summary.json"] = JSON.stringify(data);
-  return out;
+// Optional thresholds (toggle with THRESHOLDS=true)
+const THRESHOLDS_ON = /^true$/i.test(String(__ENV.THRESHOLDS || 'false'));
+const THRESHOLDS = {
+  http_req_failed: ['rate<0.05'],
+  http_req_duration: ['p(95)<40000'], // 40s default until you tune
 };
+
+// ---- Load endpoints map (prefer JSON) ----
+function loadEndpointsByFeature() {
+  // k6's open() reads files at init time; path is relative to this file
+  try {
+    const txt = open('../sources/endpoints.byFeature.json');
+    return JSON.parse(txt);
+  } catch (e) {
+    // Fallback: the TS may have been emitted as JS; last resort try JSON again from CWD
+    return {};
+  }
+}
+
+const ENDPOINTS_BY_FEATURE = loadEndpointsByFeature();
+
+// ---- Host swap (-dev / -test) based on ENV ----
+function swapEnvHost(url) {
+  // Only flip the environment suffix immediately before the domain dot
+  // e.g. *.sdlcapis-test.azpriv-cloud.ubs.net <-> *.sdlcapis-dev.azpriv-cloud.ubs.net
+  const want = (ENV === 'dev') ? 'dev' : 'test'; // uat -> test
+  return String(url).replace(/-(dev|test)\./, `-${want}.`);
+}
+
+// ---- Select features/endpoints ----
+function selectedFeatures() {
+  if (!FEATURES_RAW) {
+    // Everything
+    return Object.keys(ENDPOINTS_BY_FEATURE);
+  }
+  return FEATURES_RAW
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(n => n); // names are already without .spec in your generator
+}
+
+function collectEndpoints() {
+  const out = [];
+  const feats = selectedFeatures();
+  for (var i = 0; i < feats.length; i++) {
+    var f = feats[i];
+    var list = ENDPOINTS_BY_FEATURE[f] || [];
+    for (var j = 0; j < list.length; j++) {
+      var ep = list[j];
+      if (ENDPOINT_FILTER && String(ep.name).toLowerCase().indexOf(ENDPOINT_FILTER.toLowerCase()) === -1) {
+        continue;
+      }
+      // clone + host swap
+      var url = swapEnvHost(ep.url || ep.path || '');
+      out.push({
+        feature: f,
+        name: ep.name,
+        method: ep.method || 'GET',
+        url: url,
+        body: (ep.body || ''),
+        expect: ep.expect || { status: 200 },
+      });
+    }
+  }
+  return out;
+}
+
+const ENDPOINTS = collectEndpoints();
+
+// ---- Single endpoint runner (by index) with tags ----
+function runOne(i) {
+  var ep = ENDPOINTS[i];
+  var tags = { feature: ep.feature, endpoint: ep.name };
+
+  // Build request options
+  var opts;
+  if (ep.method === 'GET') {
+    // GET: no Authorization header; only tags
+    opts = { tags: tags };
+  } else {
+    // Non-GET: add Authorization + JSON content type
+    var headers = { 'Content-Type': 'application/json' };
+    if (TOKEN) headers.Authorization = `Bearer ${TOKEN}`;
+    opts = { headers: headers, tags: tags };
+  }
+
+  var res;
+  if (ep.method === 'GET') {
+    res = http.get(ep.url, opts);
+  } else if (ep.method === 'POST') {
+    res = http.post(ep.url, ep.body || '', opts);
+  } else if (ep.method === 'PUT') {
+    res = http.put(ep.url, ep.body || '', opts);
+  } else if (ep.method === 'PATCH') {
+    res = http.patch(ep.url, ep.body || '', opts);
+  } else if (ep.method === 'DELETE') {
+    res = http.del(ep.url, null, opts);
+  } else {
+    // Unknown verb -> treat like GET
+    res = http.get(ep.url, opts);
+  }
+
+  var want = (ep.expect && ep.expect.status) ? ep.expect.status : 200;
+  check(res, { 'status ok': function (r) { return r.status === want; } }, tags);
+
+  if (ep.expect && ep.expect.text) {
+    var needle = String(ep.expect.text);
+    check(res, { 'body has text': function (r) { return String(r.body || '').indexOf(needle) !== -1; } }, tags);
+  }
+
+  sleep(1);
+}
+
+// ---- Scenarios per endpoint and exports ----
+var scenarios = {};
+for (var i = 0; i < ENDPOINTS.length; i++) {
+  var ep = ENDPOINTS[i];
+  scenarios['ep_' + i] = {
+    executor: 'constant-arrival-rate',
+    rate: RPS,
+    timeUnit: '1s',
+    duration: DURATION,
+    preAllocatedVUs: PREALLOC,
+    maxVUs: MAXVUS,
+    exec: 'ep_' + i,
+    tags: { feature: ep.feature, endpoint: ep.name },
+  };
+}
+
+// Summary renderer
+var handleSummaryImpl;
+try {
+  handleSummaryImpl = require('../vendor/handleSummary.js');
+} catch (_e) {
+  handleSummaryImpl = function (data) { return { stdout: JSON.stringify(data, null, 2) }; };
+}
+
+// Collect everything we export so k6 can see exec funcs
+var exported = {
+  options: { scenarios: scenarios, thresholds: THRESHOLDS_ON ? THRESHOLDS : {} },
+  handleSummary: handleSummaryImpl,
+};
+
+for (var i = 0; i < ENDPOINTS.length; i++) {
+  // create ep_0, ep_1, ...
+  (function (idx) {
+    exported['ep_' + idx] = function () { runOne(idx); };
+  })(i);
+}
+
+module.exports = exported;
