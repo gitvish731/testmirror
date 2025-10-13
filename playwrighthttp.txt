@@ -1,161 +1,109 @@
-// perf/k6/scenarios/from-playwright.http.js
-/* eslint-disable no-undef */
+// perf/k6/vendor/handleSummary.js
+// Minimal, ES5-safe HTML summary (works with k6 v0.46+ without extended mode)
 
-// k6 core (keep CommonJS style for max compatibility with v0.46+)
-const http = require('k6/http');
-const { check, sleep } = require('k6');
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+function fmtDate(d) {
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+         ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]; }); }
+function fmtNum(n) { return (n == null || isNaN(n)) ? '-' : Number(n).toLocaleString(); }
+function fmtMs(n)  { return (n == null || isNaN(n)) ? '-' : Number(n).toFixed(1) + ' ms'; }
 
-// Load the generated endpoints map at init (JSON created by your generator)
-var endpointsByFeature = JSON.parse(open('../sources/endpoints.byFeature.json'));
+// get percentile value from a trend metric (keys look like 'p(90)', 'p(95)', etc.)
+function pct(metric, key) {
+  if (!metric || !metric.values) return null;
+  return metric.values[key];
+}
 
-// --------- Env / knobs ---------
-var ENV       = (__ENV.ENV || 'dev').toLowerCase();                 // 'dev' | 'uat'
-var BASE_URL  = __ENV.BASE_URL || '';                               // hard override (https://host[:port])
-var TOKEN     = __ENV.TOKEN || '';                                  // bearer for POST/PATCH/DELETE
-var FEATURES  = (__ENV.FEATURES || '').split(',').map(function(s){return s.trim();}).filter(Boolean);
-var EP_FILTER = __ENV.ENDPOINT_FILTER ? new RegExp(__ENV.ENDPOINT_FILTER) : null;
-
-var RPS       = Number(__ENV.RPS || 1);     // per-endpoint rate
-var DURATION  = __ENV.DURATION || '30s';
-var PREALLOC  = Number(__ENV.PREALLOC || 5);
-var MAXVUS    = Number(__ENV.MAXVUS || 50);
-
-// Optional JSON map of per-endpoint rates: {"Feature:Endpoint Name": 10, ...}
-var EP_RATES = {};
-try { if (__ENV.EP_RATES) EP_RATES = JSON.parse(__ENV.EP_RATES); } catch (_e) {}
-
-// --------- Helpers ----------
-function swapEnvInHost(url) {
-  // If BASE_URL specified, force protocol+host to BASE_URL
-  if (BASE_URL) {
-    var idx = url.indexOf('://');
-    if (idx >= 0) {
-      var slash = url.indexOf('/', idx + 3);
-      if (slash >= 0) return BASE_URL.replace(/\/+$/, '') + url.slice(slash);
+// try to read checks (pass/fail) – prefer root_group.checks if present
+function aggregateChecks(data) {
+  var passes = 0, fails = 0;
+  try {
+    var ch = (data.root_group && data.root_group.checks) ? data.root_group.checks : [];
+    for (var i = 0; i < ch.length; i++) {
+      passes += ch[i].passes || 0;
+      fails  += ch[i].fails  || 0;
     }
-    return BASE_URL.replace(/\/+$/, '') + '/' + url.replace(/^https?:\/\/[^/]+\/?/, '');
+  } catch (e) {}
+  // fallback to metric "checks"
+  if (passes + fails === 0 && data.metrics && data.metrics.checks && data.metrics.checks.values) {
+    var v = data.metrics.checks.values;
+    passes = v.passes || 0; fails = v.fails || 0;
   }
-  // otherwise, flip -dev / -test in host
-  var desired = (ENV === 'dev') ? '-dev' : '-test';
-  return url
-    .replace(/-dev(\.[^\/]+(?:\/|$))/, function(_, tail){ return desired + tail; })
-    .replace(/-test(\.[^\/]+(?:\/|$))/, function(_, tail){ return desired + tail; });
+  return { passes: passes, fails: fails };
 }
 
-function buildHeaders(method) {
-  var h = {};
-  if (method !== 'GET') {
-    h['Content-Type'] = 'application/json';
-  }
-  if (method !== 'GET' && TOKEN) {
-    h['Authorization'] = 'Bearer ' + TOKEN;
-  }
-  return h;
+// Build a simple table row
+function tr(cells) {
+  var t = '<tr>';
+  for (var i = 0; i < cells.length; i++) t += '<td>' + cells[i] + '</td>';
+  return t + '</tr>';
 }
 
-function send(method, url, body, params) {
-  if (method === 'GET')    return http.get(url, params);
-  if (method === 'POST')   return http.post(url, body || null, params);
-  if (method === 'PUT')    return http.put(url, body || null, params);
-  if (method === 'PATCH')  return http.patch(url, body || null, params);
-  if (method === 'DELETE') return http.del(url, null, params);
-  return http.request(method, url, body || null, params);
-}
+module.exports = function handleSummary(data) {
+  var now = new Date();
+  var title = 'SDLC Auto Gov Load Test – ' + fmtDate(now);
 
-// --------- Select endpoints for this run ----------
-function pickEndpoints() {
-  var selected = [];
-  var featureKeys = FEATURES.length ? FEATURES : Object.keys(endpointsByFeature);
-  for (var i = 0; i < featureKeys.length; i++) {
-    var feature = featureKeys[i];
-    var list = endpointsByFeature[feature] || [];
-    for (var j = 0; j < list.length; j++) {
-      var ep = list[j];
-      if (EP_FILTER && !EP_FILTER.test(ep.name)) continue;
-      selected.push({ feature: feature, ep: ep });
-    }
-  }
-  return selected;
-}
+  // Core metrics
+  var checksAgg = aggregateChecks(data);
+  var httpReqs  = (data.metrics && data.metrics.http_reqs && data.metrics.http_reqs.values) ? data.metrics.http_reqs.values.count : 0;
+  var durTrend  = (data.metrics) ? data.metrics.http_req_duration : null;
 
-var CHOSEN = pickEndpoints();
+  var p50  = pct(durTrend, 'med');
+  var p90  = pct(durTrend, 'p(90)');
+  var p95  = pct(durTrend, 'p(95)');
+  var p99  = pct(durTrend, 'p(99)');
+  var avg  = durTrend && durTrend.values ? durTrend.values.avg : null;
+  var min  = durTrend && durTrend.values ? durTrend.values.min : null;
+  var max  = durTrend && durTrend.values ? durTrend.values.max : null;
 
-// --------- k6 scenarios (one per endpoint) ----------
-export let options = {
-  scenarios: (function(){
-    var sc = {};
-    for (var i = 0; i < CHOSEN.length; i++) {
-      var feature = CHOSEN[i].feature;
-      var ep      = CHOSEN[i].ep;
-      var key     = feature + ':' + ep.name;
-      var rate    = (EP_RATES[key] != null) ? Number(EP_RATES[key]) : RPS;
+  // Table: headline
+  var headline =
+    '<table>' +
+      tr(['Metric', 'Value']) +
+      tr(['Checks (pass/fail)', esc(fmtNum(checksAgg.passes) + ' / ' + fmtNum(checksAgg.fails))]) +
+      tr(['Requests', esc(fmtNum(httpReqs))]) +
+      tr(['Latency p95', esc(fmtMs(p95))]) +
+    '</table>';
 
-      sc['ep_' + i] = {
-        executor: 'constant-arrival-rate',
-        rate: rate,
-        timeUnit: '1s',
-        duration: DURATION,
-        preAllocatedVUs: PREALLOC,
-        maxVUs: MAXVUS,
-        exec: 'ep_' + i
-      };
-    }
-    return sc;
-  })(),
-  thresholds: {
-    http_req_failed: ['rate<0.01']
-  }
+  // Latency table
+  var latTable =
+    '<h3>Latency (http_req_duration)</h3>' +
+    '<table>' +
+      tr(['avg', esc(fmtMs(avg))]) +
+      tr(['min', esc(fmtMs(min))]) +
+      tr(['p50/median', esc(fmtMs(p50))]) +
+      tr(['p90', esc(fmtMs(p90))]) +
+      tr(['p95', esc(fmtMs(p95))]) +
+      tr(['p99', esc(fmtMs(p99))]) +
+      tr(['max', esc(fmtMs(max))]) +
+    '</table>';
+
+  // Raw JSON (collapsible)
+  var raw =
+    '<details><summary>Raw JSON</summary><pre>' + esc(JSON.stringify(data, null, 2)) + '</pre></details>';
+
+  var html =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<title>' + esc(title) + '</title>' +
+    '<style>' +
+      'body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.35;margin:24px;}' +
+      'h1{margin:0 0 16px;font-size:20px}' +
+      'table{border-collapse:collapse;margin:16px 0;min-width:380px}' +
+      'td{border:1px solid #ddd;padding:6px 10px;font-size:13px}' +
+      'td:first-child{background:#fafafa;font-weight:600;white-space:nowrap}' +
+      'details{margin-top:16px}' +
+      'pre{background:#111;color:#ddd;padding:12px;border-radius:6px;overflow:auto}' +
+    '</style>' +
+    '</head><body>' +
+      '<h1>' + esc(title) + '</h1>' +
+      headline +
+      latTable +
+      raw +
+    '</body></html>';
+
+  return {
+    'perf/k6/reports/summary.html': html
+  };
 };
-
-// --------- One exec() per endpoint with TAGS on requests *and* checks ----------
-for (var k = 0; k < CHOSEN.length; k++) {
-  (function(idx){
-    var feature = CHOSEN[idx].feature;
-    var ep      = CHOSEN[idx].ep;
-
-    exports['ep_' + idx] = function () {
-      var url     = swapEnvInHost(ep.url || ep.path || ep.full || '');
-      var method  = ep.method || 'GET';
-      var headers = buildHeaders(method);
-      var body    = ep.body || null;
-
-      // 🎯 tags for per-feature & per-endpoint reporting
-      var tags = { feature: feature, endpoint: ep.name };
-
-      // http params with headers + tags (headers for GET are fine here)
-      var params = { headers: headers, tags: tags };
-
-      var res = send(method, url, body, params);
-
-      var expectStatus = (ep.expect && typeof ep.expect.status !== 'undefined') ? ep.expect.status : undefined;
-      var expectText   = (ep.expect && typeof ep.expect.text   !== 'undefined') ? ep.expect.text   : undefined;
-
-      var okStatus = check(
-        res,
-        { 'status ok': function(r){ return (typeof expectStatus === 'number') ? (r.status === expectStatus) : (r.status >= 200 && r.status < 400); } },
-        tags
-      );
-
-      var okBody = true;
-      if (typeof expectText === 'string' && expectText.length > 0) {
-        okBody = check(
-          res,
-          { 'body has text': function(r){ return (r.body || '').indexOf(expectText) >= 0; } },
-          tags
-        );
-      }
-
-      if (!okStatus || !okBody) {
-        // small breather to avoid tight-looping on failures
-        sleep(0.1);
-      }
-    };
-  })(k);
-}
-
-// keep a default so `k6 run` is happy even if no scenarios match
-export default function () { sleep(1); }
-
-// --------- HTML reporter (separate file) ----------
-import reporter from '../vendor/handleSummary.js';
-export { reporter as handleSummary };
