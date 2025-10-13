@@ -2,10 +2,19 @@ rm -f perf/k6/sources/endpoints.byFeature.js
 node -e "const fs=require('fs');const p='perf/k6/sources/endpoints.byFeature.json';const out='perf/k6/sources/endpoints.byFeature.js';const txt=fs.readFileSync(p,'utf8').trim();fs.writeFileSync(out,'module.exports = '+txt+';\\n');console.log('wrote',out)"
 
 
-// Load endpoints map (prefer CJS wrapper; fall back to raw JSON if needed)
-let ENDPOINTS_BY_FEATURE;
+// -------- load endpoints map (CJS wrapper first, JSON fallback) --------
+let ENDPOINTS_BY_FEATURE;              // <- declare once, outer scope
 try {
-  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js'); // CJS wrapper we just wrote
+  // CJS wrapper created by the node one-liner
+  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
 } catch (_) {
-  ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json')); // fallback
+  // Fallback: read raw JSON (works in k6)
+  ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
 }
+// ----------------------------------------------------------------------
+
+const allFeatures = Object.keys(ENDPOINTS_BY_FEATURE);
+const SELECTED_FEATURES =
+  (String(__ENV.FEATURES || '').split(',').map(s => s.trim()).filter(Boolean)).length
+    ? String(__ENV.FEATURES || '').split(',').map(s => s.trim()).filter(Boolean)
+    : allFeatures;
