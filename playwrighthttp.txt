@@ -1,1 +1,11 @@
-node -e "const fs=require('fs');const p='perf/k6/sources/endpoints.byFeature.json';const out='perf/k6/sources/endpoints.byFeature.js';const txt=fs.readFileSync(p,'utf8');fs.writeFileSync(out,'export default '+txt+';');console.log('wrote',out)"
+rm -f perf/k6/sources/endpoints.byFeature.js
+node -e "const fs=require('fs');const p='perf/k6/sources/endpoints.byFeature.json';const out='perf/k6/sources/endpoints.byFeature.js';const txt=fs.readFileSync(p,'utf8').trim();fs.writeFileSync(out,'module.exports = '+txt+';\\n');console.log('wrote',out)"
+
+
+// Load endpoints map (prefer CJS wrapper; fall back to raw JSON if needed)
+let ENDPOINTS_BY_FEATURE;
+try {
+  ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js'); // CJS wrapper we just wrote
+} catch (_) {
+  ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json')); // fallback
+}
