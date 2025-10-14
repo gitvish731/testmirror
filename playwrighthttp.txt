@@ -1,187 +1,230 @@
-// 3 perf/k6/scenarios/from-playwright.http.min.js
-import http from "k6/http";
-import { sleep } from "k6";
-import { Trend, Counter } from "k6/metrics";
-import features from "../sources/endpoints.byFeature.js";
-
-// ---------- env ----------
-const FEAT_RAW = String(__ENV.FEATURES || "").trim();
-const VUS      = Number(__ENV.VUS || "1");
-const ITERS    = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
-const DURATION = String(__ENV.DURATION || "30s");
-
-// ---------- options ----------
-export const options = ITERS > 0 ? {
-  scenarios: { by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" } }
-} : {
-  scenarios: { by_time: { executor: "constant-vus", vus: VUS, duration: DURATION, gracefulStop: "3s" } }
-};
-
-// ---------- build endpoints ----------
-function isPO(x){return x && typeof x==="object" && !Array.isArray(x);}
-const SELECTED = FEAT_RAW ? FEAT_RAW.split(",").map(s=>s.trim()).filter(Boolean) : [];
-console.log("parsed  -> vus=%s, iters=%s, duration=%s, features=%s",
-  VUS, ITERS, DURATION, SELECTED.length?SELECTED.join("|"):"(all)");
-
-const ENDPOINTS = [];
-if (!isPO(features)) {
-  console.error("features export invalid; typeof =", typeof features);
-} else {
-  const names = SELECTED.length ? SELECTED : Object.keys(features);
-  for (const fname of names) {
-    const list = features[fname];
-    if (!Array.isArray(list)) { console.warn("feature not found / not array:", fname); continue; }
-    for (const ep of list) {
-      if (!isPO(ep)) continue;
-      const method = String(ep.method || "GET").toUpperCase();
-      const url    = String(ep.url || "");
-      if (!url) { console.warn("skip empty url in", fname); continue; }
-      ENDPOINTS.push({
-        feature: fname,
-        name: ep.name || (method + " " + url),
-        method, url,
-        headers: isPO(ep.headers)?ep.headers:undefined,
-        auth: ep.auth || null
-      });
-    }
-  }
-}
-console.log("endpoints built:", ENDPOINTS.length);
-if (ENDPOINTS.length) console.log("first endpoint:", JSON.stringify(ENDPOINTS[0]));
-
-// ---------- metric registry (instances, not names) ----------
-function slug(s){
-  return s.toLowerCase()
-    .replace(/[^a-z0-9]+/g,"_")
-    .replace(/^_+|_+$/g,"")
-    .slice(0,120);
+/* perf/k6/vendor/handleSummary.js — v0.46-safe enhanced summary */
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
-const REGISTRY = [];                // [{ id, feature, endpoint, lat, cnt }]
-const BY_ID = Object.create(null);  // id -> entry
-
-for (const ep of ENDPOINTS) {
-  const id = slug(ep.feature + "__" + ep.name);
-  const lat = new Trend(`lat_ep_${id}`, true);
-  const cnt = new Counter(`req_ep_${id}`);
-  const entry = { id, feature: ep.feature, endpoint: ep.name, lat, cnt };
-  REGISTRY.push(entry);
-  BY_ID[id] = entry;
+// tiny helper to read a trend percentile safely (works on k6 v0.46)
+function trendPct(metrics, name, p) {
+  const m = metrics && metrics[name];
+  if (!m || !m.values) return null;
+  const key = p === 50 ? 'med' : `p(${p})`;
+  return m.values[key] != null ? m.values[key] : null;
+}
+function trendNum(metrics, name, k) {
+  const m = metrics && metrics[name];
+  return m && m.values && m.values[k] != null ? m.values[k] : null;
 }
 
-// ---------- tiny RR picker ----------
-let idx = 0;
-function pickEP(){ if (!ENDPOINTS.length) return null; const ep = ENDPOINTS[idx % ENDPOINTS.length]; idx = (idx+1)>>>0; return ep; }
-
-// ---------- VU code ----------
-export default function () {
-  const ep = pickEP();
-  if (!ep) { sleep(0.25); return; }
-
-  const params = {};
-  if (ep.headers) params.headers = ep.headers;
-  if (ep.auth) {
-    const h = params.headers || {};
-    h.authorization = String(ep.auth);
-    params.headers = h;
-  }
-
-  const t0 = Date.now();
-  let res, errMsg = "";
-  try {
-    if (ep.method === "GET") {
-      res = http.get(ep.url, params);
-    } else {
-      res = http.request(ep.method, ep.url, null, params);
-    }
-  } catch (e) {
-    errMsg = String(e && e.message || e);
-    console.error("request error:", errMsg);
-  }
-  const dur = Date.now() - t0;
-
-  // record with the real instances (works on 0.46)
-  const id = slug(ep.feature + "__" + ep.name);
-  const reg = BY_ID[id];
-  if (reg) { reg.lat.add(dur); reg.cnt.add(1); }
-
-  const status = res ? res.status : 0;
-  console.log(`[${ep.feature}] ${ep.name} -> status=${status} dur=${dur}ms${errMsg?(" err="+errMsg):""}`);
-  sleep(0.2);
+// tiny inline SVG bar chart (no dependencies)
+function svgBarChart(rows, {title, labelKey, valueKey, unit='', width=640, height=200}) {
+  if (!rows || !rows.length) return '';
+  const padL = 160, padR = 20, padT = 24, padB = 24;
+  const innerW = width - padL - padR;
+  const innerH = height - padT - padB;
+  const maxV = Math.max(...rows.map(r => Number(r[valueKey]) || 0)) || 1;
+  const step = innerH / rows.length;
+  const bars = rows.map((r, i) => {
+    const v = Number(r[valueKey]) || 0;
+    const w = Math.round((v / maxV) * innerW);
+    const y = padT + i * step + 4;
+    const x = padL;
+    const h = Math.max(10, step - 6);
+    return `
+      <text x="${padL-8}" y="${y+h-4}" text-anchor="end" font-size="11">${esc(r[labelKey])}</text>
+      <rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#4e79a7" />
+      <text x="${x+w+4}" y="${y+h-4}" font-size="11">${v}${unit}</text>`;
+  }).join('');
+  return `
+  <svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">
+    <text x="${padL}" y="16" font-size="12" font-weight="600">${esc(title)}</text>
+    ${bars}
+  </svg>`;
 }
 
-// ---------- summary ----------
-export function handleSummary(data) {
-  const metrics = (data && data.metrics) || {};
-  const perEp = [];
-  const perFeat = {};
+export default function handleSummary(data) {
+  // ---- GLOBAL PANEL (built-in metrics) ----
+  const M = data.metrics || {};
+  const totalReqs = trendNum(M, 'http_reqs', 'count') || 0;
+  const testDurationMs = trendNum(M, 'iteration_duration', 'avg') ? data.state?.testRunDurationMs || null : null;
+  const rps = (data.state && data.state.testRunDurationMs)
+    ? (totalReqs / (data.state.testRunDurationMs / 1000)).toFixed(2)
+    : ''; // falls back to '' if we don’t have exact duration
 
-  for (let i=0;i<REGISTRY.length;i++){
-    const r = REGISTRY[i];
-    const lat = metrics[r.lat.name];   // trend instance name
-    const cnt = metrics[r.cnt.name];   // counter instance name
-    const count = (cnt && cnt.values && (cnt.values.count || 0)) || 0;
-    const avg = (lat && lat.values && typeof lat.values.avg === "number") ? Math.round(lat.values.avg) : 0;
+  const latAvg = trendNum(M, 'http_req_duration', 'avg');
+  const latMin = trendNum(M, 'http_req_duration', 'min');
+  const latMed = trendNum(M, 'http_req_duration', 'med');
+  const latP90 = trendPct(M, 'http_req_duration', 90);
+  const latP95 = trendPct(M, 'http_req_duration', 95);
+  const latP99 = trendPct(M, 'http_req_duration', 99) || null;
+  const latMax = trendNum(M, 'http_req_duration', 'max');
 
-    perEp.push([r.feature, r.endpoint, count, avg ? (avg + " ms") : "-"]);
+  const failed = trendNum(M, 'http_req_failed', 'fails') || 0; // v0.46 exposes error rate via thresholds; we approximate via fails if available
+  const dataSent = trendNum(M, 'data_sent', 'count') || 0;
+  const dataRecv = trendNum(M, 'data_received', 'count') || 0;
+  const vusMax = trendNum(M, 'vus_max', 'max') || '';
 
-    if (!perFeat[r.feature]) perFeat[r.feature] = { feature: r.feature, count: 0, sum: 0 };
-    perFeat[r.feature].count += count;
-    perFeat[r.feature].sum   += (avg * count);
-  }
+  // ---- ACCUMULATED PER FEATURE/ENDPOINT (from runner) ----
+  const acc = data.acc || { byFeature:{}, byEndpoint:{} };
 
-  const featRows = [];
-  for (const f in perFeat){
-    const obj = perFeat[f];
-    const avg = obj.count ? Math.round(obj.sum / obj.count) : 0;
-    featRows.push([obj.feature, obj.count, avg ? (avg + " ms") : "-"]);
-  }
+  // Build tidy arrays for tables
+  const byFeature = Object.keys(acc.byFeature || {}).map(f => {
+    const v = acc.byFeature[f] || {};
+    return {
+      feature: f,
+      requests: v.count || 0,
+      avg: v.avg != null ? Math.round(v.avg) : null,
+      p95: v.p95 != null ? Math.round(v.p95) : null,
+      max: v.max != null ? Math.round(v.max) : null,
+      errs: v.errs != null ? v.errs : null,
+    };
+  }).sort((a,b)=> b.requests - a.requests);
 
-  function table(rows, headers) {
-    let html = '<table style="border-collapse:collapse;width:100%;margin:10px 0">';
-    html += "<tr>";
-    for (let i=0;i<headers.length;i++){
-      html += '<th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">' + headers[i] + "</th>";
-    }
-    html += "</tr>";
-    for (let r=0;r<rows.length;r++){
-      html += "<tr>";
-      const row = rows[r];
-      for (let c=0;c<row.length;c++){
-        html += '<td style="padding:6px;border-bottom:1px solid #f0f0f0">' + row[c] + "</td>";
+  const byEndpoint = Object.keys(acc.byEndpoint || {}).map(k => {
+    const v = acc.byEndpoint[k] || {};
+    // k format expected: "FeatureName|EndpointName"
+    let feature = '', endpoint = k;
+    if (k.includes('|')) [feature, endpoint] = k.split('|');
+    return {
+      feature,
+      endpoint,
+      requests: v.count || 0,
+      avg: v.avg != null ? Math.round(v.avg) : null,
+      p95: v.p95 != null ? Math.round(v.p95) : null,
+      max: v.max != null ? Math.round(v.max) : null,
+      errs: v.errs != null ? v.errs : null,
+    };
+  }).sort((a,b)=> b.requests - a.requests);
+
+  // Top charts sources
+  const topN = 8;
+  const chartLatency = byEndpoint
+    .filter(r => r.avg != null)
+    .sort((a,b)=> b.avg - a.avg)
+    .slice(0, topN)
+    .map(r => ({ name: r.endpoint, value: r.avg }));
+
+  const chartRps = byEndpoint
+    .slice(0, topN)
+    .map(r => ({ name: r.endpoint, value: r.requests })); // per test; a strict RPS would divide by duration, which we can add when available
+
+  // ---- HTML ----
+  const head = `
+  <!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>SDLC Auto Gov Load Test</title>
+    <style>
+      body { font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; color:#222; }
+      h1 { font-size: 20px; margin: 0 0 12px; }
+      h2 { font-size: 16px; margin: 24px 0 8px; }
+      table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; }
+      th, td { border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; }
+      th { background: #f7f7f7; }
+      .muted { color:#777; }
+      .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+      .pill { display:inline-block; padding:2px 6px; border-radius:10px; background:#f0f0f0; font-size:12px; }
+      details { margin: 8px 0 16px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; white-space:pre; }
+    </style>
+  </head>
+  <body>
+  <h1>SDLC Auto Gov Load Test — ${esc(new Date().toISOString().replace('T',' ').slice(0,19))}</h1>
+  `;
+
+  const globalPanel = `
+  <div class="grid">
+    <div>
+      <h2>Overview</h2>
+      <table>
+        <tr><th>Requests</th><td>${totalReqs}</td></tr>
+        <tr><th>Throughput</th><td>${rps ? `${rps} req/s` : '<span class="muted">n/a</span>'}</td></tr>
+        <tr><th>VUs max</th><td>${vusMax || '<span class="muted">n/a</span>'}</td></tr>
+        <tr><th>Data</th><td>sent ${Math.round(dataSent)} B, received ${Math.round(dataRecv)} B</td></tr>
+        <tr><th>Error rate</th><td>${failed ? failed : 0}</td></tr>
+      </table>
+    </div>
+    <div>
+      <h2>Latency (ms)</h2>
+      <table>
+        <tr><th>avg</th><td>${latAvg != null ? Math.round(latAvg) : '—'}</td></tr>
+        <tr><th>p50</th><td>${latMed != null ? Math.round(latMed) : '—'}</td></tr>
+        <tr><th>p90</th><td>${latP90 != null ? Math.round(latP90) : '—'}</td></tr>
+        <tr><th>p95</th><td>${latP95 != null ? Math.round(latP95) : '—'}</td></tr>
+        <tr><th>p99</th><td>${latP99 != null ? Math.round(latP99) : '—'}</td></tr>
+        <tr><th>min / max</th><td>${latMin != null ? Math.round(latMin) : '—'} / ${latMax != null ? Math.round(latMax) : '—'}</td></tr>
+      </table>
+    </div>
+  </div>
+  `;
+
+  const featureTable = `
+  <h2>Feature breakdown</h2>
+  ${byFeature.length ? `
+  <table>
+    <tr><th>Feature</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
+    ${byFeature.map(r => `
+      <tr>
+        <td>${esc(r.feature)}</td>
+        <td>${r.requests}</td>
+        <td>${r.avg ?? '—'}</td>
+        <td>${r.p95 ?? '—'}</td>
+        <td>${r.max ?? '—'}</td>
+        <td>${r.errs ?? 0}</td>
+      </tr>`).join('')}
+  </table>` : `<div class="muted">No feature data recorded.</div>`}
+  `;
+
+  const endpointTable = `
+  <h2>Endpoint breakdown</h2>
+  ${byEndpoint.length ? `
+  <table>
+    <tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
+    ${byEndpoint.map(r => `
+      <tr>
+        <td><span class="pill">${esc(r.feature)}</span></td>
+        <td>${esc(r.endpoint)}</td>
+        <td>${r.requests}</td>
+        <td>${r.avg ?? '—'}</td>
+        <td>${r.p95 ?? '—'}</td>
+        <td>${r.max ?? '—'}</td>
+        <td>${r.errs ?? 0}</td>
+      </tr>`).join('')}
+  </table>` : `<div class="muted">No endpoint data recorded.</div>`}
+  `;
+
+  const charts = `
+  <h2>Charts</h2>
+  <div class="grid">
+    <div>${svgBarChart(chartLatency, { title:'Top endpoints by avg latency (ms)', labelKey:'name', valueKey:'value', unit:' ms' })}</div>
+    <div>${svgBarChart(chartRps, { title:'Top endpoints by requests', labelKey:'name', valueKey:'value' })}</div>
+  </div>
+  `;
+
+  const raw = `
+  <details>
+    <summary>Raw JSON (truncated)</summary>
+    <div class="mono">${esc(JSON.stringify({
+      acc: data.acc || {},
+      options: data.options || {},
+      scenario: data.options?.scenarios || {},
+      sample_metrics: {
+        http_reqs: M.http_reqs || {},
+        http_req_duration: M.http_req_duration || {},
       }
-      html += "</tr>";
-    }
-    html += "</table>";
-    return html;
-  }
+    }, null, 2).slice(0, 18000))}${data && JSON.stringify(data).length > 18000 ? '\n…(truncated)…' : ''}</div>
+  </details>`;
 
-  let html  = "<!doctype html><meta charset='utf-8'><title>SDLC Auto Gov Load Test</title>";
-  html += "<div style='font:14px/1.4 system-ui,Segoe UI,Arial'>";
-  html += "<h2>SDLC Auto Gov Load Test — " + new Date().toISOString().replace("T"," ").slice(0,19) + "</h2>";
-  const scenarioNames = Object.keys((data && data.options && data.options.scenarios) ? data.options.scenarios : {});
-  html += "<div><b>Scenarios</b>: " + (scenarioNames.length ? scenarioNames.join(", ") : "-") + "</div>";
+  const html = head + globalPanel + featureTable + endpointTable + charts + raw + '\n</body></html>';
 
-  html += "<h3 style='margin-top:18px'>Feature breakdown</h3>";
-  html += featRows.length ? table(featRows, ["Feature","Requests","Avg latency"]) : "<i>No feature data recorded.</i>";
-
-  html += "<h3 style='margin-top:18px'>Endpoint breakdown</h3>";
-  html += perEp.length ? table(perEp, ["Feature","Endpoint","Requests","Avg latency"]) : "<i>No endpoint data recorded.</i>";
-
-  html += "<details style='margin-top:18px'><summary>Raw JSON (truncated)</summary>";
-  const keep = { options:data.options, metrics:{} };
-  for (let i=0;i<REGISTRY.length;i++){
-    const r = REGISTRY[i];
-    keep.metrics[r.lat.name] = metrics[r.lat.name] || null;
-    keep.metrics[r.cnt.name] = metrics[r.cnt.name] || null;
-  }
-  let json = JSON.stringify(keep, null, 2);
-  if (json.length > 8000) json = json.slice(0,8000) + "\n...truncated...";
-  html += "<pre style='white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace'>" + json.replace(/</g,"&lt;") + "</pre>";
-  html += "</details></div>";
-
+  // stdout keeps the pretty text; json+html are written as files
   return {
-    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
-    "perf/k6/reports/summary.html": html
+    stdout: `\nSummary written with feature/endpoint tables${byEndpoint.length ? '' : ' (no endpoints found)'}\n`,
+    'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
+    'perf/k6/reports/summary.html': html,
   };
 }
