@@ -4,21 +4,20 @@
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.4/index.js';
 
 // ---- local vendor helpers (CommonJS) ---------------------------------------
-const ACC = require('../vendor/accumulator.js');          // must export add(feature, endpoint, durMs, ok) and snapshot()
-const vendorSummary = require('../vendor/handleSummary.js'); // must export function (data) -> { 'reports/summary.html': html }
+const ACC = require('../vendor/accumulator.js');              // exports add(feature, endpoint, durMs, ok) & snapshot()
+const vendorSummary = require('../vendor/handleSummary.js');  // exports function (data) -> { 'reports/summary.html': html }
 
 // ---- ENV -------------------------------------------------------------------
 const ENV = (__ENV.ENV || 'dev').toLowerCase();
 const BASE_URL = (__ENV.BASE_URL || '').trim();
 const TOKEN = (__ENV.TOKEN || '').trim();
 
-const FEATURES_RAW = (__ENV.FEATURES || '').trim();          // comma list or empty for all
-const ENDPOINT_FILTER = (__ENV.ENDPOINT_FILTER || '').trim(); // substring filter (optional)
+const FEATURES_RAW     = (__ENV.FEATURES || '').trim();          // comma list or empty for all
+const ENDPOINT_FILTER  = (__ENV.ENDPOINT_FILTER || '').trim();   // substring filter (optional)
 
-const DURATION = Number(__ENV.DURATION || '20'); // seconds
+const DURATION = Number(__ENV.DURATION || '20');   // seconds
 const RPS      = Number(__ENV.RPS      || '1');
 const PREALLOC = Number(__ENV.PREALLOC || '5');
 const MAXVUS   = Number(__ENV.MAXVUS   || '35');
@@ -84,7 +83,7 @@ function fire(method, url, body, params, feature, endpoint, expectStatus, mustCo
   else if (method === 'PUT') res = http.put(url, body || '', p);
   else res = http.post(url, body || '', p);
 
-  // build checks without object spread
+  // checks (no object spread; Goja limitation)
   const checks = {};
   checks['status ok'] = (r) => r.status === (expectStatus || 200);
   if (mustContain) {
@@ -137,9 +136,10 @@ export default function () {
 
 // ---- summary ---------------------------------------------------------------
 export function handleSummary(data) {
-  // prefer vendor HTML; fall back to text summary
+  // Prefer local HTML report.
   if (vendorSummary && typeof vendorSummary === 'function') {
     try { return vendorSummary(data); } catch (_) { /* fall back */ }
   }
-  return { stdout: textSummary(data, { indent: ' ', enableColors: true }) };
+  // Offline-friendly fallback: print JSON to stdout
+  return { stdout: JSON.stringify(data, null, 2) };
 }
