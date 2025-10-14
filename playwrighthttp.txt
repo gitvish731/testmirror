@@ -1,157 +1,194 @@
-/* eslint-disable no-undef */
+// perf/k6/vendor/handleSummary.js
+//
+// Minimal, robust HTML reporter with Feature/Endpoint table.
+// Looks for custom metrics named either like:
+//   reqs_ep{feature=Foo,endpoint=Bar}
+//   latency_ep{feature=Foo,endpoint=Bar}
+// or flattened variants like:
+//   reqs_ep_Foo_Bar
+//   latency_ep_Foo_Bar
+//
+// It’s deliberately “plain JS strings only” to avoid template parse errors.
 
-// Small helpers
-function esc(s) { return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-function fmtMs(v) { return (v == null || isNaN(v)) ? '–' : `${(+v).toFixed(3)} ms`; }
-function bar(widthPct) {
-  const pct = Math.max(0, Math.min(100, widthPct || 0));
-  return `<div style="height:10px;background:#e5e7eb;border-radius:6px;"><div style="width:${pct}%;height:10px;background:#3b82f6;border-radius:6px;"></div></div>`;
+function fmtInt(n) { return typeof n === 'number' ? Math.round(n).toString() : '0'; }
+function fmtMs(n)  { return typeof n === 'number' ? `${Math.round(n)} ms` : '0 ms'; }
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Parse a metric name like: latency_ep{feature:ReportingAPI Alpha1,endpoint:lists}
-function parseTagsFromSeriesName(name) {
-  const open = name.indexOf('{');
-  const close = name.lastIndexOf('}');
-  if (open === -1 || close === -1) return null;
-  const inner = name.slice(open + 1, close);
-  const obj = {};
-  inner.split(',').forEach(kv => {
-    const p = kv.split(':');
-    const k = p[0] && p[0].trim();
-    const v = p.slice(1).join(':'); // allow ':' in values
-    if (k) obj[k] = v;
-  });
-  return obj;
+// Pull a single trend value safely
+function trendValue(metric, key) {
+  if (!metric || !metric.values) return null;
+  const v = metric.values[key];
+  return (typeof v === 'number' && isFinite(v)) ? v : null;
 }
 
-function pick(obj, key, dflt) {
-  return (obj && Object.prototype.hasOwnProperty.call(obj, key)) ? obj[key] : dflt;
+// Try to read global latency (http_req_duration preferred)
+function globalLatency(data) {
+  const m = data.metrics['http_req_duration'] || data.metrics['http_req_duration{expected_response:true}'] || null;
+  return {
+    avg: trendValue(m, 'avg'),
+    p95: trendValue(m, 'p(95)'),
+    max: trendValue(m, 'max'),
+    min: trendValue(m, 'min'),
+    med: trendValue(m, 'med'),
+  };
+}
+
+// Parse metric name to {feature, endpoint}
+function parseFeatEp(name) {
+  // Prom-style: reqs_ep{feature=Foo,endpoint=Bar}
+  const brace = name.indexOf('{');
+  if (brace !== -1) {
+    const inside = name.slice(brace + 1, name.lastIndexOf('}'));
+    const tags = {};
+    inside.split(',').forEach(pair => {
+      const i = pair.indexOf('=');
+      if (i > 0) tags[pair.slice(0, i).trim()] = pair.slice(i + 1).trim().replace(/^"|"$/g, '');
+    });
+    return { feature: tags.feature || 'unknown', endpoint: tags.endpoint || 'unknown' };
+  }
+  // Flat: reqs_ep_Feature_Endpoint (last two parts)
+  const parts = name.split('_');
+  if (parts.length >= 3) {
+    return { feature: parts[parts.length - 2], endpoint: parts[parts.length - 1] };
+  }
+  return null;
+}
+
+// Build Feature/Endpoint aggregation from custom metrics
+function collectFeatureTable(data) {
+  const table = new Map(); // key `${feature}|${endpoint}` -> {feature,endpoint,reqs,avg,p95,max}
+  const metrics = data.metrics || {};
+
+  for (const [name, m] of Object.entries(metrics)) {
+    if (!name.startsWith('reqs_ep') && !name.startsWith('latency_ep')) continue;
+    const parsed = parseFeatEp(name);
+    if (!parsed) continue;
+    const key = `${parsed.feature}|${parsed.endpoint}`;
+    const row = table.get(key) || { feature: parsed.feature, endpoint: parsed.endpoint, reqs: 0, avg: null, p95: null, max: null };
+
+    if (name.startsWith('reqs_ep')) {
+      const c = m && m.values && typeof m.values.count === 'number' ? m.values.count : 0;
+      row.reqs += c;
+    } else if (name.startsWith('latency_ep')) {
+      row.avg = trendValue(m, 'avg') ?? row.avg;
+      row.p95 = trendValue(m, 'p(95)') ?? row.p95;
+      row.max = trendValue(m, 'max') ?? row.max;
+    }
+    table.set(key, row);
+  }
+
+  return Array.from(table.values()).sort((a, b) => (b.p95 ?? 0) - (a.p95 ?? 0));
+}
+
+function bar(widthPx, ratio) {
+  const w = Math.max(0, Math.min(1, Number(ratio))) * widthPx;
+  return '<div style="background:#e9eef6; height:10px; width:'+widthPx+'px; border-radius:4px; overflow:hidden;">'
+       + '<div style="background:#3b82f6; height:10px; width:'+w+'px;"></div>'
+       + '</div>';
 }
 
 export function handleSummary(data) {
-  // Always also write JSON so we can quickly inspect what k6 actually produced
-  const files = {
+  // Top stats
+  const checks = data.metrics && data.metrics.checks && data.metrics.checks.values
+    ? data.metrics.checks.values : { passes: 0, fails: 0 };
+  const http_reqs = data.metrics && data.metrics.http_reqs && data.metrics.http_reqs.values
+    ? data.metrics.http_reqs.values : { count: 0 };
+  const iters = data.metrics && data.metrics.iterations && data.metrics.iterations.values
+    ? data.metrics.iterations.values : { count: 0 };
+  const vus_max = data.metrics && data.metrics.vus_max && data.metrics.vus_max.values
+    ? data.metrics.vus_max.values : { value: 0 };
+
+  const gl = globalLatency(data);
+
+  // Feature table
+  const featRows = collectFeatureTable(data);
+  const hasFeat = featRows.length > 0;
+
+  // For the little bars, normalize against max we have
+  const maxForBars = Math.max(gl.max || 0, gl.p95 || 0, gl.avg || 0, 1);
+
+  let html = '';
+  html += '<!doctype html><html><head><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>';
+  html += '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;color:#111}'
+       +  'h1{font-size:22px;margin:0 0 16px}'
+       +  'table{border-collapse:collapse;margin:12px 0;width:720px;max-width:100%}'
+       +  'th,td{border:1px solid #e5e7eb;padding:8px;text-align:left;font-size:13px}'
+       +  'th{background:#f8fafc;font-weight:600}'
+       +  '.muted{color:#64748b;font-size:12px}'
+       +  '.bars{margin:16px 0 8px; width:720px; max-width:100%}'
+       +  '.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap}'
+       +  '</style></head><body>';
+
+  // Header
+  const when = new Date().toISOString().replace('T',' ').replace(/\..+/, '');
+  html += '<h1>SDLC Auto Gov Load Test — '+esc(when)+'</h1>';
+
+  // Summary table
+  html += '<table><tbody>';
+  html += '<tr><th>Checks (pass/fail)</th><td>'+fmtInt(checks.passes)+' / '+fmtInt(checks.fails)+'</td></tr>';
+  html += '<tr><th>Requests</th><td>'+fmtInt(http_reqs.count)+' total</td></tr>';
+  html += '<tr><th>Latency p(95)</th><td>'+(gl.p95!=null?fmtMs(gl.p95):'n/a')+'</td></tr>';
+  html += '<tr><th>Latency avg / min / max</th><td>'
+       +  (gl.avg!=null?fmtMs(gl.avg):'n/a')+' / '
+       +  (gl.min!=null?fmtMs(gl.min):'n/a')+' / '
+       +  (gl.max!=null?fmtMs(gl.max):'n/a')+'</td></tr>';
+  html += '<tr><th>Iterations</th><td>'+fmtInt(iters.count)+'</td></tr>';
+  html += '<tr><th>VUs max</th><td>'+fmtInt(vus_max.value)+'</td></tr>';
+  html += '</tbody></table>';
+
+  // Latency bars
+  html += '<div class="bars">';
+  html += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0;">'
+       +  '<div class="muted" style="width:60px">avg</div>'+ bar(440, (gl.avg||0)/maxForBars)
+       +  '<div class="muted">'+(gl.avg!=null?fmtMs(gl.avg):'n/a')+'</div></div>';
+  html += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0;">'
+       +  '<div class="muted" style="width:60px">p(95)</div>'+ bar(440, (gl.p95||0)/maxForBars)
+       +  '<div class="muted">'+(gl.p95!=null?fmtMs(gl.p95):'n/a')+'</div></div>';
+  html += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0;">'
+       +  '<div class="muted" style="width:60px">max</div>'+ bar(440, (gl.max||0)/maxForBars)
+       +  '<div class="muted">'+(gl.max!=null?fmtMs(gl.max):'n/a')+'</div></div>';
+  html += '</div>';
+
+  // Feature / Endpoint breakdown
+  html += '<h2 style="margin-top:20px">Feature / Endpoint breakdown</h2>';
+  if (!hasFeat) {
+    html += '<div class="muted">No per-feature data (did the runner emit endpoint metrics?).</div>';
+  } else {
+    html += '<table><thead><tr>'
+         +  '<th style="width:22%">Feature</th>'
+         +  '<th style="width:38%">Endpoint</th>'
+         +  '<th style="width:10%">Reqs</th>'
+         +  '<th style="width:10%">avg</th>'
+         +  '<th style="width:10%">p(95)</th>'
+         +  '<th style="width:10%">max</th>'
+         +  '</tr></thead><tbody>';
+    for (const r of featRows) {
+      html += '<tr>'
+           +  '<td>'+esc(r.feature)+'</td>'
+           +  '<td class="mono">'+esc(r.endpoint)+'</td>'
+           +  '<td>'+fmtInt(r.reqs)+'</td>'
+           +  '<td>'+(r.avg!=null?fmtMs(r.avg):'n/a')+'</td>'
+           +  '<td>'+(r.p95!=null?fmtMs(r.p95):'n/a')+'</td>'
+           +  '<td>'+(r.max!=null?fmtMs(r.max):'n/a')+'</td>'
+           +  '</tr>';
+    }
+    html += '</tbody></table>';
+  }
+
+  // Small raw JSON section (truncated – just metrics keys to keep file small)
+  const metricKeys = Object.keys(data.metrics || {});
+  html += '<details style="margin-top:14px"><summary class="muted">Raw JSON (truncated)</summary>'
+       +  '<div class="mono">'+esc(JSON.stringify({ options: data.options, state: data.state, metricKeys }, null, 2))+'</div>'
+       +  '</details>';
+
+  html += '</body></html>';
+
+  return {
+    'perf/k6/reports/summary.html': { data: html, format: 'html' },
     'perf/k6/reports/last.json': JSON.stringify(data, null, 2),
   };
-
-  const metrics = data.metrics || {};
-
-  // 1) Top tiles
-  const checksM = metrics.checks || {};
-  const checksValues = checksM.values || {};
-  const checksPass = pick(checksValues, 'passes', 0);
-  const checksFail = pick(checksValues, 'fails', 0);
-
-  const httpReqs = metrics.http_reqs || {};
-  const reqCount = pick(httpReqs.values || {}, 'count', 0);
-
-  const httpDur = metrics.http_req_duration || {};
-  const durVals = httpDur.values || {};
-  const p95 = pick(durVals, 'p(95)', null);
-  const avg = pick(durVals, 'avg', null);
-  const min = pick(durVals, 'min', null);
-  const max = pick(durVals, 'max', null);
-
-  // 2) Aggregate per feature/endpoint from tagged series
-  const table = {}; // key: feature::endpoint => { feature, endpoint, count, avg, p95, max }
-  let sawReqs = false;
-  let sawLat = false;
-
-  for (const [name, series] of Object.entries(metrics)) {
-    if (name.startsWith('reqs_ep{')) {
-      const tags = parseTagsFromSeriesName(name);
-      if (!tags || !tags.feature || !tags.endpoint) continue;
-      const key = `${tags.feature}::${tags.endpoint}`;
-      const row = table[key] || (table[key] = { feature: tags.feature, endpoint: tags.endpoint, count: 0, avg: null, p95: null, max: null });
-      row.count += pick(series.values || {}, 'count', 0);
-      sawReqs = true;
-    } else if (name.startsWith('latency_ep{')) {
-      const tags = parseTagsFromSeriesName(name);
-      if (!tags || !tags.feature || !tags.endpoint) continue;
-      const key = `${tags.feature}::${tags.endpoint}`;
-      const row = table[key] || (table[key] = { feature: tags.feature, endpoint: tags.endpoint, count: 0, avg: null, p95: null, max: null });
-      const vals = series.values || {};
-      row.avg = pick(vals, 'avg', row.avg);
-      row.p95 = pick(vals, 'p(95)', row.p95);
-      row.max = pick(vals, 'max', row.max);
-      sawLat = true;
-    }
-  }
-
-  // Build the HTML
-  let html = '';
-  html += `<!doctype html><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>`;
-  html += `<div style="font:14px/1.5 system-ui,Segoe UI,Roboto,Arial,sans-serif;max-width:980px;margin:24px auto;padding:0 12px;">`;
-  html += `<h1 style="margin:0 0 16px;">SDLC Auto Gov Load Test — ${new Date().toISOString().replace('T',' ').slice(0,19)}</h1>`;
-
-  // Summary tiles
-  html += `<table style="width:100%;border-collapse:collapse;margin:8px 0 16px;">
-    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Checks (pass/fail)</td><td style="padding:8px;border:1px solid #e5e7eb;">${checksPass} / ${checksFail}</td></tr>
-    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Requests</td><td style="padding:8px;border:1px solid #e5e7eb;">${reqCount} total</td></tr>
-    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Latency p(95)</td><td style="padding:8px;border:1px solid #e5e7eb;">${fmtMs(p95)}</td></tr>
-    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Latency avg / min / max</td><td style="padding:8px;border:1px solid #e5e7eb;">${fmtMs(avg)} / ${fmtMs(min)} / ${fmtMs(max)}</td></tr>
-    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Iterations</td><td style="padding:8px;border:1px solid #e5e7eb;">${pick(metrics.iterations?.values || {}, 'count', 0)}</td></tr>
-    <tr><td style="padding:8px;border:1px solid #e5e7eb;">VUs max</td><td style="padding:8px;border:1px solid #e5e7eb;">${pick(metrics.vus_max?.values || {}, 'value', pick(metrics.vus_max?.values || {}, 'max', 0))}</td></tr>
-  </table>`;
-
-  // Simple latency bars
-  const scale = Math.max(1, Number(max || p95 || avg || 1));
-  html += `<div style="margin:12px 0 24px;">
-    <div style="display:grid;grid-template-columns:140px 1fr 80px;align-items:center;gap:10px;margin:6px 0;">
-      <div>avg</div><div>${bar((avg || 0) / scale * 100)}</div><div style="text-align:right">${fmtMs(avg)}</div>
-    </div>
-    <div style="display:grid;grid-template-columns:140px 1fr 80px;align-items:center;gap:10px;margin:6px 0;">
-      <div>p(95)</div><div>${bar((p95 || 0) / scale * 100)}</div><div style="text-align:right">${fmtMs(p95)}</div>
-    </div>
-    <div style="display:grid;grid-template-columns:140px 1fr 80px;align-items:center;gap:10px;margin:6px 0;">
-      <div>max</div><div>${bar((max || 0) / scale * 100)}</div><div style="text-align:right">${fmtMs(max)}</div>
-    </div>
-  </div>`;
-
-  // Feature / Endpoint table
-  html += `<h2 style="margin:24px 0 8px;">Feature / Endpoint breakdown</h2>`;
-  const rows = Object.values(table).sort((a, b) => (b.count || 0) - (a.count || 0));
-
-  if (!rows.length) {
-    const hint = (!sawReqs && !sawLat)
-      ? 'No per-feature data (did the runner emit endpoint metrics?).'
-      : 'Per-feature metrics were sparse; nothing to show.';
-    html += `<p style="color:#6b7280">${esc(hint)}</p>`;
-  } else {
-    html += `<table style="width:100%;border-collapse:collapse;margin:6px 0 18px;">
-      <thead><tr>
-        <th style="text-align:left;padding:6px;border-bottom:1px solid #e5e7eb;">Feature</th>
-        <th style="text-align:left;padding:6px;border-bottom:1px solid #e5e7eb;">Endpoint</th>
-        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">Requests</th>
-        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">Avg</th>
-        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">p(95)</th>
-        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">Max</th>
-      </tr></thead><tbody>`;
-    for (const r of rows) {
-      html += `<tr>
-        <td style="padding:6px;border-bottom:1px solid #f3f4f6;">${esc(r.feature)}</td>
-        <td style="padding:6px;border-bottom:1px solid #f3f4f6;">${esc(r.endpoint)}</td>
-        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${r.count || 0}</td>
-        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${fmtMs(r.avg)}</td>
-        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${fmtMs(r.p95)}</td>
-        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${fmtMs(r.max)}</td>
-      </tr>`;
-    }
-    html += `</tbody></table>`;
-  }
-
-  // Raw JSON (truncated)
-  const jsonShort = JSON.stringify({
-    options: data.options || {},
-    state: data.state || {},
-    metrics: Object.fromEntries(
-      Object.entries(metrics).slice(0, 30)
-    ),
-  }, null, 2);
-
-  html += `<details style="margin-top:8px;"><summary>Raw JSON (truncated)</summary><pre style="white-space:pre-wrap;background:#f9fafb;padding:12px;border:1px solid #e5e7eb;border-radius:8px;">${esc(jsonShort)}</pre></details>`;
-  html += `</div>`;
-
-  files['perf/k6/reports/summary.html'] = html;
-  return files;
 }
