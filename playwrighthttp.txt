@@ -1,25 +1,208 @@
-// perf/k6/sources/endpoints.byFeature.js
-// Pure ESM, no CommonJS. k6 0.46 is fine with this.
+// perf/k6/scenarios/from-playwright.http.js
+// k6 v0.46 compatible
 
-const features = {
-  "": [
-    {
-      name: "Lists_Registrations",
-      method: "GET",
-      url: "https://",
-      // optional helpers (won’t break anything if your runner ignores them)
-      headers: {},          // e.g. { "content-type": "application/json" }
-      auth: null,           // e.g. "bearer"
-      expect: { status: 200, text: "releaseTagStatus" }
+import http from "k6/http";
+import { sleep, check, Trend, Counter } from "k6/metrics";
+import features from "../sources/endpoints.byFeature.js";     // <- your feature map (ESM default export)
+import handleSummary from "../vendor/handleSummary.js";       // <- keep if you have it
+export { handleSummary };                                     // <- lets k6 write summary.html/json
+
+/**********************
+ * ENV / CLI switches *
+ **********************
+ * -e FEATURES='ReportingAPI Alpha1, SomethingElse'
+ * -e VUS=2             (# virtual users)
+ * -e ITERS=2           (# iterations per VU; uses per-vu-iterations executor)
+ * -e DURATION=30s      (uses constant-vus executor)
+ * -e ONE=1             (shortcut: run exactly one iteration total)
+ * -e TIER=dev|uat|...  (optional passthrough; does not alter URLs)
+ */
+
+const RAW_FEATURES = (__ENV.FEATURES || "").trim();
+
+// ----- executor selection (v0.46 safe) -----
+const VUS = toInt(__ENV.VUS, 1);
+const ITERS = toInt(__ENV.ITERS, 0);
+const ONE = toInt(__ENV.ONE, 0);
+const DURATION = (__ENV.DURATION || "").trim();
+
+const usePerVuIters = ONE === 1 || (ITERS > 0 && !DURATION);
+const perVuIters = ONE === 1 ? 1 : Math.max(ITERS, 1);
+
+// Default durations when none given (only used if DURATION specified)
+const duration = DURATION || "";
+
+// Exported options for k6
+export let options = usePerVuIters
+  ? {
+      scenarios: {
+        by_iter: {
+          executor: "per-vu-iterations",
+          vus: Math.max(VUS, 1),
+          iterations: perVuIters,
+          maxDuration: "120s",
+        },
+      },
+      thresholds: {
+        // keep simple defaults; adjust to your needs
+        http_req_failed: ["rate<0.05"],
+      },
     }
-  ],
+  : {
+      scenarios: {
+        by_time: {
+          executor: "constant-vus",
+          vus: Math.max(VUS, 1),
+          duration: duration || "30s",
+          gracefulStop: "3s",
+        },
+      },
+      thresholds: {
+        http_req_failed: ["rate<0.05"],
+      },
+    };
 
-  // keep other features here as needed…
-  
-};
+/***************************
+ * Custom per-endpoint mets *
+ ***************************/
+const reqs_ep = new Counter("reqs_ep");          // counts requests per feature/endpoint
+const latency_ep = new Trend("latency_ep", true); // stores ms per feature/endpoint
 
-export default features;
+/************************************
+ * Build the endpoint execution list *
+ ************************************/
+const REQUESTED = RAW_FEATURES
+  ? RAW_FEATURES.split(",").map((s) => s.trim()).filter(Boolean)
+  : Object.keys(features);
 
+// Validate against the features map (defensive for v0.46)
+const SELECTED = REQUESTED.filter((n) =>
+  Object.prototype.hasOwnProperty.call(features, n)
+);
+const MISSING = REQUESTED.filter((n) => !SELECTED.includes(n));
+if (MISSING.length) {
+  console.error("Unknown feature(s) ignored:", MISSING);
+}
 
-import features from "../sources/endpoints.byFeature.js";
-console.log("features loaded:", Object.keys(features || {}));
+const ENDPOINTS = [];
+for (const fname of SELECTED) {
+  const eps = features[fname];
+  if (!Array.isArray(eps)) {
+    console.error("Feature does not map to an array of endpoints:", fname, eps);
+    continue;
+  }
+  for (const ep of eps) {
+    if (!ep || !ep.url || !ep.method) {
+      console.error("Bad endpoint definition under", fname, ep);
+      continue;
+    }
+    ENDPOINTS.push({
+      feature: fname,
+      name: ep.name || ep.url,
+      method: (ep.method || "GET").toUpperCase(),
+      url: ep.url,
+      headers: ep.headers || {},
+      auth: ep.auth || null,
+      expect: ep.expect || { status: 200, text: null },
+      body: ep.body || null,
+    });
+  }
+}
+
+if (!ENDPOINTS.length) {
+  throw new Error(
+    `No endpoints selected. FEATURES="${RAW_FEATURES}" | available=${Object.keys(
+      features
+    ).join(", ")}`
+  );
+}
+
+console.log("features loaded:", JSON.stringify(SELECTED));
+
+/*******************
+ * Helper functions *
+ *******************/
+function toInt(v, defVal) {
+  const n = parseInt(v, 10);
+  return isNaN(n) ? defVal : n;
+}
+
+function buildHeaders(h, auth) {
+  const hdrs = Object.assign({}, h || {});
+  // Normalize content-type capitalization if provided
+  if (hdrs["Content-Type"] && !hdrs["content-type"])
+    hdrs["content-type"] = hdrs["Content-Type"];
+  // Minimal auth helper
+  if (auth && typeof auth === "string") {
+    // e.g. "bearer mytoken" -> Authorization: Bearer mytoken
+    const parts = auth.trim().split(/\s+/, 2);
+    if (parts.length === 2 && /^bearer$/i.test(parts[0])) {
+      hdrs["Authorization"] = "Bearer " + parts[1];
+    }
+  }
+  return hdrs;
+}
+
+/*****************
+ * Main iteration *
+ *****************/
+export default function () {
+  // Round-robin through endpoints
+  const idx = (__ITER % ENDPOINTS.length);
+  const ep = ENDPOINTS[idx];
+
+  const tags = { feature: ep.feature, endpoint: ep.name };
+  const params = {
+    tags: tags,                       // <-- critical: puts feature/endpoint tags on built-in metrics
+    headers: buildHeaders(ep.headers, ep.auth),
+  };
+
+  let res;
+  try {
+    switch (ep.method) {
+      case "GET":
+        res = http.get(ep.url, params);
+        break;
+      case "POST":
+        res = http.post(ep.url, ep.body || "", params);
+        break;
+      case "PATCH":
+        res = http.patch(ep.url, ep.body || "", params);
+        break;
+      case "PUT":
+        res = http.put(ep.url, ep.body || "", params);
+        break;
+      case "DELETE":
+        res = http.del(ep.url, null, params);
+        break;
+      default:
+        throw new Error("Unsupported method: " + ep.method);
+    }
+  } catch (e) {
+    // still emit a counter so the table shows something
+    reqs_ep.add(1, tags);
+    console.error("request error for", ep.name, e && (e.message || e));
+    sleep(0.2);
+    return;
+  }
+
+  // Emit our custom metrics with tags
+  reqs_ep.add(1, tags);
+  if (res && res.timings) {
+    latency_ep.add(res.timings.duration, tags);
+  }
+
+  // Basic checks (status + optional text)
+  const expect = ep.expect || {};
+  const ok = check(res, {
+    "status ok": (r) => r && r.status === (expect.status || 200),
+    ...(expect.text
+      ? { "body has text": (r) => String(r && r.body || "").indexOf(expect.text) !== -1 }
+      : {}),
+  });
+  if (!ok) {
+    console.warn("check(s) failed for", ep.name, "status=", res && res.status);
+  }
+
+  sleep(0.2);
+}
