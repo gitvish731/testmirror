@@ -1,13 +1,155 @@
-// checks (always) – status and optional text
-const want = ep.expect || {};
-const mustStatus = Number(want.status || 200);
-const mustContain = (want.text || '').trim();
+/* eslint-disable no-undef */
+// perf/k6/scenarios/from-playwright.http.js
 
-const checks = {
-  'status ok': (r) => r.status === mustStatus,
-};
-if (mustContain) {
-  checks['body has text'] = (r) =>
-    String(r.body || '').indexOf(mustContain) !== -1;
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Counter, Trend } from 'k6/metrics';
+import { SharedArray } from 'k6/experimental';
+
+// ---- Load endpoint catalog --------------------------------------------------
+// Path is from this file to the catalog. Adjust if your tree is different.
+const ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
+
+// ---- Env/config -------------------------------------------------------------
+const FEATURES_RAW = String(__ENV.FEATURES || '').trim();
+// Comma-separated list, or blank => all features in the catalog
+const SELECTED = FEATURES_RAW
+  ? FEATURES_RAW.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; })
+  : Object.keys(ENDPOINTS_BY_FEATURE);
+
+// Execution knobs
+const VUS       = Number(__ENV.VUS || 1);         // virtual users
+const ITER      = Number(__ENV.ITER || 1);        // iterations per VU (used when no DURATION)
+const DURATION  = String(__ENV.DURATION || '');   // e.g. "30s" to run by time
+
+// ---- Custom metrics (used by your HTML report) ------------------------------
+const REQS_EP = new Counter('reqs_ep');      // per-request count, tagged {feature, endpoint}
+const LAT_EP  = new Trend('latency_ep');     // request duration, tagged {feature, endpoint}
+
+// ---- Build once, share to all VUs -------------------------------------------
+const ENDPOINTS = new SharedArray('selected endpoints', function build() {
+  var out = [];
+
+  // Defensive: ensure SELECTED is an array
+  var picked = Array.isArray(SELECTED) ? SELECTED : (SELECTED ? [SELECTED] : []);
+
+  for (var i = 0; i < picked.length; i++) {
+    var feature = picked[i];
+    var list = ENDPOINTS_BY_FEATURE[feature];
+
+    if (!Array.isArray(list)) {
+      // Nothing for this feature, skip
+      continue;
+    }
+
+    for (var j = 0; j < list.length; j++) {
+      var ep = list[j];
+      out.push({
+        feature: feature,
+        name: String(ep.name || ''),
+        method: String(ep.method || 'GET').toUpperCase(),
+        url: String(ep.url || ''),
+        expect: ep.expect || {},            // { status, text } optional
+        headers: ep.headers || undefined,
+        body: (ep.body === undefined ? undefined : ep.body)
+      });
+    }
+  }
+
+  return out; // MUST return a plain array for SharedArray
+});
+
+// ---- k6 options -------------------------------------------------------------
+export const options = (function () {
+  // Choose executor set based on whether DURATION is provided
+  if (DURATION) {
+    return {
+      scenarios: {
+        by_time: {
+          executor: 'constant-vus',
+          vus: VUS,
+          duration: DURATION
+        }
+      },
+      thresholds: {
+        // keep thresholds light; tune as needed
+        'http_req_failed': ['rate<0.05']
+      },
+      summaryTrendStats: ['avg', 'min', 'max', 'p(90)', 'p(95)']
+    };
+  }
+
+  // No DURATION -> run fixed iterations per VU
+  return {
+    scenarios: {
+      by_iter: {
+        executor: 'per-vu-iterations',
+        vus: VUS,
+        iterations: ITER
+      }
+    },
+    thresholds: {
+      'http_req_failed': ['rate<0.05']
+    },
+    summaryTrendStats: ['avg', 'min', 'max', 'p(90)', 'p(95)']
+  };
+})();
+
+// ---- Main iteration ----------------------------------------------------------
+export default function () {
+  if (!ENDPOINTS.length) {
+    // Nothing selected; avoid hard errors
+    sleep(0.2);
+    return;
+  }
+
+  // Simple round-robin across the selected endpoints
+  var idx = (__ITER || 0) % ENDPOINTS.length;
+  var ep = ENDPOINTS[idx];
+
+  var tags = { feature: ep.feature, endpoint: ep.name };
+  var params = { headers: ep.headers || {}, tags: tags };
+
+  var res;
+  switch (ep.method) {
+    case 'POST':
+      res = http.post(ep.url, ep.body !== undefined ? ep.body : null, params);
+      break;
+    case 'PUT':
+      res = http.put(ep.url, ep.body !== undefined ? ep.body : null, params);
+      break;
+    case 'PATCH':
+      res = http.patch(ep.url, ep.body !== undefined ? ep.body : null, params);
+      break;
+    case 'DELETE':
+      res = http.del(ep.url, null, params);
+      break;
+    case 'GET':
+    default:
+      res = http.get(ep.url, params);
+      break;
+  }
+
+  // Record custom metrics for the HTML reporter
+  REQS_EP.add(1, tags);
+  LAT_EP.add(res.timings.duration, tags);
+
+  // Expectations/checks
+  var want = ep.expect || {};
+  var mustStatus = Number(want.status || 200);
+  var mustContain = String(want.text || '').trim();
+
+  var ok = {
+    'status ok': function (r) { return r.status === mustStatus; }
+  };
+  if (mustContain) {
+    ok['body has text'] = function (r) {
+      var body = String(r.body || '');
+      return body.indexOf(mustContain) !== -1;
+    };
+  }
+  check(res, ok, tags);
+
+  // Small think time to avoid hammering tight loops
+  sleep(0.2);
 }
-check(res, checks, tags);
