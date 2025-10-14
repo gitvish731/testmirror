@@ -1,115 +1,159 @@
-/* perf/k6/vendor/handleSummary.js — ENHANCED marker + v0.46-safe */
-function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
-function trendNum(M,n,k){ const m=M&&M[n]; return m&&m.values&&m.values[k]!=null?m.values[k]:null; }
-function trendPct(M,n,p){ const m=M&&M[n]; if(!m||!m.values) return null; const k=p===50?'med':`p(${p})`; return m.values[k]!=null?m.values[k]:null; }
+// perf/k6/scenarios/from-playwright.http.min.js
+// Minimal runner (k6 v0.46 compatible) + vendor handleSummary + feature/endpoint tagging
 
-function svgBar(rows,{title,labelKey,valueKey,unit='',width=640,height=200}){
-  if(!rows||!rows.length) return '';
-  const L=160,R=20,T=24,B=24, W=width-L-R, H=height-T-B;
-  const maxV=Math.max(...rows.map(r=>+r[valueKey]||0))||1, step=H/rows.length;
-  const bars=rows.map((r,i)=>{ const v=+r[valueKey]||0, w=Math.round((v/maxV)*W), y=T+i*step+4, x=L, h=Math.max(10,step-6);
-    return `<text x="${L-8}" y="${y+h-4}" text-anchor="end" font-size="11">${esc(r[labelKey])}</text>
-            <rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#4e79a7"/>
-            <text x="${x+w+4}" y="${y+h-4}" font-size="11">${v}${unit}</text>`; }).join('');
-  return `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">
-    <text x="${L}" y="16" font-size="12" font-weight="600">${esc(title)}</text>${bars}</svg>`;
+import http from 'k6/http';
+import { sleep, check } from 'k6';
+import features from '../sources/endpoints.byFeature.js';
+import handleSummary from '../vendor/handleSummary.js'; // <— use the enhanced summary
+
+// ---------- ENV / CLI switches ----------
+// Examples:
+//   k6 run perf/k6/scenarios/from-playwright.http.min.js -e VUS=2 -e ITER=2 -e FEATURES='ReportingAPI Alpha1' -e ENV=uat
+//   k6 run perf/k6/scenarios/from-playwright.http.min.js -e VUS=2 -e DURATION=10s -e FEATURES='ReportingAPI Alpha1' -e ENV=uat
+const RAW_FEATURES = (__ENV.FEATURES || '').trim();
+const SELECTED_FEATURES = RAW_FEATURES
+  ? RAW_FEATURES.split(',').map(s => s.trim()).filter(Boolean)
+  : Object.keys(features); // default: all feature keys
+
+const VUS = Number(__ENV.VUS || '1');
+const ITER = __ENV.ITER ? Number(__ENV.ITER) : null;
+const DURATION = (__ENV.DURATION || '').trim(); // e.g. "10s"
+
+// Optional base URL/env tweak (no-op unless you want to use it in URLs)
+const ENV = (__ENV.ENV || '').trim(); // "uat" | "dev" | etc.
+
+// ---------- Build endpoint list from features map ----------
+/*
+Expected shape in ../sources/endpoints.byFeature.js:
+export default {
+  "ReportingAPI Alpha1": [
+    {
+      name: "Lists SBC compliances for all found Release Registrations",
+      method: "GET",
+      url: "https://grafeas.sdlcapis-test.azpriv-cloud.ubs.net/v1alpha1/compliances",
+      headers: null,          // optional
+      auth: null,             // optional, e.g. "bearer"
+      expect: { status: 200, text: "releaseTagStatus" } // text optional
+    }
+  ]
+}
+*/
+const ENDPOINTS = [];
+for (let i = 0; i < SELECTED_FEATURES.length; i += 1) {
+  const fname = SELECTED_FEATURES[i];
+  const eps = features[fname];
+  if (!eps || !Array.isArray(eps)) {
+    console.warn(`[WARN] feature "${fname}" not found or has no endpoints`);
+    continue;
+  }
+  for (let j = 0; j < eps.length; j += 1) {
+    const ep = eps[j];
+    ENDPOINTS.push({ feature: fname, ep });
+  }
 }
 
-export default function handleSummary(data){
-  // marker in console so you know this file is active
-  const banner = 'Enhanced summary active ✅';
-  // ---- built-in metrics (global) ----
-  const M = data.metrics || {};
-  const totalReqs = trendNum(M,'http_reqs','count') || 0;
-  const vusMax   = trendNum(M,'vus_max','max') || '';
-  const sentB    = trendNum(M,'data_sent','count') || 0;
-  const recvB    = trendNum(M,'data_received','count') || 0;
+console.info(`features loaded: ${JSON.stringify(SELECTED_FEATURES)}`);
+console.info(`endpoints built: ${ENDPOINTS.length}`);
 
-  const latAvg = trendNum(M,'http_req_duration','avg');
-  const latMin = trendNum(M,'http_req_duration','min');
-  const latMed = trendNum(M,'http_req_duration','med');
-  const latP90 = trendPct(M,'http_req_duration',90);
-  const latP95 = trendPct(M,'http_req_duration',95);
-  const latP99 = trendPct(M,'http_req_duration',99);
-  const latMax = trendNum(M,'http_req_duration','max');
-
-  // ---- per feature / endpoint from runner accumulator ----
-  const acc = data.acc || { byFeature:{}, byEndpoint:{} };
-
-  const byFeature = Object.keys(acc.byFeature||{}).map(f=>{
-    const v=acc.byFeature[f]||{};
-    return { feature:f, requests:v.count||0, avg:v.avg!=null?Math.round(v.avg):null,
-             p95:v.p95!=null?Math.round(v.p95):null, max:v.max!=null?Math.round(v.max):null, errs:v.errs||0 };
-  }).sort((a,b)=>b.requests-a.requests);
-
-  const byEndpoint = Object.keys(acc.byEndpoint||{}).map(k=>{
-    const v=acc.byEndpoint[k]||{};
-    let feature='', endpoint=k;
-    if(k.indexOf('|')>-1){ const parts=k.split('|'); feature=parts[0]; endpoint=parts.slice(1).join('|'); }
-    return { feature, endpoint, requests:v.count||0, avg:v.avg!=null?Math.round(v.avg):null,
-             p95:v.p95!=null?Math.round(v.p95):null, max:v.max!=null?Math.round(v.max):null, errs:v.errs||0 };
-  }).sort((a,b)=>b.requests-a.requests);
-
-  const topN=8;
-  const chartLatency = byEndpoint.filter(r=>r.avg!=null).sort((a,b)=>b.avg-a.avg).slice(0,topN)
-    .map(r=>({ name:r.endpoint, value:r.avg }));
-  const chartReqs = byEndpoint.slice(0,topN).map(r=>({ name:r.endpoint, value:r.requests }));
-
-  const head = `<!doctype html><html><head><meta charset="utf-8"/>
-  <title>SDLC Auto Gov Load Test (ENHANCED)</title>
-  <style>
-    body{font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;color:#222}
-    h1{font-size:20px;margin:0 0 12px} h2{font-size:16px;margin:24px 0 8px}
-    table{border-collapse:collapse;width:100%;margin:8px 0 16px}
-    th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left} th{background:#f7f7f7}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px} .pill{padding:2px 6px;border-radius:10px;background:#f0f0f0}
-    details{margin:8px 0 16px} .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre}
-  </style></head><body>
-  <h1>SDLC Auto Gov Load Test (ENHANCED) — ${esc(new Date().toISOString().replace('T',' ').slice(0,19))}</h1>`;
-
-  const overview = `<div class="grid">
-    <div><h2>Overview</h2><table>
-      <tr><th>Requests</th><td>${totalReqs}</td></tr>
-      <tr><th>VUs max</th><td>${vusMax||'—'}</td></tr>
-      <tr><th>Data</th><td>sent ${Math.round(sentB)} B, received ${Math.round(recvB)} B</td></tr>
-    </table></div>
-    <div><h2>Latency (ms)</h2><table>
-      <tr><th>avg</th><td>${latAvg!=null?Math.round(latAvg):'—'}</td></tr>
-      <tr><th>p50</th><td>${latMed!=null?Math.round(latMed):'—'}</td></tr>
-      <tr><th>p90</th><td>${latP90!=null?Math.round(latP90):'—'}</td></tr>
-      <tr><th>p95</th><td>${latP95!=null?Math.round(latP95):'—'}</td></tr>
-      <tr><th>p99</th><td>${latP99!=null?Math.round(latP99):'—'}</td></tr>
-      <tr><th>min / max</th><td>${latMin!=null?Math.round(latMin):'—'} / ${latMax!=null?Math.round(latMax):'—'}</td></tr>
-    </table></div></div>`;
-
-  const featureTbl = `<h2>Feature breakdown</h2>${
-    byFeature.length?`<table>
-      <tr><th>Feature</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
-      ${byFeature.map(r=>`<tr><td>${esc(r.feature)}</td><td>${r.requests}</td><td>${r.avg??'—'}</td><td>${r.p95??'—'}</td><td>${r.max??'—'}</td><td>${r.errs||0}</td></tr>`).join('')}
-    </table>`:'<div class="mono">No feature data recorded.</div>'}`;
-
-  const endpointTbl = `<h2>Endpoint breakdown</h2>${
-    byEndpoint.length?`<table>
-      <tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
-      ${byEndpoint.map(r=>`<tr><td><span class="pill">${esc(r.feature)}</span></td><td>${esc(r.endpoint)}</td><td>${r.requests}</td>
-        <td>${r.avg??'—'}</td><td>${r.p95??'—'}</td><td>${r.max??'—'}</td><td>${r.errs||0}</td></tr>`).join('')}
-    </table>`:'<div class="mono">No endpoint data recorded.</div>'}`;
-
-  const charts = `<h2>Charts</h2><div class="grid">
-      <div>${svgBar(chartLatency,{title:'Top endpoints by avg latency (ms)',labelKey:'name',valueKey:'value',unit:' ms'})}</div>
-      <div>${svgBar(chartReqs,{title:'Top endpoints by requests',labelKey:'name',valueKey:'value'})}</div>
-    </div>`;
-
-  const raw = `<details><summary>Raw JSON (truncated)</summary>
-    <div class="mono">${esc(JSON.stringify({acc:data.acc||{}, sample:{
-      http_reqs:M.http_reqs||{}, http_req_duration:M.http_req_duration||{}
-    }},null,2).slice(0,18000))}${JSON.stringify(data).length>18000?'\n…(truncated)…':''}</div></details>`;
-
-  const html = head + overview + featureTbl + endpointTbl + charts + raw + '</body></html>';
-
-  return {
-    stdout: `\n${banner}\n`,
-    'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
-    'perf/k6/reports/summary.html': html,
+// ---------- k6 options (choose executor based on what you passed) ----------
+let scenarios;
+if (ITER && !DURATION) {
+  // run a fixed number of iterations per VU
+  scenarios = {
+    by_iter: {
+      executor: 'per-vu-iterations',
+      vus: VUS,
+      iterations: ITER,
+      maxDuration: '10m', // safety net
+    },
+  };
+} else if (!ITER && DURATION) {
+  // run for a duration at constant VUs
+  scenarios = {
+    by_time: {
+      executor: 'constant-vus',
+      vus: VUS,
+      duration: DURATION,
+      gracefulStop: '30s',
+    },
+  };
+} else if (ITER && DURATION) {
+  // both provided — honor ITER (explicit), ignore duration
+  scenarios = {
+    by_iter: {
+      executor: 'per-vu-iterations',
+      vus: VUS,
+      iterations: ITER,
+      maxDuration: DURATION || '10m',
+    },
+  };
+} else {
+  // nothing provided — smallest sensible default
+  scenarios = {
+    by_iter: {
+      executor: 'per-vu-iterations',
+      vus: 1,
+      iterations: 1,
+      maxDuration: '10m',
+    },
   };
 }
+
+export const options = {
+  scenarios,
+  // show p(95) and avg in console & summary.json
+  summaryTrendStats: ['avg', 'min', 'max', 'p(90)', 'p(95)'],
+};
+
+// ---------- tiny helper ----------
+function hasText(body, mustContain) {
+  if (!mustContain) return true;
+  const s = typeof body === 'string' ? body : String(body || '');
+  return s.indexOf(mustContain) !== -1;
+}
+
+// ---------- the test ----------
+export default function () {
+  if (ENDPOINTS.length === 0) {
+    console.warn('No endpoints to run; sleeping this iteration.');
+    sleep(0.2);
+    return;
+  }
+
+  // For this minimal runner: hit every endpoint once per iteration
+  for (let i = 0; i < ENDPOINTS.length; i += 1) {
+    const { feature, ep } = ENDPOINTS[i];
+    const method = (ep.method || 'GET').toUpperCase();
+    const url = ep.url;
+    const headers = ep.headers || null;
+
+    let res;
+    if (method === 'GET') {
+      res = http.get(url, { headers, tags: { feature, endpoint: ep.name } });
+    } else if (method === 'DELETE') {
+      res = http.del(url, null, { headers, tags: { feature, endpoint: ep.name } });
+    } else if (method === 'PATCH') {
+      // if your ep has a body, include ep.body; otherwise send empty object
+      res = http.patch(url, ep.body || {}, { headers, tags: { feature, endpoint: ep.name } });
+    } else if (method === 'POST') {
+      res = http.post(url, ep.body || {}, { headers, tags: { feature, endpoint: ep.name } });
+    } else if (method === 'PUT') {
+      res = http.put(url, ep.body || {}, { headers, tags: { feature, endpoint: ep.name } });
+    } else {
+      console.warn(`Unsupported method: ${method} for ${ep.name}`);
+      continue;
+    }
+
+    const expect = ep.expect || {};
+    check(res, {
+      'status ok': (r) => (!expect.status ? r.status >= 200 && r.status < 400 : r.status === expect.status),
+      'body has text': (r) => hasText(r.body, expect.text),
+    }, { feature, endpoint: ep.name });
+
+    // very short wait between endpoints (keeps output readable)
+    sleep(0.1);
+  }
+}
+
+// ---------- export the enhanced summary from vendor ----------
+export { handleSummary };
