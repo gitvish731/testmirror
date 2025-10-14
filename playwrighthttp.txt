@@ -1,177 +1,177 @@
 // perf/k6/vendor/handleSummary.js
-// Self-contained HTML + text reporter for k6 (no external imports)
+// ES5-safe (no optional chaining / nullish coalescing)
 
 function esc(s) {
-  return String(s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  s = String(s == null ? "" : s);
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
 }
 function ms(n) {
   if (n == null || isNaN(n)) return "0 ms";
-  return `${Math.round(Number(n))} ms`;
+  return Math.round(Number(n)) + " ms";
 }
 function trendVals(metric) {
-  const v = (metric && metric.values) || {};
-  return {
-    avg: v.avg, min: v.min, med: v.med, p95: v["p(95)"], max: v.max,
-  };
+  var v = (metric && metric.values) || {};
+  return { avg: v.avg, min: v.min, med: v.med, p95: v["p(95)"], max: v.max };
 }
+function val(obj, k1, k2, k3) {
+  var o = obj || null;
+  if (o && k1 in o) { o = o[k1]; } else { return null; }
+  if (k2 != null) { if (o && k2 in o) { o = o[k2]; } else { return null; } }
+  if (k3 != null) { if (o && k3 in o) { o = o[k3]; } else { return null; } }
+  return o;
+}
+
+// -------- text summary (stdout) ----------
 function textSummary(data) {
-  const dur = trendVals(data.metrics["http_req_duration"]);
-  const reqs = data.metrics["http_reqs"]?.values?.count || 0;
-  const iters = data.metrics["iterations"]?.values?.count || 0;
-  const vusMax = data.metrics["vus_max"]?.values?.value || 0;
-  const checks = data.metrics["checks"]?.values || {};
-  const pass = checks.passes || 0;
-  const fail = checks.fails || 0;
+  var dur = trendVals(data.metrics["http_req_duration"]);
+  var reqs = val(data, "metrics", "http_reqs", "values"); reqs = reqs ? reqs.count : 0;
+  var iters = val(data, "metrics", "iterations", "values"); iters = iters ? iters.count : 0;
+  var vusMax = val(data, "metrics", "vus_max", "values"); vusMax = vusMax ? vusMax.value : 0;
+  var checks = val(data, "metrics", "checks", "values") || {};
+  var pass = checks.passes || 0;
+  var fail = checks.fails || 0;
 
-  const lines = [];
-  lines.push("SDLC Auto Gov Load Test");
-  lines.push("-----------------------");
-  lines.push(`Checks: ${pass} / ${fail}`);
-  lines.push(`Requests: ${reqs}`);
-  lines.push(`Latency p(95): ${ms(dur.p95)}`);
-  lines.push(`Latency avg/min/max: ${ms(dur.avg)} / ${ms(dur.min)} / ${ms(dur.max)}`);
-  lines.push(`Iterations: ${iters}`);
-  lines.push(`VUs max: ${vusMax}`);
-  return lines.join("\n") + "\n";
+  var out = [];
+  out.push("SDLC Auto Gov Load Test");
+  out.push("-----------------------");
+  out.push("Checks: " + pass + " / " + fail);
+  out.push("Requests: " + reqs);
+  out.push("Latency p(95): " + ms(dur.p95));
+  out.push("Latency avg/min/max: " + ms(dur.avg) + " / " + ms(dur.min) + " / " + ms(dur.max));
+  out.push("Iterations: " + iters);
+  out.push("VUs max: " + vusMax);
+  return out.join("\n") + "\n";
 }
 
-// Parse metric names like: latency_ep{feature:Foo,endpoint:/api/x}
+// -------- tagged metric name parser ----------
 function parseTagMetricName(name) {
-  const i = name.indexOf("{");
-  if (i < 0 || !name.endsWith("}")) return null;
-  const base = name.slice(0, i);
-  const inside = name.slice(i + 1, -1); // feature:Foo,endpoint:/x
-  const tags = {};
-  for (const part of inside.split(",")) {
-    const [k, v] = part.split(":");
-    if (!k) continue;
-    // join back any stray colons and strip quotes/spaces
-    const raw = (v == null ? "" : [v, ...part.split(":").slice(2)].join(":")).trim();
-    tags[k.trim()] = raw.replace(/^"(.*)"$/, "$1");
+  var i = name.indexOf("{");
+  if (i < 0 || name.charAt(name.length - 1) !== "}") return null;
+  var base = name.slice(0, i);
+  var inside = name.slice(i + 1, -1); // k:v,k2:v2
+  var tags = {};
+  var parts = inside.split(",");
+  for (var p = 0; p < parts.length; p++) {
+    var seg = parts[p];
+    var idx = seg.indexOf(":");
+    if (idx < 0) continue;
+    var k = seg.slice(0, idx).trim();
+    var v = seg.slice(idx + 1).trim();
+    if (v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
+      v = v.slice(1, -1);
+    }
+    tags[k] = v;
   }
-  return { base, tags };
+  return { base: base, tags: tags };
 }
 
-// Build Feature/Endpoint rows from custom metrics:
-//   - reqs_ep{feature:...,endpoint:...}   -> counter.count
-//   - latency_ep{feature:...,endpoint:...} -> trend.avg/p(95)/max
+// -------- collect Feature/Endpoint rows ----------
 function collectFeatureRows(metrics) {
-  const map = new Map(); // key = feature||endpoint
-  for (const [name, metric] of Object.entries(metrics || {})) {
-    const parsed = parseTagMetricName(name);
+  var map = {}; // key: feature||endpoint
+  for (var name in (metrics || {})) {
+    if (!metrics.hasOwnProperty(name)) continue;
+    var metric = metrics[name];
+    var parsed = parseTagMetricName(name);
     if (!parsed) continue;
-    const { base, tags } = parsed;
-    if (base !== "reqs_ep" && base !== "latency_ep") continue;
+    if (parsed.base !== "reqs_ep" && parsed.base !== "latency_ep") continue;
 
-    const feature = tags.feature || "unknown";
-    const endpoint = tags.endpoint || tags.ep || "unknown";
-    const key = `${feature}||${endpoint}`;
-    if (!map.has(key)) {
-      map.set(key, { feature, endpoint, count: 0, avg: null, p95: null, max: null });
-    }
-    const row = map.get(key);
-    if (base === "reqs_ep") row.count = (metric.values && metric.values.count) || 0;
-    if (base === "latency_ep") {
-      const v = trendVals(metric);
-      row.avg = v.avg; row.p95 = v.p95; row.max = v.max;
+    var feature = parsed.tags.feature || "unknown";
+    var endpoint = parsed.tags.endpoint || parsed.tags.ep || "unknown";
+    var key = feature + "||" + endpoint;
+    if (!map[key]) map[key] = { feature: feature, endpoint: endpoint, count: 0, avg: null, p95: null, max: null };
+
+    if (parsed.base === "reqs_ep") {
+      map[key].count = val(metric, "values", "count") || 0;
+    } else {
+      var v = trendVals(metric);
+      map[key].avg = v.avg; map[key].p95 = v.p95; map[key].max = v.max;
     }
   }
-  return Array.from(map.values()).sort((a, b) =>
-    (b.count || 0) - (a.count || 0)
-  );
+  // to array + sort by count desc
+  var arr = [];
+  for (var k in map) if (map.hasOwnProperty(k)) arr.push(map[k]);
+  arr.sort(function(a, b){ return (b.count || 0) - (a.count || 0); });
+  return arr;
 }
 
 export default function handleSummary(data) {
-  // ----- Text (stdout) -----
-  const text = textSummary(data);
+  var text = textSummary(data);
+  var overall = trendVals(data.metrics["http_req_duration"]);
+  var rows = collectFeatureRows(data.metrics);
 
-  // ----- Overall latency bars (from http_req_duration) -----
-  const overall = trendVals(data.metrics["http_req_duration"]);
+  var checksVal = val(data, "metrics", "checks", "values") || {};
+  var when = new Date().toISOString().replace("T", " ").slice(0, 19);
 
-  // ----- Feature/Endpoint table -----
-  const rows = collectFeatureRows(data.metrics);
+  var topTable =
+    '<table style="border-collapse:collapse;margin:8px 0">' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Checks (pass/fail)</th>' +
+          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (checksVal.passes || 0) + ' / ' + (checksVal.fails || 0) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Requests</th>' +
+          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (val(data, "metrics", "http_reqs", "values") ? val(data, "metrics", "http_reqs", "values").count : 0) + ' total</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency p(95)</th>' +
+          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + ms(overall.p95) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency avg / min / max</th>' +
+          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + ms(overall.avg) + ' / ' + ms(overall.min) + ' / ' + ms(overall.max) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Iterations</th>' +
+          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (val(data, "metrics", "iterations", "values") ? val(data, "metrics", "iterations", "values").count : 0) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">VUs max</th>' +
+          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (val(data, "metrics", "vus_max", "values") ? val(data, "metrics", "vus_max", "values").value : 0) + '</td></tr>' +
+    '</table>';
 
-  const when = new Date().toISOString().replace("T", " ").slice(0, 19);
-  const topTable = `
-    <table style="border-collapse:collapse;margin:8px 0">
-      <tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Checks (pass/fail)</th>
-          <td style="padding:6px 10px;border:1px solid #e0e0e0">
-            ${(data.metrics["checks"]?.values?.passes || 0)} / ${(data.metrics["checks"]?.values?.fails || 0)}
-          </td></tr>
-      <tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Requests</th>
-          <td style="padding:6px 10px;border:1px solid #e0e0e0">${data.metrics["http_reqs"]?.values?.count || 0} total</td></tr>
-      <tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency p(95)</th>
-          <td style="padding:6px 10px;border:1px solid #e0e0e0">${ms(overall.p95)}</td></tr>
-      <tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency avg / min / max</th>
-          <td style="padding:6px 10px;border:1px solid #e0e0e0">${ms(overall.avg)} / ${ms(overall.min)} / ${ms(overall.max)}</td></tr>
-      <tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Iterations</th>
-          <td style="padding:6px 10px;border:1px solid #e0e0e0">${data.metrics["iterations"]?.values?.count || 0}</td></tr>
-      <tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">VUs max</th>
-          <td style="padding:6px 10px;border:1px solid #e0e0e0">${data.metrics["vus_max"]?.values?.value || 0}</td></tr>
-    </table>`;
+  var featureTable;
+  if (rows.length) {
+    var body = "";
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      body += '<tr>' +
+        '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + esc(r.feature) + '</td>' +
+        '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + esc(r.endpoint) + '</td>' +
+        '<td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">' + (r.count || 0) + '</td>' +
+        '<td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">' + ms(r.avg) + '</td>' +
+        '<td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">' + ms(r.p95) + '</td>' +
+        '<td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">' + ms(r.max) + '</td>' +
+      '</tr>';
+    }
+    featureTable =
+      '<h3>Feature / Endpoint breakdown</h3>' +
+      '<table style="border-collapse:collapse;margin:8px 0;width:100%">' +
+        '<thead><tr>' +
+          '<th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Feature</th>' +
+          '<th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Endpoint</th>' +
+          '<th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">Requests</th>' +
+          '<th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">avg</th>' +
+          '<th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">p(95)</th>' +
+          '<th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">max</th>' +
+        '</tr></thead><tbody>' + body + '</tbody></table>';
+  } else {
+    featureTable =
+      '<h3>Feature / Endpoint breakdown</h3>' +
+      '<div style="color:#666">No per-feature data (did the runner emit <code>reqs_ep{...}</code> and <code>latency_ep{...}</code> metrics?).</div>';
+  }
 
-  const featureTable = rows.length
-    ? `
-    <h3>Feature / Endpoint breakdown</h3>
-    <table style="border-collapse:collapse;margin:8px 0;width:100%">
-      <thead>
-        <tr>
-          <th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Feature</th>
-          <th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Endpoint</th>
-          <th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">Requests</th>
-          <th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">avg</th>
-          <th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">p(95)</th>
-          <th style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">max</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows.map(r => `
-          <tr>
-            <td style="padding:6px 10px;border:1px solid #e0e0e0">${esc(r.feature)}</td>
-            <td style="padding:6px 10px;border:1px solid #e0e0e0">${esc(r.endpoint)}</td>
-            <td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">${r.count || 0}</td>
-            <td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">${ms(r.avg)}</td>
-            <td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">${ms(r.p95)}</td>
-            <td style="text-align:right;padding:6px 10px;border:1px solid #e0e0e0">${ms(r.max)}</td>
-          </tr>`).join("")}
-      </tbody>
-    </table>`
-    : `<h3>Feature / Endpoint breakdown</h3>
-       <div style="color:#666">No per-feature data (did the runner emit <code>reqs_ep{...}</code> / <code>latency_ep{...}</code> metrics?).</div>`;
+  var jsonStr = JSON.stringify(data, null, 2);
+  var html =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<title>SDLC Auto Gov Load Test — ' + esc(when) + '</title>' +
+    '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:16px 18px 48px}h1{margin:0 0 10px;font-size:22px}h3{margin:18px 0 6px}code{background:#f6f8fa;padding:1px 4px;border-radius:4px}</style>' +
+    '</head><body>' +
+    '<h1>SDLC Auto Gov Load Test — ' + esc(when) + '</h1>' +
+    topTable +
+    '<div style="margin:10px 0 16px">' +
+      '<div style="height:10px;background:#e6eefc;border-radius:4px;position:relative;margin:8px 0">' +
+      '<div style="position:absolute;left:0;top:0;bottom:0;width:70%;background:#3b82f6;border-radius:4px"></div>' +
+      '</div></div>' +
+    featureTable +
+    '<details style="margin-top:14px"><summary style="cursor:pointer">Raw JSON (truncated)</summary>' +
+    '<pre style="white-space:pre-wrap;font-size:12px;background:#fafafa;border:1px solid #eee;padding:8px;border-radius:6px;max-height:440px;overflow:auto;">' +
+    esc(jsonStr.slice(0, 20000)) + '</pre></details>' +
+    '</body></html>';
 
-  const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>SDLC Auto Gov Load Test — ${esc(when)}</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px 18px 48px; }
-    h1 { margin: 0 0 10px; font-size: 22px; }
-    h3 { margin: 18px 0 6px; }
-    code { background: #f6f8fa; padding: 1px 4px; border-radius: 4px; }
-  </style>
-</head>
-<body>
-  <h1>SDLC Auto Gov Load Test — ${esc(when)}</h1>
-  ${topTable}
-  <div style="margin:10px 0 16px">
-    <div style="height:10px;background:#e6eefc;border-radius:4px;position:relative;margin:8px 0">
-      <div style="position:absolute;left:0;top:0;bottom:0;width:70%;background:#3b82f6;border-radius:4px"></div>
-    </div>
-  </div>
-  ${featureTable}
-  <details style="margin-top:14px"><summary style="cursor:pointer">Raw JSON (truncated)</summary>
-    <pre style="white-space:pre-wrap;font-size:12px;background:#fafafa;border:1px solid #eee;padding:8px;border-radius:6px;max-height:440px;overflow:auto;">${esc(JSON.stringify(data, null, 2).slice(0, 20000))}</pre>
-  </details>
-</body>
-</html>`;
-
-  // Always emit all three outputs
   return {
     stdout: text,
     "perf/k6/reports/summary.html": html,
-    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
+    "perf/k6/reports/summary.json": jsonStr
   };
 }
