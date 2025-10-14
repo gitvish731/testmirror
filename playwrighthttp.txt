@@ -1,5 +1,5 @@
 // perf/k6/vendor/handleSummary.js
-// ES5-safe (no optional chaining / nullish coalescing)
+// ES5-safe (no optional chaining / nullish coalescing). Named export: handleSummary.
 
 function esc(s) {
   s = String(s == null ? "" : s);
@@ -96,7 +96,8 @@ function collectFeatureRows(metrics) {
   return arr;
 }
 
-export default function handleSummary(data) {
+// ---------- NAMED EXPORT ----------
+export function handleSummary(data) {
   var text = textSummary(data);
   var overall = trendVals(data.metrics["http_req_duration"]);
   var rows = collectFeatureRows(data.metrics);
@@ -152,6 +153,7 @@ export default function handleSummary(data) {
   }
 
   var jsonStr = JSON.stringify(data, null, 2);
+  var when = new Date().toISOString().replace("T", " ").slice(0, 19);
   var html =
     '<!doctype html><html><head><meta charset="utf-8">' +
     '<title>SDLC Auto Gov Load Test — ' + esc(when) + '</title>' +
