@@ -1,9 +1,9 @@
+// mini
 import http from "k6/http";
 import { sleep, check, Trend, Counter } from "k6";
-import features from "../sources/endpoints.byFeature.js";
-export { handleSummary } from "../vendor/handleSummary.js"; // import only
+import features from "../sources/endpoints.byFeature.js"; // ESM default export
 
-// ---------- env parsing ----------
+// ------------ env parsing ------------
 var FEAT_RAW = (__ENV.FEATURES || "").toString().trim();
 var VUS      = Number(__ENV.VUS || "1");
 var ITERS    = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
@@ -20,7 +20,7 @@ console.log(
   ", features=" + (SELECTED.length ? SELECTED.join("|") : "(all)")
 );
 
-// ---------- executor selection ----------
+// ------------ executor ------------
 export var options = ITERS > 0 ? {
   scenarios: { by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" } }
 } : {
@@ -28,34 +28,34 @@ export var options = ITERS > 0 ? {
 };
 console.log("executor chosen -> " + (ITERS > 0 ? "per-vu-iterations" : "constant-vus"));
 
-// ---------- normalize features -> endpoints (defensive) ----------
-function isPO(x) { return x && typeof x === "object" && !Array.isArray(x); }
+// ------------ build endpoints (defensive) ------------
+function isPO(x){ return x && typeof x === "object" && !Array.isArray(x); }
 
 var ENDPOINTS = [];
 if (!isPO(features)) {
-  console.error("features export invalid; got:", typeof features);
+  console.error("features export invalid; typeof =", typeof features);
 } else {
   var available = Object.keys(features);
   console.log("features available:", JSON.stringify(available));
-
   var names = SELECTED.length ? SELECTED : available;
+
   for (var i = 0; i < names.length; i++) {
     var fname = names[i];
     var list = features[fname];
-
     if (!Array.isArray(list)) {
-      console.warn("Feature name not found or has no endpoints:", fname);
-      list = []; // make it safe; keep going
+      console.warn("Feature not found or not an array:", fname);
+      continue;
     }
-
     for (var j = 0; j < list.length; j++) {
       var ep = list[j];
       if (!isPO(ep)) continue;
 
       var method = (ep.method || "GET").toUpperCase();
       var url = String(ep.url || "");
-      if (!url) continue;
-
+      if (!url) {
+        console.warn("Skipping endpoint with empty url in feature:", fname);
+        continue;
+      }
       var expect = isPO(ep.expect) ? ep.expect : {};
       ENDPOINTS.push({
         feature: fname,
@@ -67,52 +67,65 @@ if (!isPO(features)) {
           text: typeof expect.text === "string" ? expect.text : ""
         },
         headers: isPO(ep.headers) ? ep.headers : undefined,
-        auth: ep.auth || null
+        auth: ep.auth || null,
+        body: ep.body || "" // safe default for POST/PUT/PATCH
       });
     }
   }
 }
 
+console.log("endpoints built:", ENDPOINTS.length);
+if (ENDPOINTS.length) {
+  // Log the first one so we see exact shape
+  console.log("first endpoint:", JSON.stringify(ENDPOINTS[0]));
+}
+
+// metrics
 var latency_ep = new Trend("latency_ep");
 var reqs_ep = new Counter("reqs_ep");
 
-// ---------- main test ----------
+// ------------ main ------------
 export default function () {
-  if (!ENDPOINTS.length) { sleep(0.2); return; }
+  // Nothing to run? Exit gracefully; prevents “value is not an object”
+  if (!ENDPOINTS.length) { sleep(0.25); return; }
 
-  // round-robin across defined endpoints
-  var idx = (typeof __ITER === "number" ? __ITER : 0) % ENDPOINTS.length;
-  var ep = ENDPOINTS[idx];
+  try {
+    // simple round-robin
+    var idx = (typeof __ITER === "number" ? __ITER : 0) % ENDPOINTS.length;
+    var ep = ENDPOINTS[idx];
 
-  var tags = { feature: ep.feature, endpoint: ep.name };
-  var params = { tags: tags };
-  if (ep.headers) params.headers = ep.headers;
-  if (ep.auth) {
-    var h = params.headers || {};
-    h.authorization = String(ep.auth);
-    params.headers = h;
-  }
-
-  var res;
-  switch (ep.method) {
-    case "POST": res = http.post(ep.url, ep.body || "", params); break;
-    case "PUT":  res = http.put(ep.url, ep.body || "", params);  break;
-    case "PATCH":res = http.patch(ep.url, ep.body || "", params);break;
-    case "DELETE": res = http.del(ep.url, null, params); break;
-    default:     res = http.get(ep.url, params);
-  }
-
-  check(res, {
-    "status ok": function (r) { return r && r.status === ep.expect.status; },
-    "body has text": function (r) {
-      if (!ep.expect.text) return true;
-      var s = typeof r.body === "string" ? r.body : JSON.stringify(r.body);
-      return s.indexOf(ep.expect.text) !== -1;
+    var tags = { feature: ep.feature, endpoint: ep.name };
+    var params = { tags: tags };
+    if (ep.headers) params.headers = ep.headers;
+    if (ep.auth) {
+      var h = params.headers || {};
+      h.authorization = String(ep.auth);
+      params.headers = h;
     }
-  });
 
-  latency_ep.add(res.timings.duration, tags);
-  reqs_ep.add(1, tags);
+    var res;
+    switch (ep.method) {
+      case "POST":   res = http.post(ep.url, ep.body, params); break;
+      case "PUT":    res = http.put(ep.url, ep.body, params);  break;
+      case "PATCH":  res = http.patch(ep.url, ep.body, params);break;
+      case "DELETE": res = http.del(ep.url, null, params);     break;
+      default:       res = http.get(ep.url, params);
+    }
 
-  sleep(0.2);
+    check(res, {
+      "status ok": function (r) { return r && r.status === ep.expect.status; },
+      "body has text": function (r) {
+        if (!ep.expect.text) return true;
+        var s = (r && typeof r.body === "string") ? r.body : JSON.stringify(r && r.body || "");
+        return s.indexOf(ep.expect.text) !== -1;
+      }
+    });
+
+    if (res && res.timings) latency_ep.add(res.timings.duration, tags);
+    reqs_ep.add(1, tags);
+  } catch (e) {
+    console.error("iteration error for ep:", JSON.stringify(ENDPOINTS[0] || {}), "err:", String(e && e.message || e));
+  }
+
+  sleep(0.25);
 }
