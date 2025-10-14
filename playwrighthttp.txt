@@ -1,86 +1,106 @@
-//--- perf/k6/scenarios/from-playwright.http.js 
-import http from "k6/http";
-import { sleep, check, Trend, Counter } from "k6";
-import features from "../sources/endpoints.byFeature.js";
-export { handleSummary } from "../vendor/handleSummary.js";   // just import — do NOT paste function
+// perf/k6/vendor/handleSummary.js  —  K6 v0.46-safe HTML + JSON summary
 
-// -------- env parsing (k6 0.46 safe) --------
-var FEAT_RAW = (__ENV.FEATURES || "").toString().trim();
-var VUS      = Number(__ENV.VUS || "1");
-var ITERS    = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
-var DURATION = (__ENV.DURATION || "30s").toString();
-
-var SELECTED = FEAT_RAW
-  ? FEAT_RAW.split(",").map(function(s){return s.trim();}).filter(function(s){return s.length;})
-  : [];
-
-console.log("parsed -> vus=" + VUS + ", iters=" + ITERS + ", duration=" + DURATION +
-            ", features=" + (SELECTED.length ? SELECTED.join("|") : "(all)"));
-
-// -------- executor selection --------
-export var options = ITERS > 0 ? {
-  scenarios: { by_iter: { executor:"per-vu-iterations", vus:VUS, iterations:ITERS, maxDuration:"10m" } }
-} : {
-  scenarios: { by_time: { executor:"constant-vus", vus:VUS, duration:DURATION, gracefulStop:"3s" } }
-};
-console.log("executor chosen -> " + (ITERS > 0 ? "per-vu-iterations" : "constant-vus"));
-
-// -------- normalize features -> endpoints --------
-function isPO(x){ return x && typeof x==="object" && !Array.isArray(x); }
-var ENDPOINTS=[];
-if(!isPO(features)){ console.error("features export invalid."); }
-else{
-  var names=SELECTED.length?SELECTED:Object.keys(features);
-  console.log("features_loaded: "+JSON.stringify(names));
-  for(var i=0;i<names.length;i++){
-    var fname=names[i], list=features[fname];
-    if(!Array.isArray(list)){console.warn("Feature "+fname+" has no endpoints.");continue;}
-    for(var j=0;j<list.length;j++){
-      var ep=list[j]; if(!isPO(ep))continue;
-      var method=(ep.method||"GET").toUpperCase();
-      var url=String(ep.url||""); if(!url)continue;
-      var expect=isPO(ep.expect)?ep.expect:{};
-      ENDPOINTS.push({
-        feature:fname,
-        name:ep.name||(method+" "+url),
-        method:method,url:url,
-        expect:{status:Number(expect.status||200),text:typeof expect.text==="string"?expect.text:""},
-        headers:isPO(ep.headers)?ep.headers:undefined,
-        auth:ep.auth||null
-      });
-    }
+function safe(v, d) { return v == null ? d : v; }
+function get(obj, path, d) {
+  var x = obj;
+  for (var i = 0; i < path.length; i++) {
+    if (!x || typeof x !== "object" || !(path[i] in x)) return d;
+    x = x[path[i]];
   }
+  return x;
 }
 
-// -------- custom metrics --------
-var latency_ep=new Trend("latency_ep");
-var reqs_ep=new Counter("reqs_ep");
+function table(rows) {
+  if (!rows.length)
+    return "<em>No per-feature data (did the runner emit tagged metrics?)</em>";
+  var head = "<tr><th>Feature</th><th>Endpoint</th><th style='text-align:right'>Count</th><th style='text-align:right'>p(95) ms</th><th style='text-align:right'>avg ms</th></tr>";
+  var body = rows.map(function (r) {
+    return "<tr><td>" + r.feature + "</td><td>" + r.endpoint +
+           "</td><td style='text-align:right'>" + r.count +
+           "</td><td style='text-align:right'>" + r.p95.toFixed(1) +
+           "</td><td style='text-align:right'>" + r.avg.toFixed(1) +
+           "</td></tr>";
+  }).join("");
+  return "<table style='border-collapse:collapse;width:100%'><thead>" +
+         head + "</thead><tbody>" + body + "</tbody></table>";
+}
 
-// -------- main test --------
-export default function(){
-  if(!ENDPOINTS.length){sleep(0.2);return;}
-  var idx=(typeof __ITER==="number"?__ITER:0)%ENDPOINTS.length;
-  var ep=ENDPOINTS[idx];
-  var tags={feature:ep.feature,endpoint:ep.name};
-  var params={tags:tags};
-  if(ep.headers)params.headers=ep.headers;
-  if(ep.auth){
-    var h=params.headers||{};
-    h.authorization=String(ep.auth);
-    params.headers=h;
+export function handleSummary(data) {
+  var rows = [];
+  try {
+    var lat = data.metrics && data.metrics["latency_ep"];
+    var req = data.metrics && data.metrics["reqs_ep"];
+    var latTags = lat && lat.values && lat.values.tags ? lat.values.tags : null;
+    var reqTags = req && req.values && req.values.tags ? req.values.tags : null;
+    if (latTags || reqTags) {
+      var map = {};
+      function addKey(k) {
+        if (!map[k]) map[k] = { feature: "", endpoint: "", count: 0, avg: 0, p95: 0 };
+      }
+      for (var k in (latTags || {})) addKey(k);
+      for (var k2 in (reqTags || {})) addKey(k2);
+      for (var a in map) {
+        var parts = a.split("|");
+        map[a].feature = parts[0] || "";
+        map[a].endpoint = parts[1] || "";
+        var lv = latTags && latTags[a] ? latTags[a] : {};
+        var rv = reqTags && reqTags[a] ? reqTags[a] : {};
+        map[a].count = safe(rv.count, 0);
+        map[a].avg = safe(lv.avg, 0);
+        map[a].p95 = safe(lv["p(95)"], 0);
+      }
+      for (var m in map) rows.push(map[m]);
+      rows.sort(function (x, y) {
+        return x.feature.localeCompare(y.feature) ||
+               x.endpoint.localeCompare(y.endpoint);
+      });
+    }
+  } catch (e) {}
+
+  var checks = get(data, ["root_group", "checks"], []);
+  var totalPass = 0, totalFail = 0;
+  for (var i = 0; i < checks.length; i++) {
+    totalPass += safe(checks[i].passes, 0);
+    totalFail += safe(checks[i].fails, 0);
   }
 
-  var res=http.get(ep.url,params);   // extend later for POST etc.
-  check(res,{
-    "status ok":function(r){return r&&r.status===ep.expect.status;},
-    "body has text":function(r){
-      if(!ep.expect.text)return true;
-      var s=typeof r.body==="string"?r.body:JSON.stringify(r.body);
-      return s.indexOf(ep.expect.text)!==-1;
-    }
-  });
+  var httpReqDur = get(data, ["metrics", "http_req_duration", "values"], {});
+  var httpReqs   = get(data, ["metrics", "http_reqs", "values", "count"], 0);
+  var vusMax     = get(data, ["metrics", "vus_max", "values", "value"], 0);
+  var iterations = get(data, ["metrics", "iterations", "values", "count"], 0);
 
-  latency_ep.add(res.timings.duration,tags);
-  reqs_ep.add(1,tags);
-  sleep(0.2);
+  var html = "<!doctype html><html><head><meta charset='utf-8'/>" +
+    "<title>SDLC Auto Gov Load Test</title>" +
+    "<style>body{font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif;margin:24px}" +
+    ".grid{display:grid;grid-template-columns:260px 1fr;gap:12px;margin-bottom:18px}" +
+    ".box{border:1px solid #e0e0e0;padding:8px 10px;border-radius:6px}" +
+    "table td,table th{border-bottom:1px solid #f0f0f0;padding:6px 8px}" +
+    "thead th{border-bottom:2px solid #e0e0e0}</style></head><body>" +
+    "<h1>SDLC Auto Gov Load Test — " + new Date().toISOString() + "</h1>" +
+    "<div class='grid'>" +
+    "<div class='box'><b>Checks (pass/fail)</b><br/>" + totalPass + " / " + totalFail + "</div>" +
+    "<div class='box'><b>Requests</b><br/>" + httpReqs + " total</div>" +
+    "<div class='box'><b>Latency p(95)</b><br/>" + safe(httpReqDur["p(95)"],0).toFixed(1) + " ms</div>" +
+    "<div class='box'><b>Latency avg/min/max</b><br/>" +
+      safe(httpReqDur.avg,0).toFixed(1) + " / " +
+      safe(httpReqDur.min,0).toFixed(1) + " / " +
+      safe(httpReqDur.max,0).toFixed(1) + " ms</div>" +
+    "<div class='box'><b>Iterations</b><br/>" + iterations + "</div>" +
+    "<div class='box'><b>VUs max</b><br/>" + vusMax + "</div></div>" +
+    "<h2>Feature / Endpoint breakdown</h2>" + table(rows) +
+    "<details style='margin-top:16px'><summary><b>Raw JSON (truncated)</b></summary><pre>" +
+    JSON.stringify({
+      options:data.options,
+      metrics:{
+        http_req_duration:data.metrics && data.metrics.http_req_duration,
+        http_reqs:data.metrics && data.metrics.http_reqs,
+        latency_ep:data.metrics && data.metrics.latency_ep,
+        reqs_ep:data.metrics && data.metrics.reqs_ep
+      }
+    },null,2) + "</pre></details></body></html>";
+
+  return {
+    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
+    "perf/k6/reports/summary.html": html
+  };
 }
