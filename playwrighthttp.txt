@@ -1,104 +1,174 @@
-// probe
+perf/k6/vendor/acc.js
+
+// Minimal accumulator that works on k6 v0.46 (no shared-array, no experimental APIs)
+export const ACC = {
+  byFeature: Object.create(null),   // { feature: { count, dur } }
+  byEndpoint: Object.create(null),  // { "feature::name": { feature, name, count, dur } }
+};
+
+export function add(feature, name, durMs) {
+  try {
+    // per feature
+    let f = ACC.byFeature[feature];
+    if (!f) { f = ACC.byFeature[feature] = { feature, count: 0, dur: 0 }; }
+    f.count += 1;
+    f.dur += +durMs || 0;
+
+    // per endpoint
+    const key = feature + "::" + name;
+    let e = ACC.byEndpoint[key];
+    if (!e) { e = ACC.byEndpoint[key] = { feature, name, count: 0, dur: 0 }; }
+    e.count += 1;
+    e.dur += +durMs || 0;
+  } catch (_) { /* never throw in VU code */ }
+}
+
+//------------------------------
+
+perf/k6/scenarios/from-playwright.http.min.js
+
 import http from "k6/http";
 import { sleep } from "k6";
-import features from "../sources/endpoints.byFeature.js"; // default ESM export
+import features from "../sources/endpoints.byFeature.js";
+import { ACC, add as accAdd } from "../vendor/acc.js";
 
-// -------- env ----------
-var FEAT = (__ENV.FEATURES || "").toString().trim();
-var VUS = Number(__ENV.VUS || "1");
-var ITERS = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
-var DURATION = (__ENV.DURATION || "30s").toString();
+// ---------------- env ----------------
+const FEAT_RAW = String(__ENV.FEATURES || "").trim();
+const VUS      = Number(__ENV.VUS || "1");
+const ITERS    = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
+const DURATION = String(__ENV.DURATION || "30s");
 
-var SELECTED = FEAT
-  ? FEAT.split(",").map(function (s) { return s.trim(); }).filter(function (s) { return s.length; })
+const SELECTED = FEAT_RAW
+  ? FEAT_RAW.split(",").map(s => s.trim()).filter(Boolean)
   : [];
 
-console.log(
-  "parsed -> vus=" + VUS +
-  ", iters=" + ITERS +
-  ", duration=" + DURATION +
-  ", features=" + (SELECTED.length ? SELECTED.join("|") : "(all)")
-);
+console.log(`parsed  -> vus=${VUS}, iters=${ITERS}, duration=${DURATION}, features=${SELECTED.length?SELECTED.join("|"):"(all)"}`);
+console.log("feature map keys:", JSON.stringify(Object.keys(features || {})));
 
-// -------- executor --------
-export var options = ITERS > 0 ? {
-  scenarios: { by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" } }
+// ------------- options ---------------
+export const options = ITERS > 0 ? {
+  scenarios: {
+    by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" }
+  }
 } : {
-  scenarios: { by_time: { executor: "constant-vus", vus: VUS, duration: DURATION, gracefulStop: "3s" } }
+  scenarios: {
+    by_time: { executor: "constant-vus", vus: VUS, duration: DURATION, gracefulStop: "3s" }
+  }
 };
-console.log("executor chosen -> " + (ITERS > 0 ? "per-vu-iterations" : "constant-vus"));
+console.log("executor chosen:", ITERS > 0 ? "per-vu-iterations" : "constant-vus");
 
-// -------- build endpoints (very defensive) --------
-function isPO(x){ return x && typeof x === "object" && !Array.isArray(x); }
-
-var ENDPOINTS = [];
+// -------- build endpoints safely -----
+function isPO(x){return x && typeof x==="object" && !Array.isArray(x);}
+const ENDPOINTS = [];
 if (!isPO(features)) {
   console.error("features export invalid; typeof =", typeof features);
 } else {
-  var available = Object.keys(features);
-  console.log("features available:", JSON.stringify(available));
-  var names = SELECTED.length ? SELECTED : available;
-
-  for (var i = 0; i < names.length; i++) {
-    var fname = names[i];
-    var list = features[fname];
-    if (!Array.isArray(list)) {
-      console.warn("Feature not found or not an array:", fname);
-      continue;
-    }
-    for (var j = 0; j < list.length; j++) {
-      var ep = list[j];
+  const names = SELECTED.length ? SELECTED : Object.keys(features);
+  for (const fname of names) {
+    const list = features[fname];
+    if (!Array.isArray(list)) { console.warn("feature not found / not array:", fname); continue; }
+    for (const ep of list) {
       if (!isPO(ep)) continue;
-
-      var method = (ep.method || "GET").toUpperCase();
-      var url = String(ep.url || "");
-      if (!url) { console.warn("Skipping endpoint with empty url in feature:", fname); continue; }
-
+      const method = String(ep.method || "GET").toUpperCase();
+      const url    = String(ep.url || "");
+      if (!url) { console.warn("skip empty url in", fname); continue; }
       ENDPOINTS.push({
         feature: fname,
         name: ep.name || (method + " " + url),
-        method: method,
-        url: url,
-        headers: isPO(ep.headers) ? ep.headers : undefined,
+        method, url,
+        headers: isPO(ep.headers)?ep.headers:undefined,
         auth: ep.auth || null
       });
     }
   }
 }
-
 console.log("endpoints built:", ENDPOINTS.length);
-if (ENDPOINTS.length) {
-  console.log("first endpoint:", JSON.stringify(ENDPOINTS[0]));
+if (ENDPOINTS.length) console.log("first endpoint:", JSON.stringify(ENDPOINTS[0]));
+
+// ---------- tiny round-robin ---------
+let idx = 0;
+function pickEP() {
+  if (!ENDPOINTS.length) return null;
+  const ep = ENDPOINTS[idx % ENDPOINTS.length];
+  idx = (idx + 1) >>> 0;
+  return ep;
 }
 
+// --------------- VU code -------------
 export default function () {
-  if (!ENDPOINTS.length) { sleep(0.25); return; }
+  const ep = pickEP();
+  if (!ep) { sleep(0.25); return; }
 
-  try {
-    // Always hit the first endpoint to avoid any indexing issues
-    var ep = ENDPOINTS[0];
-
-    // Build params without tags/metrics
-    var params = {};
-    if (ep.headers) params.headers = ep.headers;
-    if (ep.auth) {
-      var h = params.headers || {};
-      h.authorization = String(ep.auth);
-      params.headers = h;
-    }
-
-    // Only GET for the probe (your feature is GET anyway)
-    console.log("GET ->", ep.url);
-    var res = http.get(ep.url, params);
-
-    var status = res ? res.status : "(no response)";
-    var blen = (res && typeof res.body === "string") ? res.body.length
-              : (res && res.body ? JSON.stringify(res.body).length : 0);
-
-    console.log("response status:", status, "body length:", blen);
-  } catch (e) {
-    console.error("probe iteration error:", String(e && e.message || e));
+  const params = {};
+  if (ep.headers) params.headers = ep.headers;
+  if (ep.auth) {
+    const h = params.headers || {};
+    h.authorization = String(ep.auth);
+    params.headers = h;
   }
 
-  sleep(0.25);
+  let res;
+  const t0 = Date.now();
+  try {
+    if (ep.method === "GET") {
+      res = http.get(ep.url, params);
+    } else {
+      // keep probe simple; extend if you add POST/PATCH later
+      res = http.request(ep.method, ep.url, null, params);
+    }
+  } catch (e) {
+    console.error("request error:", String(e && e.message || e));
+  }
+  const dur = Date.now() - t0;
+
+  // record to our accumulator (works on 0.46)
+  accAdd(ep.feature, ep.name, dur);
+
+  // lightweight console to see it’s running
+  const st = res ? res.status : "(no response)";
+  console.log(`[${ep.feature}] ${ep.name} -> status=${st} dur=${dur}ms`);
+
+  sleep(0.2);
+}
+
+// ------------- summary hook ----------
+export function handleSummary(data) {
+  // build simple tables from ACC; no reliance on k6 tag summaries
+  function table(rows, headers) {
+    const th = `<tr>${headers.map(h=>`<th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">${h}</th>`).join("")}</tr>`;
+    const trs = rows.map(r => `<tr>${r.map(c=>`<td style="padding:6px;border-bottom:1px solid #f0f0f0">${c}</td>`).join("")}</tr>`).join("");
+    return `<table style="border-collapse:collapse;width:100%;margin:10px 0">${th}${trs}</table>`;
+  }
+  const featRows = Object.values(ACC.byFeature).map(f => [f.feature, f.count, (f.dur/f.count|0)+" ms", f.dur+" ms"]);
+  const epRows   = Object.values(ACC.byEndpoint).map(e => [e.feature, e.name, e.count, (e.dur/e.count|0)+" ms", e.dur+" ms"]);
+
+  const html =
+`<!doctype html><meta charset="utf-8">
+<title>SDLC Auto Gov Load Test</title>
+<div style="font:14px/1.4 system-ui,Segoe UI,Arial">
+  <h2>SDLC Auto Gov Load Test — ${new Date().toISOString().replace("T"," ").slice(0,19)}</h2>
+  <div style="display:flex;gap:24px;flex-wrap:wrap">
+    <div><b>Checks (pass/fail)</b><br>${(data.root_group && data.root_group.checks||[]).reduce((p,c)=>p+(c.passes||0),0)} / ${(data.root_group && data.root_group.checks||[]).reduce((p,c)=>p+(c.fails||0),0)}</div>
+    <div><b>Iterations</b><br>${data.metrics.iterations && data.metrics.iterations.values ? data.metrics.iterations.values.count : 0}</div>
+    <div><b>VUs max</b><br>${data.metrics.vus_max && data.metrics.vus_max.values ? data.metrics.vus_max.values.value : ""}</div>
+  </div>
+
+  <h3 style="margin-top:18px">Feature breakdown</h3>
+  ${featRows.length ? table(featRows, ["Feature","Requests","Avg latency","Total latency"]) : "<i>No feature data recorded.</i>"}
+
+  <h3 style="margin-top:18px">Endpoint breakdown</h3>
+  ${epRows.length ? table(epRows, ["Feature","Endpoint","Requests","Avg latency","Total latency"]) : "<i>No endpoint data recorded.</i>"}
+
+  <details style="margin-top:18px"><summary>Raw JSON (truncated)</summary>
+    <pre style="white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace">${JSON.stringify({ options:data.options, sampleMetrics:{
+      http_req_duration: data.metrics["http_req_duration"],
+      checks: data.metrics["checks"],
+    }, acc: ACC }, null, 2).slice(0, 8000)}</pre>
+  </details>
+</div>`;
+
+  return {
+    "perf/k6/reports/summary.json": JSON.stringify({ acc: ACC, options: data.options, metrics: data.metrics }, null, 2),
+    "perf/k6/reports/summary.html": html,
+  };
 }
