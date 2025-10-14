@@ -1,190 +1,25 @@
-import http from "k6/http";
-import { sleep, check, Trend, Counter } from "k6";
-import endpointsByFeature from "../sources/endpointsByFeature.js";
+// perf/k6/sources/endpoints.byFeature.js
+// Pure ESM, no CommonJS. k6 0.46 is fine with this.
 
-/**
- * ======== ENV / CLI ========
- *  -e FEATURES="ReportingAPI Alpha1"      (comma-separated; defaults to all)
- *  -e ENV=uat|dev                         (optional, for URL switching)
- *  -e VUS=2                               (# virtual users)
- *  -e ITERS=2                             (# iterations per VU; if set we use per-vu-iterations)
- *  -e DURATION=10s                        (if set and ITERS is not, we use constant-vus + duration)
- *
- * Notes for k6 v0.46:
- *  - Do not use k6/experimental.
- *  - Create all custom metrics in the init context (before the test starts).
- */
-
-// --------- tiny helpers (ES5-safe) ----------
-function trim(s) { return s ? String(s).replace(/^\s+|\s+$/g, "") : ""; }
-function splitCSV(s) {
-  if (!s) return [];
-  var parts = String(s).split(",");
-  var out = [];
-  for (var i = 0; i < parts.length; i++) {
-    var t = trim(parts[i]);
-    if (t) out.push(t);
-  }
-  return out;
-}
-function safeName(s) {
-  // Make a metric-safe fragment (letters, digits, underscore only)
-  return String(s).replace(/[^A-Za-z0-9_]+/g, "_");
-}
-
-// ====== read ENV ======
-var ENV = trim(__ENV.ENV || "");
-var FEATURES_RAW = trim(__ENV.FEATURES || "");
-var VUS = parseInt(__ENV.VUS || "1", 10);
-if (!(VUS > 0)) VUS = 1;
-var ITERS = parseInt(__ENV.ITERS || "0", 10);
-if (!(ITERS > 0)) ITERS = 0;
-var DURATION = trim(__ENV.DURATION || "");
-
-// ====== choose features ======
-var ALL_FEATURE_NAMES = [];
-for (var fname in endpointsByFeature) {
-  if (Object.prototype.hasOwnProperty.call(endpointsByFeature, fname)) {
-    ALL_FEATURE_NAMES.push(fname);
-  }
-}
-var SELECTED_FEATURES = FEATURES_RAW ? splitCSV(FEATURES_RAW) : ALL_FEATURE_NAMES;
-
-// ====== build flat list of endpoints we’ll execute ======
-var ENDPOINTS = []; // [{ feature, ep }] where ep = {name, method, url, expect:{status,text}, headers?, auth?}
-for (var i = 0; i < SELECTED_FEATURES.length; i++) {
-  var f = SELECTED_FEATURES[i];
-  var eps = endpointsByFeature[f];
-  if (!eps || !eps.length) continue;
-  for (var j = 0; j < eps.length; j++) {
-    ENDPOINTS.push({ feature: f, ep: eps[j] });
-  }
-}
-if (ENDPOINTS.length === 0) {
-  throw new Error("No endpoints found for features: " + (SELECTED_FEATURES.join(", ")));
-}
-
-// ====== declare per-endpoint metrics (init context) ======
-var LATENCY_METRICS = {}; // key -> Trend
-var REQS_METRICS = {};    // key -> Counter
-
-for (var k = 0; k < ENDPOINTS.length; k++) {
-  var pair = ENDPOINTS[k];
-  var featureKey = safeName(pair.feature);
-  var epKey = safeName(pair.ep.name || pair.ep.url || ("ep" + k));
-  var base = featureKey + ":" + epKey;
-
-  var latName = "latency_ep:" + base;
-  var reqName = "reqs_ep:" + base;
-
-  // only create once per unique key
-  if (!LATENCY_METRICS[latName]) LATENCY_METRICS[latName] = new Trend(latName, true);
-  if (!REQS_METRICS[reqName]) REQS_METRICS[reqName] = new Counter(reqName);
-}
-
-// ====== options (choose executor based on ITERS/DURATION) ======
-var OPTIONS = { scenarios: {} };
-
-if (ITERS > 0) {
-  OPTIONS.scenarios["per_vu"] = {
-    executor: "per-vu-iterations",
-    vus: VUS,
-    iterations: ITERS,
-    maxDuration: "10m",
-    gracefulStop: "30s",
-  };
-} else {
-  var dur = DURATION || "30s";
-  OPTIONS.scenarios["const_vus"] = {
-    executor: "constant-vus",
-    vus: VUS,
-    duration: dur,
-    gracefulStop: "30s",
-  };
-}
-
-export const options = OPTIONS;
-
-// ====== tiny URL env switcher (optional) ======
-function applyEnvUrl(u) {
-  if (!ENV) return u;
-  // Example: swap "...-test..." <-> "...-dev..." based on ENV
-  if (ENV.toLowerCase() === "dev") {
-    return u.replace(/-test(\.|-)/, "-dev$1");
-  }
-  if (ENV.toLowerCase() === "uat") {
-    return u.replace(/-dev(\.|-)/, "-test$1");
-  }
-  return u;
-}
-
-// ====== main request runner ======
-function runOnce(featureName, ep) {
-  var url = applyEnvUrl(ep.url);
-
-  // headers
-  var headers = {};
-  if (ep.headers) {
-    for (var h in ep.headers) {
-      if (Object.prototype.hasOwnProperty.call(ep.headers, h)) {
-        headers[h] = ep.headers[h];
-      }
+const features = {
+  "": [
+    {
+      name: "Lists_SBC_compliances for all found Release Registrations",
+      method: "GET",
+      url: "https://",
+      // optional helpers (won’t break anything if your runner ignores them)
+      headers: {},          // e.g. { "content-type": "application/json" }
+      auth: null,           // e.g. "bearer"
+      expect: { status: 200, text: "releaseTagStatus" }
     }
-  }
-  if (ep.auth === "bearer" && __ENV.TOKEN) {
-    headers["Authorization"] = "Bearer " + __ENV.TOKEN;
-  }
+  ],
 
-  var params = { headers: headers };
+  // keep other features here as needed…
+  
+};
 
-  var res;
-  var method = (ep.method || "GET").toUpperCase();
-  try {
-    if (method === "GET") {
-      res = http.get(url, params);
-    } else if (method === "POST") {
-      res = http.post(url, ep.body || "", params);
-    } else if (method === "PUT") {
-      res = http.put(url, ep.body || "", params);
-    } else if (method === "PATCH") {
-      res = http.patch(url, ep.body || "", params);
-    } else if (method === "DELETE") {
-      res = http.del(url, null, params);
-    } else {
-      // fallback
-      res = http.request(method, url, ep.body || "", params);
-    }
-  } catch (e) {
-    // record a failed request as latency 0
-    var keyBase = safeName(featureName) + ":" + safeName(ep.name || ep.url || "ep");
-    REQS_METRICS["reqs_ep:" + keyBase].add(1);
-    return;
-  }
+export default features;
 
-  var key = safeName(featureName) + ":" + safeName(ep.name || ep.url || "ep");
-  LATENCY_METRICS["latency_ep:" + key].add(res.timings.duration);
-  REQS_METRICS["reqs_ep:" + key].add(1);
 
-  // basic checks (don’t fail the script; just record)
-  var expectedStatus = ep.expect && ep.expect.status ? ep.expect.status : 200;
-  var expectedText = ep.expect && ep.expect.text ? String(ep.expect.text) : "";
-
-  check(res, {
-    "status ok": function (r) { return r.status === expectedStatus; },
-    "body has text": function (r) {
-      if (!expectedText) return true;
-      var body = String(r.body || "");
-      return body.indexOf(expectedText) !== -1;
-    },
-  });
-}
-
-// ====== default (k6 entry) ======
-export default function () {
-  // one full sweep across chosen endpoints per iteration
-  for (var i = 0; i < ENDPOINTS.length; i++) {
-    runOnce(ENDPOINTS[i].feature, ENDPOINTS[i].ep);
-    // small pacing to avoid all-at-once bursts
-    sleep(0.2);
-  }
-}
+import features from "../sources/endpoints.byFeature.js";
+console.log("features loaded:", Object.keys(features || {}));
