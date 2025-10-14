@@ -1,36 +1,11 @@
-perf/k6/vendor/acc.js
-
-// Minimal accumulator that works on k6 v0.46 (no shared-array, no experimental APIs)
-export const ACC = {
-  byFeature: Object.create(null),   // { feature: { count, dur } }
-  byEndpoint: Object.create(null),  // { "feature::name": { feature, name, count, dur } }
-};
-
-export function add(feature, name, durMs) {
-  try {
-    // per feature
-    let f = ACC.byFeature[feature];
-    if (!f) { f = ACC.byFeature[feature] = { feature, count: 0, dur: 0 }; }
-    f.count += 1;
-    f.dur += +durMs || 0;
-
-    // per endpoint
-    const key = feature + "::" + name;
-    let e = ACC.byEndpoint[key];
-    if (!e) { e = ACC.byEndpoint[key] = { feature, name, count: 0, dur: 0 }; }
-    e.count += 1;
-    e.dur += +durMs || 0;
-  } catch (_) { /* never throw in VU code */ }
-}
-
-//------------------------------
-
-perf/k6/scenarios/from-playwright.http.min.js
-
 import http from "k6/http";
 import { sleep } from "k6";
+import { Trend, Counter } from "k6/metrics";
 import features from "../sources/endpoints.byFeature.js";
-import { ACC, add as accAdd } from "../vendor/acc.js";
+
+// ---- custom metrics (aggregated by k6 across VUs/iters) ----
+const LAT_EP = new Trend("latency_ep", /* time */ true);
+const REQ_EP = new Counter("reqs_ep");
 
 // ---------------- env ----------------
 const FEAT_RAW = String(__ENV.FEATURES || "").trim();
@@ -107,68 +82,96 @@ export default function () {
     params.headers = h;
   }
 
-  let res;
   const t0 = Date.now();
+  let res;
   try {
     if (ep.method === "GET") {
       res = http.get(ep.url, params);
     } else {
-      // keep probe simple; extend if you add POST/PATCH later
       res = http.request(ep.method, ep.url, null, params);
     }
   } catch (e) {
     console.error("request error:", String(e && e.message || e));
   }
   const dur = Date.now() - t0;
+  const status = res ? res.status : 0;
 
-  // record to our accumulator (works on 0.46)
-  accAdd(ep.feature, ep.name, dur);
+  // Record to custom metrics with tags (works on k6 v0.46)
+  LAT_EP.add(dur, { feature: ep.feature, endpoint: ep.name, status: String(status) });
+  REQ_EP.add(1,    { feature: ep.feature, endpoint: ep.name, status: String(status) });
 
-  // lightweight console to see it’s running
-  const st = res ? res.status : "(no response)";
-  console.log(`[${ep.feature}] ${ep.name} -> status=${st} dur=${dur}ms`);
-
+  console.log(`[${ep.feature}] ${ep.name} -> status=${status} dur=${dur}ms`);
   sleep(0.2);
 }
 
 // ------------- summary hook ----------
 export function handleSummary(data) {
-  // build simple tables from ACC; no reliance on k6 tag summaries
+  // Parse sub-metrics like: latency_ep{feature:ReportingAPI Alpha1,endpoint:Lists...,status:200}
+  const perEp = [];      // rows for HTML
+  const perFeat = {};    // aggregate by feature
+
+  const metrics = data.metrics || {};
+  for (const k of Object.keys(metrics)) {
+    if (!k.startsWith("latency_ep{")) continue;
+
+    // crude tag parsing from the metric name
+    const tags = {};
+    const tagStr = k.slice("latency_ep".length); // e.g. {feature:Foo,endpoint:Bar,status:200}
+    tagStr.replace(/[{},]/g," ").trim().split(/\s+/).forEach(pair=>{
+      const i = pair.indexOf(":");
+      if (i>0) tags[pair.slice(0,i)] = pair.slice(i+1);
+    });
+
+    const lat = metrics[k];
+    const reqKey = "reqs_ep" + tagStr;
+    const req = metrics[reqKey];
+
+    const feature  = tags.feature || "";
+    const endpoint = tags.endpoint || "";
+    const count = (req && req.values && (req.values.count || req.values.rate)) ? (req.values.count || 0) : 0;
+    const avgMs = lat && lat.values && typeof lat.values.avg === "number" ? lat.values.avg : 0;
+
+    perEp.push([feature, endpoint, count, Math.round(avgMs) + " ms"]);
+
+    if (!perFeat[feature]) perFeat[feature] = { feature, count: 0, sum: 0 };
+    perFeat[feature].count += count;
+    perFeat[feature].sum   += (avgMs * count);
+  }
+
+  const featRows = Object.values(perFeat).map(f => {
+    const avg = f.count ? Math.round(f.sum / f.count) : 0;
+    return [f.feature, f.count, avg + " ms"];
+  });
+
   function table(rows, headers) {
     const th = `<tr>${headers.map(h=>`<th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">${h}</th>`).join("")}</tr>`;
     const trs = rows.map(r => `<tr>${r.map(c=>`<td style="padding:6px;border-bottom:1px solid #f0f0f0">${c}</td>`).join("")}</tr>`).join("");
     return `<table style="border-collapse:collapse;width:100%;margin:10px 0">${th}${trs}</table>`;
   }
-  const featRows = Object.values(ACC.byFeature).map(f => [f.feature, f.count, (f.dur/f.count|0)+" ms", f.dur+" ms"]);
-  const epRows   = Object.values(ACC.byEndpoint).map(e => [e.feature, e.name, e.count, (e.dur/e.count|0)+" ms", e.dur+" ms"]);
 
   const html =
 `<!doctype html><meta charset="utf-8">
 <title>SDLC Auto Gov Load Test</title>
 <div style="font:14px/1.4 system-ui,Segoe UI,Arial">
   <h2>SDLC Auto Gov Load Test — ${new Date().toISOString().replace("T"," ").slice(0,19)}</h2>
-  <div style="display:flex;gap:24px;flex-wrap:wrap">
-    <div><b>Checks (pass/fail)</b><br>${(data.root_group && data.root_group.checks||[]).reduce((p,c)=>p+(c.passes||0),0)} / ${(data.root_group && data.root_group.checks||[]).reduce((p,c)=>p+(c.fails||0),0)}</div>
-    <div><b>Iterations</b><br>${data.metrics.iterations && data.metrics.iterations.values ? data.metrics.iterations.values.count : 0}</div>
-    <div><b>VUs max</b><br>${data.metrics.vus_max && data.metrics.vus_max.values ? data.metrics.vus_max.values.value : ""}</div>
-  </div>
+  <div><b>Scenarios</b>: ${Object.keys(data.options?.scenarios||{}).join(", ") || "-"}</div>
 
   <h3 style="margin-top:18px">Feature breakdown</h3>
-  ${featRows.length ? table(featRows, ["Feature","Requests","Avg latency","Total latency"]) : "<i>No feature data recorded.</i>"}
+  ${featRows.length ? table(featRows, ["Feature","Requests","Avg latency"]) : "<i>No feature data recorded.</i>"}
 
   <h3 style="margin-top:18px">Endpoint breakdown</h3>
-  ${epRows.length ? table(epRows, ["Feature","Endpoint","Requests","Avg latency","Total latency"]) : "<i>No endpoint data recorded.</i>"}
+  ${perEp.length ? table(perEp, ["Feature","Endpoint","Requests","Avg latency"]) : "<i>No endpoint data recorded.</i>"}
 
   <details style="margin-top:18px"><summary>Raw JSON (truncated)</summary>
-    <pre style="white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace">${JSON.stringify({ options:data.options, sampleMetrics:{
-      http_req_duration: data.metrics["http_req_duration"],
-      checks: data.metrics["checks"],
-    }, acc: ACC }, null, 2).slice(0, 8000)}</pre>
+    <pre style="white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace">${JSON.stringify({ options:data.options, metrics:{
+      latency_ep: Object.keys(metrics).filter(k=>k.startsWith("latency_ep")).reduce((o,k)=>{o[k]=metrics[k];return o;},{}),
+      reqs_ep:    Object.keys(metrics).filter(k=>k.startsWith("reqs_ep")).reduce((o,k)=>{o[k]=metrics[k];return o;},{}),
+    }}, null, 2).slice(0, 8000)}</pre>
   </details>
 </div>`;
 
   return {
-    "perf/k6/reports/summary.json": JSON.stringify({ acc: ACC, options: data.options, metrics: data.metrics }, null, 2),
+    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
     "perf/k6/reports/summary.html": html,
   };
 }
