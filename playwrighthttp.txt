@@ -2,33 +2,49 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { SharedArray } from 'k6/data';
 
-// ---- features/endpoints map ----
+// endpoints map for the selected feature(s)
 import { ArtifactsRegistrationV1Alpha1 } from '../sources/endpoints.byFeature.js';
 
-// ---- reporter (HTML + JSON) ----
+// export the HTML/JSON reporter
 export { handleSummary } from '../vendor/handleSummary.js';
 
 // -------------------------------
-// Options (VU/iterations or VU/duration)
+// Build options dynamically
 // -------------------------------
-export const options = {
-  scenarios: {
-    by_iter: {
-      executor: __ENV.DURATION ? 'constant-vus' : 'per-vu-iterations',
-      vus: Number(__ENV.VUS || 1),
-      duration: __ENV.DURATION || undefined,       // e.g. "10s"
-      iterations: __ENV.ONE ? Number(__ENV.ONE) : undefined,
+function buildOptions() {
+  var vus = Number(__ENV.VUS || 1);
+  var byTime = __ENV.DURATION && String(__ENV.DURATION).length > 0;
+
+  var scenarios = {};
+  if (byTime) {
+    scenarios.by_time = {
+      executor: 'constant-vus',
+      vus: vus,
+      duration: String(__ENV.DURATION),
       gracefulStop: '3s',
+    };
+  } else {
+    var iters = __ENV.ONE ? Number(__ENV.ONE) : 1;
+    scenarios.by_iter = {
+      executor: 'per-vu-iterations',
+      vus: vus,
+      iterations: iters,
+      gracefulStop: '3s',
+    };
+  }
+
+  return {
+    scenarios: scenarios,
+    thresholds: {
+      http_req_failed: ['rate<0.05'],
+      http_req_duration: ['p(95)<2000'],
     },
-  },
-  thresholds: {
-    http_req_failed: ['rate<0.05'],
-    http_req_duration: ['p(95)<2000'],
-  },
-};
+  };
+}
+export const options = buildOptions();
 
 // -------------------------------
-// Helpers (no spread / no optional chaining)
+// Simple utils (ES5 compatible)
 // -------------------------------
 function mergeInto(target, source) {
   if (!source) return;
@@ -39,24 +55,14 @@ function mergeInto(target, source) {
   }
 }
 
-function reqParams(featureName, endpointName, extra) {
+function makeParams(featureName, endpointName, extra) {
   var headers = {};
   var tags = {};
 
-  // copy extra.headers (if any)
   if (extra && extra.headers) mergeInto(headers, extra.headers);
+  if (headers['content-type'] === undefined) headers['content-type'] = 'application/json';
+  if (extra && extra.auth) headers['authorization'] = extra.auth;
 
-  // default content-type if not provided
-  if (headers['content-type'] === undefined) {
-    headers['content-type'] = 'application/json';
-  }
-
-  // add auth header if given
-  if (extra && extra.auth) {
-    headers['authorization'] = extra.auth;
-  }
-
-  // required tags for summary breakdown
   tags.feature = featureName;
   tags.endpoint = endpointName;
   if (extra && extra.tags) mergeInto(tags, extra.tags);
@@ -64,13 +70,14 @@ function reqParams(featureName, endpointName, extra) {
   return { headers: headers, tags: tags };
 }
 
-// Your feature list
+// -------------------------------
+// Select features -> endpoints
+// -------------------------------
 var FEATURES = [
   { name: 'ReportingAPI Alpha1', endpoints: ArtifactsRegistrationV1Alpha1 },
 ];
 
-// Shared so all VUs see the same structure
-var testMatrix = new SharedArray('feature-endpoints', function () {
+var matrix = new SharedArray('feature-endpoints', function () {
   return FEATURES;
 });
 
@@ -78,20 +85,21 @@ var testMatrix = new SharedArray('feature-endpoints', function () {
 // Main
 // -------------------------------
 export default function main() {
-  for (var i = 0; i < testMatrix.length; i++) {
-    var feat = testMatrix[i];
+  for (var i = 0; i < matrix.length; i++) {
+    var feat = matrix[i];
     var eps = feat.endpoints || [];
+
     for (var j = 0; j < eps.length; j++) {
       var ep = eps[j];
 
-      var params = reqParams(feat.name, ep.name, {
+      var params = makeParams(feat.name, ep.name, {
         auth: ep.auth || '',
         headers: ep.headers || null,
         tags: ep.tags || null,
       });
 
-      var res;
       var method = (ep.method || 'GET').toUpperCase();
+      var res;
 
       try {
         if (method === 'GET') {
@@ -107,7 +115,7 @@ export default function main() {
           continue;
         }
       } catch (e) {
-        console.error('Request error for ' + feat.name + ' → ' + ep.name + ': ' + String(e));
+        console.error('Request error for ' + feat.name + ' -> ' + ep.name + ': ' + String(e));
         continue;
       }
 
@@ -124,7 +132,7 @@ export default function main() {
       });
 
       if (__ENV.DEBUG_TAGS === '1') {
-        console.log('Tags => ' + JSON.stringify(params.tags));
+        console.log('tags=' + JSON.stringify(params.tags));
       }
 
       sleep(0.2);
