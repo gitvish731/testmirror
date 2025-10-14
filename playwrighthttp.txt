@@ -1,110 +1,166 @@
 /* eslint-disable */
-var path = 'perf/k6/reports/summary.html';
-var x = require('./k6-text-summary-lite.js');     // existing tty summary
-var acc = require('./accumulator.js');            // in-memory stats collector
+// k6 runner that sends per-request tags + pushes feature/endpoint stats to vendor/accumulator.js
 
-function fmt(n) { return (Math.round(n * 1000) / 1000) + ' ms'; }
-function safe(n) { return typeof n === 'number' && isFinite(n) ? n : 0; }
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.4/index.js'; // harmless in case you still want tty summary
 
-function p95From(arr) {
-  if (!arr || !arr.length) return 0;
-  var a = arr.slice(0).sort(function (a, b) { return a - b; });
-  var idx = Math.floor(0.95 * (a.length - 1));
-  if (idx < 0) idx = 0;
-  return a[idx];
+// ---- local (vendor) helpers -------------------------------------------------
+const ACC = require('../vendor/accumulator.js');           // <— your accumulator
+const handleSummary = require('../vendor/handleSummary.js'); // <— HTML reporter (exports a function)
+
+// ---- config from ENV (k6 -e NAME=value) ------------------------------------
+const ENV = (__ENV.ENV || 'dev').toLowerCase();            // dev / uat
+const BASE_URL = (__ENV.BASE_URL || '').trim();            // optional override
+const TOKEN = (__ENV.TOKEN || '').trim();                  // optional bearer token
+
+const FEATURES_RAW = (__ENV.FEATURES || '').trim();        // comma list, e.g. "ReportingAPI_Alpha1"
+const ENDPOINT_FILTER = (__ENV.ENDPOINT_FILTER || '').trim(); // optional substring match
+
+// optional tunables
+const DURATION = Number(__ENV.DURATION || '20'); // seconds
+const RPS      = Number(__ENV.RPS      || '1');  // per endpoint constant-arrival-rate
+const PREALLOC = Number(__ENV.PREALLOC || '5');
+const MAXVUS   = Number(__ENV.MAXVUS   || '35');
+
+// ---- load endpoints map -----------------------------------------------------
+// We read the JSON file your generator creates.
+const ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
+
+// small util
+function slug(s) { return String(s || '').replace(/\s+/g, '_'); }
+
+// ---- select endpoints by requested features ---------------------------------
+function allFeatures() {
+  const keys = Object.keys(ENDPOINTS_BY_FEATURE || {});
+  return (FEATURES_RAW ? FEATURES_RAW.split(',') : keys).map(s => s.trim()).filter(Boolean);
 }
 
-function renderTable() {
-  var snap = acc.snapshot();
-  var feats = Object.keys(snap);
-
-  // ✅ Tiny debug check to prove data presence
-  console.log(`[k6] handleSummary: features seen in accumulator = ${feats.length} -> ${feats.join(', ')}`);
-
-  if (!feats.length) {
-    return '<p><em>No per-feature data (did the runner call accumulator.add()?).</em></p>';
-  }
-
-  var html = '';
-  for (var i = 0; i < feats.length; i++) {
-    var f = feats[i];
-    var eps = snap[f];
-    var names = Object.keys(eps);
-    html += '<h3 style="margin-top:24px">' + f + '</h3>';
-    html += '<table style="width:100%;border-collapse:collapse" border="1" cellpadding="6">';
-    html += '<tr><th align="left">Endpoint</th><th align="right">Requests</th><th align="right">Pass%</th><th align="right">Avg</th><th align="right">p95</th><th align="right">Min</th><th align="right">Max</th></tr>';
-    for (var j = 0; j < names.length; j++) {
-      var epn = names[j];
-      var n = eps[epn];
-      var avg = n.count ? n.sum / n.count : 0;
-      var p95 = p95From(n.durs);
-      var passPct = n.count ? (100 * n.ok / n.count) : 0;
-      html += '<tr>' +
-        '<td>' + epn + '</td>' +
-        '<td align="right">' + n.count + '</td>' +
-        '<td align="right">' + (Math.round(passPct * 10) / 10) + '%</td>' +
-        '<td align="right">' + fmt(safe(avg)) + '</td>' +
-        '<td align="right">' + fmt(safe(p95)) + '</td>' +
-        '<td align="right">' + fmt(safe(n.min)) + '</td>' +
-        '<td align="right">' + fmt(safe(n.max)) + '</td>' +
-      '</tr>';
+function selectEndpoints(features) {
+  const out = [];
+  for (let i = 0; i < features.length; i++) {
+    const feature = features[i];
+    const list = ENDPOINTS_BY_FEATURE[feature] || [];
+    for (let j = 0; j < list.length; j++) {
+      const ep = list[j]; // { name, method, url, expectStatus, mustContain?, headers? }
+      if (ENDPOINT_FILTER && String(ep.name).indexOf(ENDPOINT_FILTER) === -1) continue;
+      out.push({ feature, ep });
     }
-    html += '</table>';
   }
-  return html;
-}
-
-function htmlShell(title, head, body) {
-  return '<!doctype html><html><head><meta charset="utf-8"><title>' + title +
-    '</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}' +
-    'table{font-size:14px;background:#fff}th{background:#f5f6f8}</style>' + head + '</head><body>' + body + '</body></html>';
-}
-
-function topPanel(data) {
-  var m = data.metrics || {};
-  var http = m['http_req_duration'] || { values: {} };
-  var p95 = safe(http.values['p(95)'] || 0);
-  var avg = safe(http.values.avg || 0);
-  var min = safe(http.values.min || 0);
-  var max = safe(http.values.max || 0);
-
-  var reqs = m['http_reqs'] && m['http_reqs'].values ? (m['http_reqs'].values.count || 0) : 0;
-  var iters = m['iterations'] && m['iterations'].values ? (m['iterations'].values.count || 0) : 0;
-  var vusmax = m['vus_max'] && m['vus_max'].values ? (m['vus_max'].values.value || 0) : 0;
-
-  var checks = m['checks'] && m['checks'].values ? (m['checks'].values.passes || 0) : 0;
-  var fails = m['checks'] && m['checks'].values ? (m['checks'].values.fails || 0) : 0;
-
-  var out = '';
-  out += '<h1>SDLC Auto Gov Load Test – ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + '</h1>';
-  out += '<table style="width:520px;border-collapse:collapse" border="1" cellpadding="6">';
-  out += '<tr><td>Checks (pass/fail)</td><td>' + checks + ' / ' + fails + '</td></tr>';
-  out += '<tr><td>Requests</td><td>' + reqs + ' total</td></tr>';
-  out += '<tr><td>Latency p(95)</td><td>' + fmt(p95) + '</td></tr>';
-  out += '<tr><td>Latency avg / min / max</td><td>' + fmt(avg) + ' / ' + fmt(min) + ' / ' + fmt(max) + '</td></tr>';
-  out += '<tr><td>Iterations</td><td>' + iters + '</td></tr>';
-  out += '<tr><td>VUs max</td><td>' + vusmax + '</td></tr>';
-  out += '</table>';
   return out;
 }
 
-function handleSummary(data) {
-  // keep pretty tty summary too
-  var text = x && typeof x.extSummary === 'function' ? x.extSummary(data) : '';
-
-  var body = topPanel(data) +
-             '<h2 style="margin-top:28px">Feature / Endpoint breakdown</h2>' +
-             renderTable() +
-             '<h3 style="margin-top:28px">Raw JSON (truncated)</h3>' +
-             '<pre style="white-space:pre-wrap;font-size:12px;background:#f8f9fb;padding:12px;border:1px solid #eee;max-height:420px;overflow:auto">' +
-             JSON.stringify(data, null, 2).slice(0, 25000) + '</pre>';
-
-  var html = htmlShell('SDLC Auto Gov Load Test', '', body);
-
-  var out = { stdout: text };
-  out[path] = html;
-  return out;
+// ---- headers / url helpers --------------------------------------------------
+function buildHeaders(method) {
+  const h = { 'accept': 'application/json' };
+  if (TOKEN) h['authorization'] = 'Bearer ' + TOKEN;
+  if (method && method !== 'GET' && method !== 'DELETE') {
+    h['content-type'] = 'application/json';
+  }
+  return h;
 }
 
-exports.handleSummary = handleSummary;
-module.exports = handleSummary;
+function resolveURL(rawUrl) {
+  // If a full absolute URL is already provided, use it. Else prepend BASE URL (ENV specific).
+  try { new URL(rawUrl); return rawUrl; } catch (_) { /* not absolute */ }
+  let base = BASE_URL;
+  if (!base) {
+    base = (ENV === 'uat')
+      ? (__ENV.UAT_BASE || 'https://your-uat-host')
+      : (__ENV.DEV_BASE || 'https://your-dev-host');
+  }
+  if (base.endsWith('/')) base = base.slice(0, -1);
+  if (!rawUrl.startsWith('/')) rawUrl = '/' + rawUrl;
+  return base + rawUrl;
+}
+
+// ---- request wrapper that ALWAYS tags + pushes to ACC -----------------------
+function fire(method, url, body, params, feature, endpoint, expectStatus, mustContain) {
+  const tags = { feature: String(feature), endpoint: String(endpoint) };
+  const p = Object.assign({}, params || {}, { tags, headers: buildHeaders(method) });
+
+  const t0 = Date.now();
+  let res;
+  if (method === 'GET') {
+    res = http.get(url, p);
+  } else if (method === 'DELETE') {
+    res = http.del(url, null, p);
+  } else if (method === 'PATCH') {
+    res = http.patch(url, body || '', p);
+  } else if (method === 'PUT') {
+    res = http.put(url, body || '', p);
+  } else { // POST / fallback
+    res = http.post(url, body || '', p);
+  }
+
+  // checks (these are standard k6 'checks' so the global numbers still work)
+  const ok = check(res, {
+    'status ok': (r) => r.status === (expectStatus || 200),
+    ...(mustContain
+      ? { 'body has text': (r) => String(r.body || '').indexOf(String(mustContain)) !== -1 }
+      : {})
+  }, tags);
+
+  const dur = Date.now() - t0;
+  // push to our in-memory accumulator for the HTML "Feature / Endpoint" table
+  try { ACC.add(feature, endpoint, dur, !!ok); } catch (_) {}
+
+  return res;
+}
+
+// ---- build scenarios (one per selected endpoint) ----------------------------
+const FEATURE_LIST = allFeatures();
+const SELECTED = selectEndpoints(FEATURE_LIST);
+
+const scenarios = {};
+for (let i = 0; i < SELECTED.length; i++) {
+  const name = `ep_${i}`;
+  scenarios[name] = {
+    executor: 'constant-arrival-rate',
+    rate: RPS,
+    timeUnit: '1s',
+    duration: `${DURATION}s`,
+    preAllocatedVUs: PREALLOC,
+    maxVUs: MAXVUS,
+    tags: { feature: SELECTED[i].feature, endpoint: SELECTED[i].ep.name }
+  };
+}
+
+export const options = {
+  scenarios,
+  thresholds: {
+    // keep something simple; adjust later
+    'http_req_failed': ['rate<0.05']
+  },
+};
+
+// ---- main iteration ---------------------------------------------------------
+export default function () {
+  // round-robin over endpoints so each scenario instance hits all (cheap & simple)
+  for (let i = 0; i < SELECTED.length; i++) {
+    const { feature, ep } = SELECTED[i];
+    const url = resolveURL(ep.url);
+    fire(
+      (ep.method || 'GET').toUpperCase(),
+      url,
+      ep.body ? JSON.stringify(ep.body) : '',
+      {},                    // extra k6 params if you want to pass
+      feature,
+      ep.name,
+      ep.expectStatus || 200,
+      ep.mustContain || null
+    );
+  }
+  sleep(1);
+}
+
+// ---- HTML summary writer (keeps tty text too) -------------------------------
+export function handleSummary(data) {
+  // fall back to textSummary for console if vendor file missing
+  if (typeof handleSummary === 'function' && handleSummary !== undefined && handleSummary.name) {
+    try { return handleSummary(data); } catch (_) {}
+  }
+  return {
+    stdout: textSummary(data, { indent: ' ', enableColors: true }),
+  };
+}
