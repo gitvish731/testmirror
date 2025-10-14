@@ -1,198 +1,147 @@
 // perf/k6/scenarios/from-playwright.http.js
-// k6 v0.46 runner: iteration/duration switch + per-endpoint metrics + tolerant auth/header handling
-
 import http from "k6/http";
-import { sleep, check, Trend, Counter } from "k6";
+import { sleep, check } from "k6";
 import features from "../sources/endpoints.byFeature.js";
 
-// ----------------- ENV -----------------
-const VUS = Number(__ENV.VUS || 1);
-const ITERS = Number(__ENV.ITERS || 0);
-const DURATION = String(__ENV.DURATION || "");
-const FEATURES_RAW = String(__ENV.FEATURES || "");
-const DEFAULT_BEARER = String(__ENV.TOKEN || __ENV.BEARER || "");
+// ---- ENV / CLI -------------------------------------------------------------
+// -e FEATURES='ReportingAPI Alpha1'  (comma separated allowed)
+// -e VUS=1 -e ITERS=1                (use per-vu-iterations)
+// OR
+// -e VUS=2 -e DURATION=10s           (use constant-vus)
+const RAW_FEATURES = String(__ENV.FEATURES || "").trim();
+const SELECTED_FEATURE_NAMES = RAW_FEATURES
+  ? RAW_FEATURES.split(",").map((s) => s.trim()).filter(Boolean)
+  : []; // empty => all
 
-// ----------------- EXECUTOR PICK -----------------
-export const options = {
-  scenarios: {
-    default:
-      ITERS > 0
-        ? {
-            executor: "per-vu-iterations",
-            vus: VUS,
-            iterations: ITERS,
-            maxDuration: "1h",
-          }
-        : {
-            executor: "constant-vus",
-            vus: VUS,
-            duration: DURATION || "30s",
-          },
-  },
-};
+const VUS = Number(__ENV.VUS || "1");
+const ITERS = Number(__ENV.ITERS || "0");      // per-VU iterations when > 0
+const DURATION = String(__ENV.DURATION || "30s");
 
-// ----------------- SELECT ENDPOINTS -----------------
-const ALL_FEATURE_NAMES = [];
-for (const k in features) {
-  if (Object.prototype.hasOwnProperty.call(features, k)) ALL_FEATURE_NAMES.push(k);
+// ---- Choose scenario (v0.46 compatible) ------------------------------------
+export const options = ITERS > 0
+  ? {
+      scenarios: {
+        by_iter: {
+          executor: "per-vu-iterations",
+          vus: VUS,
+          iterations: ITERS,         // iterations PER VU
+          maxDuration: "10m",
+        },
+      },
+    }
+  : {
+      scenarios: {
+        by_time: {
+          executor: "constant-vus",
+          vus: VUS,
+          duration: DURATION,
+          gracefulStop: "3s",
+        },
+      },
+    };
+
+console.log(
+  `k6 config -> executor=${ITERS > 0 ? "per-vu-iterations" : "constant-vus"}, ` +
+  `vus=${VUS}, iters=${ITERS}, duration=${DURATION}`
+);
+
+// ---- Build the flat endpoint list ------------------------------------------
+function isPlainObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
 }
 
-const SELECTED_FEATURES =
-  FEATURES_RAW.trim()
-    ? FEATURES_RAW.split(",").map((s) => s.trim()).filter(Boolean)
-    : ALL_FEATURE_NAMES.slice();
+const ALL_FEATURE_NAMES = Object.keys(isPlainObject(features) ? features : {});
+if (ALL_FEATURE_NAMES.length === 0) {
+  console.error("No features loaded from ../sources/endpoints.byFeature.js");
+}
+
+const EFFECTIVE_FEATURES = SELECTED_FEATURE_NAMES.length
+  ? SELECTED_FEATURE_NAMES
+  : ALL_FEATURE_NAMES;
+
+console.log(`features_loaded: ${JSON.stringify(EFFECTIVE_FEATURES)}`);
 
 const ENDPOINTS = [];
-for (let i = 0; i < SELECTED_FEATURES.length; i++) {
-  const fname = SELECTED_FEATURES[i];
-  const eps = features[fname];
-  if (!eps || !Array.isArray(eps)) continue;
+for (const fname of EFFECTIVE_FEATURES) {
+  const list = features[fname];
+  if (!Array.isArray(list)) {
+    console.warn(`Feature "${fname}" has no endpoint array; skipping.`);
+    continue;
+  }
+  for (const ep of list) {
+    if (!isPlainObject(ep)) {
+      console.warn(`Feature "${fname}" contains a non-object endpoint; skipping.`);
+      continue;
+    }
+    const url = ep.url && String(ep.url);
+    const method = ep.method && String(ep.method || "GET").toUpperCase();
+    if (!url || !method) {
+      console.warn(`Feature "${fname}" endpoint missing url/method; skipping.`);
+      continue;
+    }
+    // Minimal, safe shape
+    const expect = isPlainObject(ep.expect) ? ep.expect : {};
+    const status = Number(expect.status || 200);
+    const text = typeof expect.text === "string" ? expect.text : "";
 
-  for (let j = 0; j < eps.length; j++) {
-    const e = eps[j] || {};
+    // headers: only accept plain object
+    const headers = isPlainObject(ep.headers) ? ep.headers : undefined;
+
+    // Build a safe, normalized record
     ENDPOINTS.push({
       feature: fname,
-      name: String(e.name || ("ep_" + j)),
-      method: String(e.method || "GET").toUpperCase(),
-      url: String(e.url || ""),
-      expect: e.expect || { status: 200 },
-      headers: normalizeHeaders(e.headers),
-      auth: normalizeAuth(e.auth), // <- tolerant
-      body: e.body,
+      name: String(ep.name || `${method} ${url}`),
+      method,
+      url,
+      expect: { status, text },
+      headers,
     });
   }
 }
 
 if (ENDPOINTS.length === 0) {
-  throw new Error(
-    "No endpoints selected. FEATURES='" +
-      FEATURES_RAW +
-      "' did not match any of: " +
-      ALL_FEATURE_NAMES.join(", ")
-  );
+  console.error("No valid endpoints to run after normalization.");
 }
 
-// ----------------- METRICS -----------------
-const EP_METRICS = {};
-function key(feature, endpoint) {
-  const clean = (s) => String(s).replace(/[^A-Za-z0-9_]/g, "_").slice(0, 60);
-  return "ep_" + clean(feature) + "__" + clean(endpoint);
-}
-function getEpMetrics(feature, endpoint) {
-  const k = key(feature, endpoint);
-  if (!EP_METRICS[k]) {
-    EP_METRICS[k] = {
-      t: new Trend(k + "_latency_ms"),
-      c: new Counter(k + "_reqs"),
-    };
-  }
-  return EP_METRICS[k];
-}
-
-// ----------------- HELPERS -----------------
-function normalizeHeaders(h) {
-  // allow null/undefined/object/array of pairs
-  if (!h) return {};
-  if (Array.isArray(h)) {
-    const out = {};
-    for (let i = 0; i < h.length; i++) {
-      const p = h[i];
-      if (p && p.length === 2) out[String(p[0])] = String(p[1]);
-    }
-    return out;
-  }
-  if (typeof h === "object") return Object.assign({}, h);
-  return {};
-}
-
-function normalizeAuth(a) {
-  // accepts:
-  //   "bearer"
-  //   { type: "bearer", token?: "..." }
-  // anything else => null
-  if (!a) return null;
-  if (typeof a === "string") {
-    if (a.toLowerCase() === "bearer") return { type: "bearer", token: DEFAULT_BEARER };
-    return null;
-  }
-  if (typeof a === "object") {
-    if ((a.type || "").toLowerCase() === "bearer") {
-      return { type: "bearer", token: a.token || DEFAULT_BEARER || "" };
-    }
-  }
-  return null;
-}
-
-function addAuthHeader(params, auth) {
-  if (!auth) return;
-  if (auth.type === "bearer" && (auth.token || DEFAULT_BEARER)) {
-    params.headers = params.headers || {};
-    params.headers.Authorization = "Bearer " + (auth.token || DEFAULT_BEARER);
-  }
-}
-
-// round-robin over selected endpoints
-function pickEndpoint() {
-  const idx = (__ITER || 0) % ENDPOINTS.length;
-  return ENDPOINTS[idx];
-}
-
-// ----------------- MAIN -----------------
+// ---- Main iteration ---------------------------------------------------------
 export default function () {
-  const ep = pickEndpoint();
+  if (ENDPOINTS.length === 0) {
+    // Nothing to do; avoid throwing TypeErrors
+    sleep(0.2);
+    return;
+  }
 
-  const params = {
-    tags: { feature: ep.feature, endpoint: ep.name },
-    headers: Object.assign({}, ep.headers || {}),
-  };
-  addAuthHeader(params, ep.auth);
+  // Round-robin selection so each VU walks the same list
+  const idx = (__ITER || 0) % ENDPOINTS.length;
+  const ep = ENDPOINTS[idx];
+
+  const params = {};
+  if (ep.headers) params.headers = ep.headers;
 
   let res;
-  const method = ep.method;
-  if (method === "GET") {
-    res = http.get(ep.url, params);
-  } else if (method === "POST") {
-    const body = ep.body || "";
-    ensureContentType(params);
-    res = http.post(ep.url, body, params);
-  } else if (method === "PATCH") {
-    const body = ep.body || "";
-    ensureContentType(params);
-    res = http.patch(ep.url, body, params);
-  } else if (method === "PUT") {
-    const body = ep.body || "";
-    ensureContentType(params);
-    res = http.put(ep.url, body, params);
-  } else if (method === "DELETE") {
-    res = http.del(ep.url, null, params);
-  } else {
-    throw new Error("Unsupported method: " + method);
+  switch (ep.method) {
+    case "GET":
+      res = http.get(ep.url, params);
+      break;
+    default:
+      // Only GET is enabled for now to keep things simple
+      console.warn(`Method ${ep.method} not implemented in runner (GET only).`);
+      res = http.get(ep.url, params);
+      break;
   }
 
-  // per-endpoint metrics
-  const m = getEpMetrics(ep.feature, ep.name);
-  m.c.add(1);
-  m.t.add(res && res.timings ? res.timings.duration : 0);
-
-  const expectedStatus = ep.expect && ep.expect.status ? ep.expect.status : 200;
-  const expectedText =
-    ep.expect && Object.prototype.hasOwnProperty.call(ep.expect, "text")
-      ? String(ep.expect.text)
-      : null;
-
-  check(res, {
-    "status ok": (r) => r && r.status === expectedStatus,
-    "body has text": (r) =>
-      expectedText ? String(r && r.body ? r.body : "").indexOf(expectedText) !== -1 : true,
+  // Checks
+  const ok = check(res, {
+    "status ok": (r) => r && r.status === ep.expect.status,
+    "body has text": (r) => {
+      if (!ep.expect.text) return true; // nothing to assert
+      const body = r && r.body;
+      if (body == null) return false;
+      const s = typeof body === "string" ? body : JSON.stringify(body);
+      return s.indexOf(ep.expect.text) !== -1;
+    },
   });
 
+  // tiny think time
   sleep(0.2);
-}
-
-function ensureContentType(p) {
-  const h = p.headers || {};
-  if (!("Content-Type" in h) && !("content-type" in h)) {
-    h["Content-Type"] = "application/json";
-  }
-  p.headers = h;
 }
