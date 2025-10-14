@@ -1,9 +1,5 @@
 // perf/k6/vendor/handleSummary.js
-// ASCII-only, plain JS strings, no template literals.
-// Generates summary.html + last.json and includes a Feature/Endpoint table.
-// Looks for custom metrics named like:
-//   reqs_ep{feature=Foo,endpoint=Bar}   or   reqs_ep_Foo_Bar
-//   latency_ep{feature=Foo,endpoint=Bar} or latency_ep_Foo_Bar
+// Plain ASCII, no template literals, no smart quotes.
 
 function fmtInt(n) { return (typeof n === "number" && isFinite(n)) ? String(Math.round(n)) : "0"; }
 function fmtMs(n)  { return (typeof n === "number" && isFinite(n)) ? String(Math.round(n)) + " ms" : "0 ms"; }
@@ -66,7 +62,7 @@ function parseFeatEp(name) {
 }
 
 function collectFeatureTable(data) {
-  var table = {}; // key "feature|endpoint" -> row
+  var table = {}; // "feature|endpoint" -> row
   var metrics = data.metrics || {};
   var names = Object.keys(metrics);
   for (var i = 0; i < names.length; i++) {
@@ -192,8 +188,9 @@ export function handleSummary(data) {
 
   html += "</body></html>";
 
+  // IMPORTANT: k6 expects { data, contentType } (not "format")
   return {
-    "perf/k6/reports/summary.html": { data: html, format: "html" },
+    "perf/k6/reports/summary.html": { data: html, contentType: "text/html" },
     "perf/k6/reports/last.json": JSON.stringify(data, null, 2)
   };
 }
