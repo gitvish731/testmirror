@@ -1,147 +1,110 @@
-// perf/k6/scenarios/from-playwright.http.js
-import http from "k6/http";
-import { sleep, check } from "k6";
-import features from "../sources/endpoints.byFeature.js";
+// perf/k6/vendor/handleSummary.js
+// k6 v0.46-compatible summary writer (no content_type wrapper)
 
-// ---- ENV / CLI -------------------------------------------------------------
-// -e FEATURES='ReportingAPI Alpha1'  (comma separated allowed)
-// -e VUS=1 -e ITERS=1                (use per-vu-iterations)
-// OR
-// -e VUS=2 -e DURATION=10s           (use constant-vus)
-const RAW_FEATURES = String(__ENV.FEATURES || "").trim();
-const SELECTED_FEATURE_NAMES = RAW_FEATURES
-  ? RAW_FEATURES.split(",").map((s) => s.trim()).filter(Boolean)
-  : []; // empty => all
+function safe(v, d) { return v == null ? d : v; }
 
-const VUS = Number(__ENV.VUS || "1");
-const ITERS = Number(__ENV.ITERS || "0");      // per-VU iterations when > 0
-const DURATION = String(__ENV.DURATION || "30s");
+function table(rows) {
+  if (!rows.length) return "<em>No per-feature data (did the runner emit tagged metrics?)</em>";
+  const head = `<tr><th style="text-align:left">Feature</th><th style="text-align:left">Endpoint</th><th style="text-align:right">Count</th><th style="text-align:right">p(95) ms</th><th style="text-align:right">avg ms</th></tr>`;
+  const body = rows.map(r =>
+    `<tr>
+      <td style="text-align:left">${r.feature}</td>
+      <td style="text-align:left">${r.endpoint}</td>
+      <td style="text-align:right">${r.count}</td>
+      <td style="text-align:right">${r.p95.toFixed(1)}</td>
+      <td style="text-align:right">${r.avg.toFixed(1)}</td>
+    </tr>`
+  ).join("");
+  return `<table style="border-collapse:collapse;width:100%">
+    <thead>${head}</thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
 
-// ---- Choose scenario (v0.46 compatible) ------------------------------------
-export const options = ITERS > 0
-  ? {
-      scenarios: {
-        by_iter: {
-          executor: "per-vu-iterations",
-          vus: VUS,
-          iterations: ITERS,         // iterations PER VU
-          maxDuration: "10m",
-        },
-      },
+export function handleSummary(data) {
+  // Aggregate from custom metrics if present
+  // We expect latency_ep (Trend) and reqs_ep (Counter) with tags {feature, endpoint}
+  const rows = [];
+  try {
+    const lat = data.metrics["latency_ep"];
+    const req = data.metrics["reqs_ep"];
+    if (lat && lat.values && req && req.values && req.values.tags) {
+      // Build a small map keyed by feature|endpoint
+      const map = new Map();
+      const latTags = lat.values.tags || {};
+      const reqTags = req.values.tags || {};
+      const keys = new Set([
+        ...Object.keys(latTags),
+        ...Object.keys(reqTags),
+      ]);
+      for (const k of keys) {
+        const [feature, endpoint] = k.split("|");
+        const latVals = latTags[k] || {};
+        const reqVals = reqTags[k] || {};
+        map.set(k, {
+          feature: safe(feature, ""),
+          endpoint: safe(endpoint, ""),
+          count: safe(reqVals.count, 0),
+          avg: safe(latVals.avg, 0),
+          p95: safe(latVals["p(95)"], 0),
+        });
+      }
+      rows.push(...Array.from(map.values()));
+      // sort by feature then endpoint
+      rows.sort((a,b)=> (a.feature.localeCompare(b.feature) || a.endpoint.localeCompare(b.endpoint)));
     }
-  : {
-      scenarios: {
-        by_time: {
-          executor: "constant-vus",
-          vus: VUS,
-          duration: DURATION,
-          gracefulStop: "3s",
-        },
-      },
-    };
-
-console.log(
-  `k6 config -> executor=${ITERS > 0 ? "per-vu-iterations" : "constant-vus"}, ` +
-  `vus=${VUS}, iters=${ITERS}, duration=${DURATION}`
-);
-
-// ---- Build the flat endpoint list ------------------------------------------
-function isPlainObject(x) {
-  return x && typeof x === "object" && !Array.isArray(x);
-}
-
-const ALL_FEATURE_NAMES = Object.keys(isPlainObject(features) ? features : {});
-if (ALL_FEATURE_NAMES.length === 0) {
-  console.error("No features loaded from ../sources/endpoints.byFeature.js");
-}
-
-const EFFECTIVE_FEATURES = SELECTED_FEATURE_NAMES.length
-  ? SELECTED_FEATURE_NAMES
-  : ALL_FEATURE_NAMES;
-
-console.log(`features_loaded: ${JSON.stringify(EFFECTIVE_FEATURES)}`);
-
-const ENDPOINTS = [];
-for (const fname of EFFECTIVE_FEATURES) {
-  const list = features[fname];
-  if (!Array.isArray(list)) {
-    console.warn(`Feature "${fname}" has no endpoint array; skipping.`);
-    continue;
-  }
-  for (const ep of list) {
-    if (!isPlainObject(ep)) {
-      console.warn(`Feature "${fname}" contains a non-object endpoint; skipping.`);
-      continue;
-    }
-    const url = ep.url && String(ep.url);
-    const method = ep.method && String(ep.method || "GET").toUpperCase();
-    if (!url || !method) {
-      console.warn(`Feature "${fname}" endpoint missing url/method; skipping.`);
-      continue;
-    }
-    // Minimal, safe shape
-    const expect = isPlainObject(ep.expect) ? ep.expect : {};
-    const status = Number(expect.status || 200);
-    const text = typeof expect.text === "string" ? expect.text : "";
-
-    // headers: only accept plain object
-    const headers = isPlainObject(ep.headers) ? ep.headers : undefined;
-
-    // Build a safe, normalized record
-    ENDPOINTS.push({
-      feature: fname,
-      name: String(ep.name || `${method} ${url}`),
-      method,
-      url,
-      expect: { status, text },
-      headers,
-    });
-  }
-}
-
-if (ENDPOINTS.length === 0) {
-  console.error("No valid endpoints to run after normalization.");
-}
-
-// ---- Main iteration ---------------------------------------------------------
-export default function () {
-  if (ENDPOINTS.length === 0) {
-    // Nothing to do; avoid throwing TypeErrors
-    sleep(0.2);
-    return;
+  } catch (e) {
+    // ignore; we'll still produce a file
   }
 
-  // Round-robin selection so each VU walks the same list
-  const idx = (__ITER || 0) % ENDPOINTS.length;
-  const ep = ENDPOINTS[idx];
+  const checks = data.root_group?.checks || [];
+  const totalPass = checks.reduce((a,c)=>a+safe(c.passes,0),0);
+  const totalFail = checks.reduce((a,c)=>a+safe(c.fails,0),0);
 
-  const params = {};
-  if (ep.headers) params.headers = ep.headers;
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"/>
+<title>SDLC Auto Gov Load Test</title>
+<style>
+  body{font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px;}
+  h1{margin:0 0 16px 0;}
+  .grid{display:grid; grid-template-columns: 260px 1fr; gap:12px; margin-bottom:18px;}
+  .box{border:1px solid #e0e0e0; padding:8px 10px; border-radius:6px;}
+  code,pre{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px;}
+  table td, table th { border-bottom: 1px solid #f0f0f0; padding:6px 8px; }
+  thead th { border-bottom: 2px solid #e0e0e0; }
+</style>
+</head>
+<body>
+<h1>SDLC Auto Gov Load Test — ${new Date().toISOString()}</h1>
 
-  let res;
-  switch (ep.method) {
-    case "GET":
-      res = http.get(ep.url, params);
-      break;
-    default:
-      // Only GET is enabled for now to keep things simple
-      console.warn(`Method ${ep.method} not implemented in runner (GET only).`);
-      res = http.get(ep.url, params);
-      break;
+<div class="grid">
+  <div class="box"><strong>Checks (pass/fail)</strong><br/>${totalPass} / ${totalFail}</div>
+  <div class="box"><strong>Requests</strong><br/>${safe(data.metrics?.http_reqs?.values?.count, 0)} total</div>
+  <div class="box"><strong>Latency p(95)</strong><br/>${safe(data.metrics?.http_req_duration?.values?.["p(95)"], 0).toFixed(1)} ms</div>
+  <div class="box"><strong>Latency avg / min / max</strong><br/>${safe(data.metrics?.http_req_duration?.values?.avg, 0).toFixed(1)} ms / ${safe(data.metrics?.http_req_duration?.values?.min, 0).toFixed(1)} ms / ${safe(data.metrics?.http_req_duration?.values?.max, 0).toFixed(1)} ms</div>
+  <div class="box"><strong>Iterations</strong><br/>${safe(data.metrics?.iterations?.values?.count, 0)}</div>
+  <div class="box"><strong>VUs max</strong><br/>${safe(data.metrics?.vus_max?.values?.value, 0)}</div>
+</div>
+
+<h2>Feature / Endpoint breakdown</h2>
+${table(rows)}
+
+<details style="margin-top:16px"><summary><strong>Raw JSON (truncated)</strong></summary>
+<pre>${JSON.stringify({
+  options: data.options,
+  metrics: {
+    http_req_duration: data.metrics?.http_req_duration,
+    http_reqs: data.metrics?.http_reqs,
+    latency_ep: data.metrics?.latency_ep,
+    reqs_ep: data.metrics?.reqs_ep,
   }
+}, null, 2)}</pre>
+</details>
 
-  // Checks
-  const ok = check(res, {
-    "status ok": (r) => r && r.status === ep.expect.status,
-    "body has text": (r) => {
-      if (!ep.expect.text) return true; // nothing to assert
-      const body = r && r.body;
-      if (body == null) return false;
-      const s = typeof body === "string" ? body : JSON.stringify(body);
-      return s.indexOf(ep.expect.text) !== -1;
-    },
-  });
+</body></html>`;
 
-  // tiny think time
-  sleep(0.2);
+  return {
+    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
+    "perf/k6/reports/summary.html": html, // plain string for k6 v0.46
+  };
 }
