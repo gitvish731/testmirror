@@ -1,118 +1,13 @@
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-import { Trend, Counter } from 'k6/metrics';
-import { SharedArray } from 'k6/data';
+// checks (always) – status and optional text
+const want = ep.expect || {};
+const mustStatus = Number(want.status || 200);
+const mustContain = (want.text || '').trim();
 
-// ------------- config (simple & flexible) -------------
-const ONE = Number(__ENV.ONE || 0);         // set to 1 to do a single GET and exit
-const VUS = Number(__ENV.VUS || 2);         // concurrent users
-const DURATION = __ENV.DURATION || '';      // e.g. "10s" (if set, run duration-mode)
-const ITER = Number(__ENV.ITER || 0);       // iterations per VU (if >0 and no DURATION)
-
-// what features to include; comma separated; default: everything in the source file
-const FEATURES_RAW = (__ENV.FEATURES || '').trim();
-
-// ----------------- load endpoints ---------------------
-const ENDPOINTS_BY_FEATURE = new SharedArray('eps', () => {
-  // IMPORTANT: this must point to your real file
-  // (path is relative to *this* runner file)
-  // eslint-disable-next-line import/no-unresolved
-  return require('../sources/endpoints.byFeature.js');  // CommonJS style is fine under extended mode
-});
-
-// ----------------- sanitizers & helpers ----------------
-const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-
-function listEndpointsToHit() {
-  // choose features
-  let wanted = Object.keys(ENDPOINTS_BY_FEATURE);
-  if (FEATURES_RAW) {
-    const wantSet = new Set(FEATURES_RAW.split(',').map(x => x.trim()).filter(Boolean));
-    wanted = wanted.filter((f) => wantSet.has(f));
-  }
-  // flatten feature -> endpoint[]
-  const out = [];
-  for (const feature of wanted) {
-    const arr = ENDPOINTS_BY_FEATURE[feature] || [];
-    for (const ep of arr) out.push({ feature, ep });
-  }
-  return out;
+const checks = {
+  'status ok': (r) => r.status === mustStatus,
+};
+if (mustContain) {
+  checks['body has text'] = (r) =>
+    String(r.body || '').indexOf(mustContain) !== -1;
 }
-
-// ----------------- concrete ep metrics -----------------
-const epReqs = new Map(); // slug -> Counter
-const epLat  = new Map(); // slug -> Trend
-function addEpMetrics(feature, endpoint, durationMs) {
-  const slug = `${slugify(feature)}__${slugify(endpoint)}`;
-  if (!epReqs.has(slug)) epReqs.set(slug, new Counter(`ep_reqs_${slug}`));
-  if (!epLat.has(slug))  epLat.set(slug,  new Trend(  `ep_lat_${slug}`));
-  epReqs.get(slug).add(1);
-  epLat.get(slug).add(durationMs);
-}
-
-// ----------------- k6 options -----------------
-export const options = (() => {
-  if (ONE) {
-    // do exactly one iteration, one VU
-    return { vus: 1, iterations: 1, thresholds: {} };
-  }
-  if (DURATION) {
-    return { vus: VUS, duration: DURATION, thresholds: {} };
-  }
-  if (ITER > 0) {
-    return { vus: VUS, iterations: VUS * ITER, thresholds: {} };
-  }
-  // default: tiny smoke
-  return { vus: 1, iterations: 1, thresholds: {} };
-})();
-
-// ----------------- main -----------------
-export default function () {
-  const items = listEndpointsToHit();
-  if (!items.length) {
-    console.warn('No endpoints selected for FEATURES=', FEATURES_RAW || '(all)');
-    sleep(0.2);
-    return;
-  }
-
-  // simple round-robin across endpoints
-  const idx = (__ITER || 0) % items.length;
-  const { feature, ep } = items[idx];
-
-  const tags = { feature, endpoint: ep.name };
-  const url = ep.url;
-  const method = (ep.method || 'GET').toUpperCase();
-  const headers = Object.assign({ 'user-agent': 'k6:auto-runner' }, ep.headers || {});
-  const body = ep.body || null;
-
-  let res;
-  if (method === 'GET') {
-    res = http.get(url, { headers, tags });
-  } else if (method === 'POST') {
-    res = http.post(url, body, { headers, tags });
-  } else if (method === 'PATCH') {
-    res = http.patch(url, body, { headers, tags });
-  } else if (method === 'DELETE') {
-    res = http.del(url, null, { headers, tags });
-  } else {
-    res = http.request(method, url, body, { headers, tags });
-  }
-
-  // checks (always) – status and optional text
-  const want = ep.expect || {};
-  const mustStatus = Number(want.status || 200);
-  const mustContain = (want.text || '').trim();
-
-  check(res, {
-    'status ok': (r) => r.status === mustStatus,
-    ...(mustContain
-      ? { 'body has text': (r) => String(r.body || '').indexOf(mustContain) !== -1 }
-      : {}),
-  }, tags);
-
-  // push our concrete per-endpoint metrics
-  addEpMetrics(feature, ep.name, res.timings.duration);
-
-  // be nice if running iterations
-  sleep(0.1);
-}
+check(res, checks, tags);
