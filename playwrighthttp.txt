@@ -1,4 +1,4 @@
-// perf/k6/scenarios/from-playwright.http.min.js
+// 3 perf/k6/scenarios/from-playwright.http.min.js
 import http from "k6/http";
 import { sleep } from "k6";
 import { Trend, Counter } from "k6/metrics";
@@ -12,13 +12,9 @@ const DURATION = String(__ENV.DURATION || "30s");
 
 // ---------- options ----------
 export const options = ITERS > 0 ? {
-  scenarios: {
-    by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" }
-  }
+  scenarios: { by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" } }
 } : {
-  scenarios: {
-    by_time: { executor: "constant-vus", vus: VUS, duration: DURATION, gracefulStop: "3s" }
-  }
+  scenarios: { by_time: { executor: "constant-vus", vus: VUS, duration: DURATION, gracefulStop: "3s" } }
 };
 
 // ---------- build endpoints ----------
@@ -53,26 +49,24 @@ if (!isPO(features)) {
 console.log("endpoints built:", ENDPOINTS.length);
 if (ENDPOINTS.length) console.log("first endpoint:", JSON.stringify(ENDPOINTS[0]));
 
-// ---------- per-endpoint metric registry (works on k6 v0.46) ----------
+// ---------- metric registry (instances, not names) ----------
 function slug(s){
   return s.toLowerCase()
     .replace(/[^a-z0-9]+/g,"_")
     .replace(/^_+|_+$/g,"")
     .slice(0,120);
 }
-const REGISTRY = [];
-const META_BY_LAT = {};  // metricName -> { feature, endpoint }
-const META_BY_CNT = {};
+
+const REGISTRY = [];                // [{ id, feature, endpoint, lat, cnt }]
+const BY_ID = Object.create(null);  // id -> entry
 
 for (const ep of ENDPOINTS) {
   const id = slug(ep.feature + "__" + ep.name);
-  const latName = `lat_ep_${id}`;
-  const cntName = `req_ep_${id}`;
-  const lat = new Trend(latName, true);
-  const cnt = new Counter(cntName);
-  REGISTRY.push({ id, feature: ep.feature, endpoint: ep.name, latName, cntName });
-  META_BY_LAT[latName] = { feature: ep.feature, endpoint: ep.name };
-  META_BY_CNT[cntName] = { feature: ep.feature, endpoint: ep.name };
+  const lat = new Trend(`lat_ep_${id}`, true);
+  const cnt = new Counter(`req_ep_${id}`);
+  const entry = { id, feature: ep.feature, endpoint: ep.name, lat, cnt };
+  REGISTRY.push(entry);
+  BY_ID[id] = entry;
 }
 
 // ---------- tiny RR picker ----------
@@ -93,7 +87,7 @@ export default function () {
   }
 
   const t0 = Date.now();
-  let res;
+  let res, errMsg = "";
   try {
     if (ep.method === "GET") {
       res = http.get(ep.url, params);
@@ -101,20 +95,18 @@ export default function () {
       res = http.request(ep.method, ep.url, null, params);
     }
   } catch (e) {
-    console.error("request error:", String(e && e.message || e));
+    errMsg = String(e && e.message || e);
+    console.error("request error:", errMsg);
   }
   const dur = Date.now() - t0;
-  const status = res ? res.status : 0;
 
-  // record to this endpoint's dedicated metrics
+  // record with the real instances (works on 0.46)
   const id = slug(ep.feature + "__" + ep.name);
-  const latName = `lat_ep_${id}`;
-  const cntName = `req_ep_${id}`;
-  // metric instances are looked up by name automatically by k6 when adding:
-  Trend.prototype.add.call({ name: latName }, dur);   // safe on 0.46
-  Counter.prototype.add.call({ name: cntName }, 1);
+  const reg = BY_ID[id];
+  if (reg) { reg.lat.add(dur); reg.cnt.add(1); }
 
-  console.log("[" + ep.feature + "] " + ep.name + " -> status=" + status + " dur=" + dur + "ms");
+  const status = res ? res.status : 0;
+  console.log(`[${ep.feature}] ${ep.name} -> status=${status} dur=${dur}ms${errMsg?(" err="+errMsg):""}`);
   sleep(0.2);
 }
 
@@ -124,11 +116,10 @@ export function handleSummary(data) {
   const perEp = [];
   const perFeat = {};
 
-  // consume our known metric names (created above)
   for (let i=0;i<REGISTRY.length;i++){
     const r = REGISTRY[i];
-    const lat = metrics[r.latName];
-    const cnt = metrics[r.cntName];
+    const lat = metrics[r.lat.name];   // trend instance name
+    const cnt = metrics[r.cnt.name];   // counter instance name
     const count = (cnt && cnt.values && (cnt.values.count || 0)) || 0;
     const avg = (lat && lat.values && typeof lat.values.avg === "number") ? Math.round(lat.values.avg) : 0;
 
@@ -178,18 +169,17 @@ export function handleSummary(data) {
   html += perEp.length ? table(perEp, ["Feature","Endpoint","Requests","Avg latency"]) : "<i>No endpoint data recorded.</i>";
 
   html += "<details style='margin-top:18px'><summary>Raw JSON (truncated)</summary>";
-  const raw = { options:data.options, metrics:{} };
+  const keep = { options:data.options, metrics:{} };
   for (let i=0;i<REGISTRY.length;i++){
     const r = REGISTRY[i];
-    raw.metrics[r.latName] = metrics[r.latName] || null;
-    raw.metrics[r.cntName] = metrics[r.cntName] || null;
+    keep.metrics[r.lat.name] = metrics[r.lat.name] || null;
+    keep.metrics[r.cnt.name] = metrics[r.cnt.name] || null;
   }
-  let json = JSON.stringify(raw, null, 2);
+  let json = JSON.stringify(keep, null, 2);
   if (json.length > 8000) json = json.slice(0,8000) + "\n...truncated...";
   html += "<pre style='white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace'>" + json.replace(/</g,"&lt;") + "</pre>";
   html += "</details></div>";
 
-  // also keep full k6 JSON for debugging
   return {
     "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
     "perf/k6/reports/summary.html": html
