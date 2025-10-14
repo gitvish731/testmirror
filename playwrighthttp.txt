@@ -1,52 +1,110 @@
-// perf/k6/vendor/accumulator.js
 /* eslint-disable */
+var path = 'perf/k6/reports/summary.html';
+var x = require('./k6-text-summary-lite.js');     // existing tty summary
+var acc = require('./accumulator.js');            // in-memory stats collector
 
-// --- Global singleton (works even if required from different paths/files) ---
-var G = (typeof globalThis !== 'undefined') ? globalThis : this;
-if (!G.__ACC_SINGLETON__) {
-  G.__ACC_SINGLETON__ = { store: Object.create(null) };
-}
-var STORE = G.__ACC_SINGLETON__.store;
+function fmt(n) { return (Math.round(n * 1000) / 1000) + ' ms'; }
+function safe(n) { return typeof n === 'number' && isFinite(n) ? n : 0; }
 
-// Cap samples per endpoint to avoid memory blowups
-var CAP = 2000;
-
-function ensure(feat, ep) {
-  if (!feat) feat = 'unknown_feature';
-  if (!ep) ep = 'unknown_endpoint';
-  if (!STORE[feat]) STORE[feat] = Object.create(null);
-  if (!STORE[feat][ep]) {
-    STORE[feat][ep] = { durs: [], count: 0, ok: 0, min: null, max: null, sum: 0 };
-  }
-  return STORE[feat][ep];
+function p95From(arr) {
+  if (!arr || !arr.length) return 0;
+  var a = arr.slice(0).sort(function (a, b) { return a - b; });
+  var idx = Math.floor(0.95 * (a.length - 1));
+  if (idx < 0) idx = 0;
+  return a[idx];
 }
 
-function add(feat, ep, ms, passed) {
-  var node = ensure(feat, ep);
-  node.count += 1;
-  if (passed) node.ok += 1;
-  var x = Number(ms) || 0;
-  node.sum += x;
-  if (node.min === null || x < node.min) node.min = x;
-  if (node.max === null || x > node.max) node.max = x;
-  if (node.durs.length < CAP) node.durs.push(x);
-}
-
-function snapshot() {
-  return STORE;
-}
-
-module.exports = { add: add, snapshot: snapshot };
-
-//----------------------------------------------------
-
-// inside handleSummary.js
-var acc = require('./accumulator.js');
-
-function handleSummary(data) {
-  // ...
+function renderTable() {
   var snap = acc.snapshot();
   var feats = Object.keys(snap);
+
+  // ✅ Tiny debug check to prove data presence
   console.log(`[k6] handleSummary: features seen in accumulator = ${feats.length} -> ${feats.join(', ')}`);
-  // ...
+
+  if (!feats.length) {
+    return '<p><em>No per-feature data (did the runner call accumulator.add()?).</em></p>';
+  }
+
+  var html = '';
+  for (var i = 0; i < feats.length; i++) {
+    var f = feats[i];
+    var eps = snap[f];
+    var names = Object.keys(eps);
+    html += '<h3 style="margin-top:24px">' + f + '</h3>';
+    html += '<table style="width:100%;border-collapse:collapse" border="1" cellpadding="6">';
+    html += '<tr><th align="left">Endpoint</th><th align="right">Requests</th><th align="right">Pass%</th><th align="right">Avg</th><th align="right">p95</th><th align="right">Min</th><th align="right">Max</th></tr>';
+    for (var j = 0; j < names.length; j++) {
+      var epn = names[j];
+      var n = eps[epn];
+      var avg = n.count ? n.sum / n.count : 0;
+      var p95 = p95From(n.durs);
+      var passPct = n.count ? (100 * n.ok / n.count) : 0;
+      html += '<tr>' +
+        '<td>' + epn + '</td>' +
+        '<td align="right">' + n.count + '</td>' +
+        '<td align="right">' + (Math.round(passPct * 10) / 10) + '%</td>' +
+        '<td align="right">' + fmt(safe(avg)) + '</td>' +
+        '<td align="right">' + fmt(safe(p95)) + '</td>' +
+        '<td align="right">' + fmt(safe(n.min)) + '</td>' +
+        '<td align="right">' + fmt(safe(n.max)) + '</td>' +
+      '</tr>';
+    }
+    html += '</table>';
+  }
+  return html;
 }
+
+function htmlShell(title, head, body) {
+  return '<!doctype html><html><head><meta charset="utf-8"><title>' + title +
+    '</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}' +
+    'table{font-size:14px;background:#fff}th{background:#f5f6f8}</style>' + head + '</head><body>' + body + '</body></html>';
+}
+
+function topPanel(data) {
+  var m = data.metrics || {};
+  var http = m['http_req_duration'] || { values: {} };
+  var p95 = safe(http.values['p(95)'] || 0);
+  var avg = safe(http.values.avg || 0);
+  var min = safe(http.values.min || 0);
+  var max = safe(http.values.max || 0);
+
+  var reqs = m['http_reqs'] && m['http_reqs'].values ? (m['http_reqs'].values.count || 0) : 0;
+  var iters = m['iterations'] && m['iterations'].values ? (m['iterations'].values.count || 0) : 0;
+  var vusmax = m['vus_max'] && m['vus_max'].values ? (m['vus_max'].values.value || 0) : 0;
+
+  var checks = m['checks'] && m['checks'].values ? (m['checks'].values.passes || 0) : 0;
+  var fails = m['checks'] && m['checks'].values ? (m['checks'].values.fails || 0) : 0;
+
+  var out = '';
+  out += '<h1>SDLC Auto Gov Load Test – ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + '</h1>';
+  out += '<table style="width:520px;border-collapse:collapse" border="1" cellpadding="6">';
+  out += '<tr><td>Checks (pass/fail)</td><td>' + checks + ' / ' + fails + '</td></tr>';
+  out += '<tr><td>Requests</td><td>' + reqs + ' total</td></tr>';
+  out += '<tr><td>Latency p(95)</td><td>' + fmt(p95) + '</td></tr>';
+  out += '<tr><td>Latency avg / min / max</td><td>' + fmt(avg) + ' / ' + fmt(min) + ' / ' + fmt(max) + '</td></tr>';
+  out += '<tr><td>Iterations</td><td>' + iters + '</td></tr>';
+  out += '<tr><td>VUs max</td><td>' + vusmax + '</td></tr>';
+  out += '</table>';
+  return out;
+}
+
+function handleSummary(data) {
+  // keep pretty tty summary too
+  var text = x && typeof x.extSummary === 'function' ? x.extSummary(data) : '';
+
+  var body = topPanel(data) +
+             '<h2 style="margin-top:28px">Feature / Endpoint breakdown</h2>' +
+             renderTable() +
+             '<h3 style="margin-top:28px">Raw JSON (truncated)</h3>' +
+             '<pre style="white-space:pre-wrap;font-size:12px;background:#f8f9fb;padding:12px;border:1px solid #eee;max-height:420px;overflow:auto">' +
+             JSON.stringify(data, null, 2).slice(0, 25000) + '</pre>';
+
+  var html = htmlShell('SDLC Auto Gov Load Test', '', body);
+
+  var out = { stdout: text };
+  out[path] = html;
+  return out;
+}
+
+exports.handleSummary = handleSummary;
+module.exports = handleSummary;
