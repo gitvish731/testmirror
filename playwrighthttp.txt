@@ -1,25 +1,35 @@
 // perf/k6/scenarios/from-playwright.http.js
-// k6 v0.46 compatible (no object spread in check, no optional chaining)
+// ✅ k6 v0.46 compatible (no spread syntax, ESM-safe, with handleSummary fix)
 
 import http from "k6/http";
 import { sleep, check } from "k6";
 import { Trend, Counter } from "k6/metrics";
-import features from "../sources/endpoints.byFeature.js";     // <- your feature map (default export)
+import features from "../sources/endpoints.byFeature.js"; // your feature map
 
-// If you DO have a summary helper, keep these two lines.
-// If you DON'T have it, delete the next two lines.
-import handleSummary from "../vendor/handleSummary.js";
-export { handleSummary };
+// --- summary wiring (robust to default or named exports) ---
+import summaryMod from "../vendor/handleSummary.js";
+export function handleSummary(data) {
+  var fn = null;
+  if (typeof summaryMod === "function") {
+    fn = summaryMod; // default export is a function
+  } else if (summaryMod && typeof summaryMod.handleSummary === "function") {
+    fn = summaryMod.handleSummary; // named export { handleSummary }
+  }
+
+  if (fn) return fn(data);
+  console.error("handleSummary module is not a function; skipping custom summary");
+  return {};
+}
 
 /**********************
  * ENV / CLI switches *
  **********************
- * -e FEATURES='ReportingAPI Alpha1, SomethingElse'
- * -e VUS=2             (# virtual users)
- * -e ITERS=2           (# iterations per VU; uses per-vu-iterations executor)
- * -e DURATION=30s      (uses constant-vus executor)
- * -e ONE=1             (shortcut: run exactly one iteration total)
- * -e TIER=dev|uat      (optional passthrough; does not alter URLs)
+ * -e FEATURES='ReportingAPI Alpha1,SomethingElse'
+ * -e VUS=2
+ * -e ITERS=2
+ * -e DURATION=30s
+ * -e ONE=1
+ * -e TIER=dev|uat
  */
 
 const RAW_FEATURES = (__ENV.FEATURES || "").trim();
@@ -62,20 +72,28 @@ export let options = usePerVuIters
 /************************************
  * Custom per-endpoint metrics (tagged)
  ************************************/
-const reqs_ep = new Counter("reqs_ep");            // counts requests per feature/endpoint
-const latency_ep = new Trend("latency_ep", true);  // ms per feature/endpoint
+const reqs_ep = new Counter("reqs_ep"); // counts requests per feature/endpoint
+const latency_ep = new Trend("latency_ep", true); // ms per feature/endpoint
 
 /************************************
  * Build the endpoint execution list *
  ************************************/
 const REQUESTED = RAW_FEATURES
-  ? RAW_FEATURES.split(",").map(function (s) { return s.trim(); }).filter(function (v) { return v; })
+  ? RAW_FEATURES.split(",")
+      .map(function (s) {
+        return s.trim();
+      })
+      .filter(function (v) {
+        return v;
+      })
   : Object.keys(features);
 
 const SELECTED = REQUESTED.filter(function (n) {
   return Object.prototype.hasOwnProperty.call(features, n);
 });
-const MISSING = REQUESTED.filter(function (n) { return SELECTED.indexOf(n) === -1; });
+const MISSING = REQUESTED.filter(function (n) {
+  return SELECTED.indexOf(n) === -1;
+});
 if (MISSING.length) {
   console.error("Unknown feature(s) ignored:", MISSING);
 }
@@ -109,7 +127,10 @@ for (var i = 0; i < SELECTED.length; i++) {
 
 if (!ENDPOINTS.length) {
   throw new Error(
-    'No endpoints selected. FEATURES="' + RAW_FEATURES + '" | available=' + Object.keys(features).join(", ")
+    'No endpoints selected. FEATURES="' +
+      RAW_FEATURES +
+      '" | available=' +
+      Object.keys(features).join(", ")
   );
 }
 
@@ -119,12 +140,12 @@ console.log("features loaded:", JSON.stringify(SELECTED));
  * Main iteration *
  *****************/
 export default function () {
-  var idx = (__ITER % ENDPOINTS.length);
+  var idx = __ITER % ENDPOINTS.length;
   var ep = ENDPOINTS[idx];
 
   var tags = { feature: ep.feature, endpoint: ep.name };
   var params = {
-    tags: tags,                       // critical: puts feature/endpoint tags on built-in metrics
+    tags: tags, // critical: puts feature/endpoint tags on built-in metrics
     headers: buildHeaders(ep.headers, ep.auth),
   };
 
@@ -162,7 +183,7 @@ export default function () {
     latency_ep.add(res.timings.duration, tags);
   }
 
-  // ---- v0.46-safe checks (no object spread) ----
+  // ---- v0.46-safe checks ----
   var expect = ep.expect || {};
   var checksObj = {};
   checksObj["status ok"] = function (r) {
@@ -170,7 +191,7 @@ export default function () {
   };
   if (expect.text) {
     checksObj["body has text"] = function (r) {
-      var b = (r && r.body) ? String(r.body) : "";
+      var b = r && r.body ? String(r.body) : "";
       return b.indexOf(expect.text) !== -1;
     };
   }
@@ -192,8 +213,7 @@ function toInt(v, defVal) {
 
 function buildHeaders(h, auth) {
   var hdrs = {};
-  // shallow copy without spread
-  for (var k in (h || {})) {
+  for (var k in h || {}) {
     if (Object.prototype.hasOwnProperty.call(h, k)) hdrs[k] = h[k];
   }
   if (hdrs["Content-Type"] && !hdrs["content-type"]) {
