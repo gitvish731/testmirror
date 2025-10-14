@@ -1,5 +1,5 @@
 // perf/k6/vendor/handleSummary.js
-// ES5-safe (no optional chaining / nullish coalescing). Named export: handleSummary.
+// ES5-safe & k6-compatible. Exports a *named* handleSummary(data).
 
 function esc(s) {
   s = String(s == null ? "" : s);
@@ -15,21 +15,19 @@ function trendVals(metric) {
   var v = (metric && metric.values) || {};
   return { avg: v.avg, min: v.min, med: v.med, p95: v["p(95)"], max: v.max };
 }
-function val(obj, k1, k2, k3) {
+function v(obj, k1, k2, k3) {
   var o = obj || null;
   if (o && k1 in o) { o = o[k1]; } else { return null; }
   if (k2 != null) { if (o && k2 in o) { o = o[k2]; } else { return null; } }
   if (k3 != null) { if (o && k3 in o) { o = o[k3]; } else { return null; } }
   return o;
 }
-
-// -------- text summary (stdout) ----------
 function textSummary(data) {
   var dur = trendVals(data.metrics["http_req_duration"]);
-  var reqs = val(data, "metrics", "http_reqs", "values"); reqs = reqs ? reqs.count : 0;
-  var iters = val(data, "metrics", "iterations", "values"); iters = iters ? iters.count : 0;
-  var vusMax = val(data, "metrics", "vus_max", "values"); vusMax = vusMax ? vusMax.value : 0;
-  var checks = val(data, "metrics", "checks", "values") || {};
+  var reqs = v(data, "metrics", "http_reqs", "values"); reqs = reqs ? reqs.count : 0;
+  var iters = v(data, "metrics", "iterations", "values"); iters = iters ? iters.count : 0;
+  var vusMax = v(data, "metrics", "vus_max", "values"); vusMax = vusMax ? vusMax.value : 0;
+  var checks = v(data, "metrics", "checks", "values") || {};
   var pass = checks.passes || 0;
   var fail = checks.fails || 0;
 
@@ -45,12 +43,12 @@ function textSummary(data) {
   return out.join("\n") + "\n";
 }
 
-// -------- tagged metric name parser ----------
-function parseTagMetricName(name) {
+// Parse "metricName{tag1:value,tag2:\"val\"}"
+function parseMetricName(name) {
   var i = name.indexOf("{");
-  if (i < 0 || name.charAt(name.length - 1) !== "}") return null;
+  if (i < 0 || name.charAt(name.length - 1) !== "}") return { base: name, tags: {} };
   var base = name.slice(0, i);
-  var inside = name.slice(i + 1, -1); // k:v,k2:v2
+  var inside = name.slice(i + 1, -1);
   var tags = {};
   var parts = inside.split(",");
   for (var p = 0; p < parts.length; p++) {
@@ -58,67 +56,82 @@ function parseTagMetricName(name) {
     var idx = seg.indexOf(":");
     if (idx < 0) continue;
     var k = seg.slice(0, idx).trim();
-    var v = seg.slice(idx + 1).trim();
-    if (v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
-      v = v.slice(1, -1);
-    }
-    tags[k] = v;
+    var raw = seg.slice(idx + 1).trim();
+    if (raw.charAt(0) === '"' && raw.charAt(raw.length - 1) === '"') raw = raw.slice(1, -1);
+    tags[k] = raw;
   }
   return { base: base, tags: tags };
 }
 
-// -------- collect Feature/Endpoint rows ----------
-function collectFeatureRows(metrics) {
-  var map = {}; // key: feature||endpoint
+// Accept many possible metric bases for requests and latency
+function isReqCounter(base, metric) {
+  // canonical and common customs
+  if (base === "http_reqs" || base === "reqs_ep" || base === "req_ep" || base === "requests") return true;
+  // heuristic: any counter with "req" in the name
+  return metric && metric.type === "counter" && /req/i.test(base);
+}
+function isLatencyTrend(base, metric) {
+  // canonical and custom
+  if (base === "http_req_duration" || base === "latency_ep" || base === "latency") return true;
+  if (metric && metric.type === "trend") {
+    // k6 labels time trends with contains: "time"
+    if (metric.contains === "time") return true;
+    if (/duration|latency/i.test(base)) return true;
+  }
+  return false;
+}
+
+// Build Feature/Endpoint rows from *any* tagged metrics
+function collectRows(metrics) {
+  var map = {}; // key = feature||endpoint
   for (var name in (metrics || {})) {
     if (!metrics.hasOwnProperty(name)) continue;
     var metric = metrics[name];
-    var parsed = parseTagMetricName(name);
-    if (!parsed) continue;
-    if (parsed.base !== "reqs_ep" && parsed.base !== "latency_ep") continue;
+    var parsed = parseMetricName(name);
+    var tags = parsed.tags || {};
+    var feature = tags.feature || tags.Feature || tags.FEATURE || null;
+    var endpoint = tags.endpoint || tags.Endpoint || tags.EP || tags.ep || null;
 
-    var feature = parsed.tags.feature || "unknown";
-    var endpoint = parsed.tags.endpoint || parsed.tags.ep || "unknown";
-    var key = feature + "||" + endpoint;
-    if (!map[key]) map[key] = { feature: feature, endpoint: endpoint, count: 0, avg: null, p95: null, max: null };
+    // Only aggregate if we actually have endpoint/feature tags
+    if (!endpoint && !feature) continue;
 
-    if (parsed.base === "reqs_ep") {
-      map[key].count = val(metric, "values", "count") || 0;
-    } else {
-      var v = trendVals(metric);
-      map[key].avg = v.avg; map[key].p95 = v.p95; map[key].max = v.max;
+    var key = (feature || "unknown") + "||" + (endpoint || "unknown");
+    if (!map[key]) map[key] = { feature: feature || "unknown", endpoint: endpoint || "unknown", count: 0, avg: null, p95: null, max: null };
+
+    if (isReqCounter(parsed.base, metric)) {
+      var c = v(metric, "values", "count");
+      if (typeof c === "number") map[key].count += c;
+    } else if (isLatencyTrend(parsed.base, metric)) {
+      var t = trendVals(metric);
+      // prefer non-null values; if we see multiple per same key, prefer the one with p95
+      if (t.avg != null) map[key].avg = t.avg;
+      if (t.p95 != null) map[key].p95 = t.p95;
+      if (t.max != null) map[key].max = t.max;
     }
   }
-  // to array + sort by count desc
+
   var arr = [];
   for (var k in map) if (map.hasOwnProperty(k)) arr.push(map[k]);
   arr.sort(function(a, b){ return (b.count || 0) - (a.count || 0); });
   return arr;
 }
 
-// ---------- NAMED EXPORT ----------
 export function handleSummary(data) {
   var text = textSummary(data);
   var overall = trendVals(data.metrics["http_req_duration"]);
-  var rows = collectFeatureRows(data.metrics);
+  var rows = collectRows(data.metrics);
 
-  var checksVal = val(data, "metrics", "checks", "values") || {};
+  var checksVal = v(data, "metrics", "checks", "values") || {};
   var when = new Date().toISOString().replace("T", " ").slice(0, 19);
 
-  var topTable =
+  var top =
     '<table style="border-collapse:collapse;margin:8px 0">' +
-      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Checks (pass/fail)</th>' +
-          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (checksVal.passes || 0) + ' / ' + (checksVal.fails || 0) + '</td></tr>' +
-      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Requests</th>' +
-          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (val(data, "metrics", "http_reqs", "values") ? val(data, "metrics", "http_reqs", "values").count : 0) + ' total</td></tr>' +
-      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency p(95)</th>' +
-          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + ms(overall.p95) + '</td></tr>' +
-      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency avg / min / max</th>' +
-          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + ms(overall.avg) + ' / ' + ms(overall.min) + ' / ' + ms(overall.max) + '</td></tr>' +
-      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Iterations</th>' +
-          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (val(data, "metrics", "iterations", "values") ? val(data, "metrics", "iterations", "values").count : 0) + '</td></tr>' +
-      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">VUs max</th>' +
-          '<td style="padding:6px 10px;border:1px solid #e0e0e0">' + (val(data, "metrics", "vus_max", "values") ? val(data, "metrics", "vus_max", "values").value : 0) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Checks (pass/fail)</th><td style="padding:6px 10px;border:1px solid #e0e0e0">' + (checksVal.passes || 0) + ' / ' + (checksVal.fails || 0) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Requests</th><td style="padding:6px 10px;border:1px solid #e0e0e0">' + (v(data, "metrics", "http_reqs", "values") ? v(data, "metrics", "http_reqs", "values").count : 0) + ' total</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency p(95)</th><td style="padding:6px 10px;border:1px solid #e0e0e0">' + ms(overall.p95) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Latency avg / min / max</th><td style="padding:6px 10px;border:1px solid #e0e0e0">' + ms(overall.avg) + ' / ' + ms(overall.min) + ' / ' + ms(overall.max) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">Iterations</th><td style="padding:6px 10px;border:1px solid #e0e0e0">' + (v(data, "metrics", "iterations", "values") ? v(data, "metrics", "iterations", "values").count : 0) + '</td></tr>' +
+      '<tr><th style="text-align:left;padding:6px 10px;border:1px solid #e0e0e0">VUs max</th><td style="padding:6px 10px;border:1px solid #e0e0e0">' + (v(data, "metrics", "vus_max", "values") ? v(data, "metrics", "vus_max", "values").value : 0) + '</td></tr>' +
     '</table>';
 
   var featureTable;
@@ -149,23 +162,18 @@ export function handleSummary(data) {
   } else {
     featureTable =
       '<h3>Feature / Endpoint breakdown</h3>' +
-      '<div style="color:#666">No per-feature data (did the runner emit <code>reqs_ep{...}</code> and <code>latency_ep{...}</code> metrics?).</div>';
+      '<div style="color:#666">No per-feature data (did requests carry <code>feature</code>/<code>endpoint</code> tags?).</div>';
   }
 
-  var jsonStr = JSON.stringify(data, null, 2);
   var when = new Date().toISOString().replace("T", " ").slice(0, 19);
+  var jsonStr = JSON.stringify(data, null, 2);
   var html =
     '<!doctype html><html><head><meta charset="utf-8">' +
     '<title>SDLC Auto Gov Load Test — ' + esc(when) + '</title>' +
     '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:16px 18px 48px}h1{margin:0 0 10px;font-size:22px}h3{margin:18px 0 6px}code{background:#f6f8fa;padding:1px 4px;border-radius:4px}</style>' +
     '</head><body>' +
     '<h1>SDLC Auto Gov Load Test — ' + esc(when) + '</h1>' +
-    topTable +
-    '<div style="margin:10px 0 16px">' +
-      '<div style="height:10px;background:#e6eefc;border-radius:4px;position:relative;margin:8px 0">' +
-      '<div style="position:absolute;left:0;top:0;bottom:0;width:70%;background:#3b82f6;border-radius:4px"></div>' +
-      '</div></div>' +
-    featureTable +
+    top + featureTable +
     '<details style="margin-top:14px"><summary style="cursor:pointer">Raw JSON (truncated)</summary>' +
     '<pre style="white-space:pre-wrap;font-size:12px;background:#fafafa;border:1px solid #eee;padding:8px;border-radius:6px;max-height:440px;overflow:auto;">' +
     esc(jsonStr.slice(0, 20000)) + '</pre></details>' +
