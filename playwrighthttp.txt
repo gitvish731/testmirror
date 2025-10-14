@@ -5,7 +5,7 @@ import { Trend } from 'k6/metrics';
 import { ACC } from '../vendor/accumulator.js';
 
 // -----------------------------------------------------
-// 🧩 Environment & URL Handling
+// Env & URL handling
 // -----------------------------------------------------
 const ENV = (__ENV.ENV || 'uat').toLowerCase();
 const RAW_BASE = (__ENV.BASE_URL || '').trim();
@@ -14,58 +14,47 @@ const BASE_ORIGIN = BASE ? BASE.origin : '';
 const BASE_PATH = BASE ? BASE.pathname.replace(/\/+$/, '') : '';
 
 function rewriteForEnv(absUrl) {
-  if (ENV === 'dev') {
-    return absUrl.replace(/sdlcapis-test/gi, 'sdlcapis-dev');
-  }
-  return absUrl; // leave test/UAT untouched
+  if (ENV === 'dev') return absUrl.replace(/sdlcapis-test/gi, 'sdlcapis-dev');
+  return absUrl;
 }
 
 function buildUrl(raw) {
   const u = String(raw || '').trim();
-  if (/^https?:\/\//i.test(u)) {
-    return rewriteForEnv(u);
-  }
-  if (!BASE) {
-    throw new Error(`Relative URL "${u}" requires BASE_URL`);
-  }
+  if (/^https?:\/\//i.test(u)) return rewriteForEnv(u);
+  if (!BASE) throw new Error(`Relative URL "${u}" requires BASE_URL`);
   const epPath = u.startsWith('/') ? u : '/' + u;
   return BASE_ORIGIN + BASE_PATH + epPath;
 }
 
 function buildHeaders(method) {
-  const hasBody = /^(POST|PUT|PATCH)$/i.test(method);
-  return {
-    'accept': 'application/json',
-    ...(hasBody ? { 'content-type': 'application/json' } : {}),
+  const headers = {
+    accept: 'application/json',
     'user-agent': 'k6/auto-runner',
   };
+  if (/^(POST|PUT|PATCH)$/i.test(method)) {
+    headers['content-type'] = 'application/json';
+  }
+  return headers;
 }
 
 // -----------------------------------------------------
-// 🧠 Load Endpoints
+// Load endpoints
 // -----------------------------------------------------
 import endpoints from '../sources/endpoints.byFeature.js';
 const FEATURES = (__ENV.FEATURES || '').split(',').map((s) => s.trim()).filter(Boolean);
-
 if (!FEATURES.length) {
   throw new Error('No FEATURES specified. Example: -e FEATURES="ReportingAPI Alpha1"');
 }
 
 const SELECTED = new SharedArray('selected-endpoints', () =>
-  FEATURES.flatMap((f) =>
-    (endpoints[f] || []).map((ep) => ({
-      feature: f,
-      ...ep,
-    })),
-  ),
+  FEATURES.flatMap((f) => (endpoints[f] || []).map((ep) => ({ feature: f, ...ep }))),
 );
-
 if (!SELECTED.length) {
   throw new Error(`No endpoints found for selected FEATURES: ${FEATURES.join(', ')}`);
 }
 
 // -----------------------------------------------------
-// ⚙️ Scenarios Setup
+// Scenarios
 // -----------------------------------------------------
 export const options = {
   scenarios: {
@@ -83,7 +72,7 @@ export const options = {
 };
 
 // -----------------------------------------------------
-// 🧾 Request + Checks
+// Request + checks
 // -----------------------------------------------------
 function fire(method, ep, feature) {
   const url = buildUrl(ep.url);
@@ -125,14 +114,13 @@ function fire(method, ep, feature) {
     res,
     {
       'status ok': (r) => r.status === expected,
-      'body has text': (r) =>
-        !mustContain || String(r.body || '').indexOf(mustContain) !== -1,
+      'body has text': (r) => !mustContain || String(r.body || '').indexOf(mustContain) !== -1,
     },
     tags,
   );
 
-  // send to accumulator (for HandleSummary)
-  if (typeof ACC?.add === 'function') {
+  // Accumulator for per-feature/endpoint table in handleSummary
+  if (ACC && typeof ACC.add === 'function') {
     ACC.add(feature, endpoint, res.timings.duration, res.status === expected);
   }
 
@@ -145,17 +133,15 @@ function fire(method, ep, feature) {
 }
 
 // -----------------------------------------------------
-// 🚀 Main Test
+// Main test
 // -----------------------------------------------------
 export default function () {
   if (!SELECTED.length) {
     console.error('No endpoints selected — aborting');
     return;
   }
-
   const i = Math.floor(Math.random() * SELECTED.length);
   const { feature, method, ...ep } = SELECTED[i];
   fire(method, ep, feature);
-
   sleep(Number(__ENV.SLEEP || 0.2));
 }
