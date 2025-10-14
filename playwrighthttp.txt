@@ -2,23 +2,21 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { SharedArray } from 'k6/data';
 
-// Import feature/endpoint lists
+// ---- features/endpoints map ----
 import { ArtifactsRegistrationV1Alpha1 } from '../sources/endpoints.byFeature.js';
 
-// Import reporter
+// ---- reporter (HTML + JSON) ----
 export { handleSummary } from '../vendor/handleSummary.js';
 
-// -------------
-// Test options
-// -------------
+// -------------------------------
+// Options (VU/iterations or VU/duration)
+// -------------------------------
 export const options = {
   scenarios: {
     by_iter: {
-      executor: __ENV.DURATION
-        ? 'constant-vus'
-        : 'per-vu-iterations', // duration → run-time mode; else iterations-based
+      executor: __ENV.DURATION ? 'constant-vus' : 'per-vu-iterations',
       vus: Number(__ENV.VUS || 1),
-      duration: __ENV.DURATION || undefined, // e.g. "10s" or "1m"
+      duration: __ENV.DURATION || undefined,       // e.g. "10s"
       iterations: __ENV.ONE ? Number(__ENV.ONE) : undefined,
       gracefulStop: '3s',
     },
@@ -29,78 +27,107 @@ export const options = {
   },
 };
 
-// -------------
-// Helpers
-// -------------
-function reqParams(featureName, endpointName, extra = {}) {
-  return {
-    headers: {
-      ...(extra.headers || {}),
-      'content-type': 'application/json',
-      'authorization': extra.auth || '', // if you inject bearer later
-    },
-    tags: {
-      feature: featureName,
-      endpoint: endpointName,
-      ...(extra.tags || {}),
-    },
-  };
+// -------------------------------
+// Helpers (no spread / no optional chaining)
+// -------------------------------
+function mergeInto(target, source) {
+  if (!source) return;
+  for (var k in source) {
+    if (Object.prototype.hasOwnProperty.call(source, k)) {
+      target[k] = source[k];
+    }
+  }
 }
 
-const FEATURES = [
+function reqParams(featureName, endpointName, extra) {
+  var headers = {};
+  var tags = {};
+
+  // copy extra.headers (if any)
+  if (extra && extra.headers) mergeInto(headers, extra.headers);
+
+  // default content-type if not provided
+  if (headers['content-type'] === undefined) {
+    headers['content-type'] = 'application/json';
+  }
+
+  // add auth header if given
+  if (extra && extra.auth) {
+    headers['authorization'] = extra.auth;
+  }
+
+  // required tags for summary breakdown
+  tags.feature = featureName;
+  tags.endpoint = endpointName;
+  if (extra && extra.tags) mergeInto(tags, extra.tags);
+
+  return { headers: headers, tags: tags };
+}
+
+// Your feature list
+var FEATURES = [
   { name: 'ReportingAPI Alpha1', endpoints: ArtifactsRegistrationV1Alpha1 },
 ];
 
-// Shared array for reusability across VUs
-const testMatrix = new SharedArray('feature-endpoints', () => FEATURES);
+// Shared so all VUs see the same structure
+var testMatrix = new SharedArray('feature-endpoints', function () {
+  return FEATURES;
+});
 
-// -------------
-// Main entrypoint
-// -------------
+// -------------------------------
+// Main
+// -------------------------------
 export default function main() {
-  for (const feat of testMatrix) {
-    for (const ep of feat.endpoints) {
-      const params = reqParams(feat.name, ep.name, { auth: ep.auth || '' });
-      let res;
+  for (var i = 0; i < testMatrix.length; i++) {
+    var feat = testMatrix[i];
+    var eps = feat.endpoints || [];
+    for (var j = 0; j < eps.length; j++) {
+      var ep = eps[j];
 
-      // Pick method dynamically
+      var params = reqParams(feat.name, ep.name, {
+        auth: ep.auth || '',
+        headers: ep.headers || null,
+        tags: ep.tags || null,
+      });
+
+      var res;
+      var method = (ep.method || 'GET').toUpperCase();
+
       try {
-        switch (ep.method.toUpperCase()) {
-          case 'GET':
-            res = http.get(ep.url, params);
-            break;
-          case 'POST':
-            res = http.post(ep.url, ep.body || {}, params);
-            break;
-          case 'PATCH':
-            res = http.patch(ep.url, ep.body || {}, params);
-            break;
-          case 'DELETE':
-            res = http.del(ep.url, null, params);
-            break;
-          default:
-            console.warn(`⚠ Unknown method ${ep.method} for ${ep.name}`);
-            continue;
+        if (method === 'GET') {
+          res = http.get(ep.url, params);
+        } else if (method === 'POST') {
+          res = http.post(ep.url, ep.body || {}, params);
+        } else if (method === 'PATCH') {
+          res = http.patch(ep.url, ep.body || {}, params);
+        } else if (method === 'DELETE') {
+          res = http.del(ep.url, null, params);
+        } else {
+          console.warn('Unknown method ' + method + ' for ' + ep.name);
+          continue;
         }
-      } catch (err) {
-        console.error(`❌ Request failed for ${feat.name} → ${ep.name}:`, err);
+      } catch (e) {
+        console.error('Request error for ' + feat.name + ' → ' + ep.name + ': ' + String(e));
         continue;
       }
 
-      // Validate
+      var expectedStatus = (ep.expect && ep.expect.status) ? ep.expect.status : 200;
+      var mustContain = (ep.expect && ep.expect.text) ? ep.expect.text : null;
+
       check(res, {
-        'status ok': (r) => r.status === (ep.expect?.status || 200),
-        'body has text': (r) => {
-          const must = ep.expect?.text;
-          return !must || String(r.body || '').includes(must);
+        'status ok': function (r) { return r.status === expectedStatus; },
+        'body has text': function (r) {
+          if (!mustContain) return true;
+          var body = String(r.body || '');
+          return body.indexOf(mustContain) !== -1;
         },
       });
 
       if (__ENV.DEBUG_TAGS === '1') {
-        console.log(`Tags => ${JSON.stringify(params.tags)}`);
+        console.log('Tags => ' + JSON.stringify(params.tags));
       }
 
-      sleep(0.2); // pacing between requests
+      sleep(0.2);
     }
   }
 }
