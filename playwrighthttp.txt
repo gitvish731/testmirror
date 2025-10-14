@@ -1,229 +1,114 @@
-/* perf/k6/vendor/handleSummary.js — v0.46-safe enhanced summary */
-function esc(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+/* perf/k6/vendor/handleSummary.js — ENHANCED marker + v0.46-safe */
+function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function trendNum(M,n,k){ const m=M&&M[n]; return m&&m.values&&m.values[k]!=null?m.values[k]:null; }
+function trendPct(M,n,p){ const m=M&&M[n]; if(!m||!m.values) return null; const k=p===50?'med':`p(${p})`; return m.values[k]!=null?m.values[k]:null; }
+
+function svgBar(rows,{title,labelKey,valueKey,unit='',width=640,height=200}){
+  if(!rows||!rows.length) return '';
+  const L=160,R=20,T=24,B=24, W=width-L-R, H=height-T-B;
+  const maxV=Math.max(...rows.map(r=>+r[valueKey]||0))||1, step=H/rows.length;
+  const bars=rows.map((r,i)=>{ const v=+r[valueKey]||0, w=Math.round((v/maxV)*W), y=T+i*step+4, x=L, h=Math.max(10,step-6);
+    return `<text x="${L-8}" y="${y+h-4}" text-anchor="end" font-size="11">${esc(r[labelKey])}</text>
+            <rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#4e79a7"/>
+            <text x="${x+w+4}" y="${y+h-4}" font-size="11">${v}${unit}</text>`; }).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">
+    <text x="${L}" y="16" font-size="12" font-weight="600">${esc(title)}</text>${bars}</svg>`;
 }
 
-// tiny helper to read a trend percentile safely (works on k6 v0.46)
-function trendPct(metrics, name, p) {
-  const m = metrics && metrics[name];
-  if (!m || !m.values) return null;
-  const key = p === 50 ? 'med' : `p(${p})`;
-  return m.values[key] != null ? m.values[key] : null;
-}
-function trendNum(metrics, name, k) {
-  const m = metrics && metrics[name];
-  return m && m.values && m.values[k] != null ? m.values[k] : null;
-}
-
-// tiny inline SVG bar chart (no dependencies)
-function svgBarChart(rows, {title, labelKey, valueKey, unit='', width=640, height=200}) {
-  if (!rows || !rows.length) return '';
-  const padL = 160, padR = 20, padT = 24, padB = 24;
-  const innerW = width - padL - padR;
-  const innerH = height - padT - padB;
-  const maxV = Math.max(...rows.map(r => Number(r[valueKey]) || 0)) || 1;
-  const step = innerH / rows.length;
-  const bars = rows.map((r, i) => {
-    const v = Number(r[valueKey]) || 0;
-    const w = Math.round((v / maxV) * innerW);
-    const y = padT + i * step + 4;
-    const x = padL;
-    const h = Math.max(10, step - 6);
-    return `
-      <text x="${padL-8}" y="${y+h-4}" text-anchor="end" font-size="11">${esc(r[labelKey])}</text>
-      <rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#4e79a7" />
-      <text x="${x+w+4}" y="${y+h-4}" font-size="11">${v}${unit}</text>`;
-  }).join('');
-  return `
-  <svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">
-    <text x="${padL}" y="16" font-size="12" font-weight="600">${esc(title)}</text>
-    ${bars}
-  </svg>`;
-}
-
-export default function handleSummary(data) {
-  // ---- GLOBAL PANEL (built-in metrics) ----
+export default function handleSummary(data){
+  // marker in console so you know this file is active
+  const banner = 'Enhanced summary active ✅';
+  // ---- built-in metrics (global) ----
   const M = data.metrics || {};
-  const totalReqs = trendNum(M, 'http_reqs', 'count') || 0;
-  const testDurationMs = trendNum(M, 'iteration_duration', 'avg') ? data.state?.testRunDurationMs || null : null;
-  const rps = (data.state && data.state.testRunDurationMs)
-    ? (totalReqs / (data.state.testRunDurationMs / 1000)).toFixed(2)
-    : ''; // falls back to '' if we don’t have exact duration
+  const totalReqs = trendNum(M,'http_reqs','count') || 0;
+  const vusMax   = trendNum(M,'vus_max','max') || '';
+  const sentB    = trendNum(M,'data_sent','count') || 0;
+  const recvB    = trendNum(M,'data_received','count') || 0;
 
-  const latAvg = trendNum(M, 'http_req_duration', 'avg');
-  const latMin = trendNum(M, 'http_req_duration', 'min');
-  const latMed = trendNum(M, 'http_req_duration', 'med');
-  const latP90 = trendPct(M, 'http_req_duration', 90);
-  const latP95 = trendPct(M, 'http_req_duration', 95);
-  const latP99 = trendPct(M, 'http_req_duration', 99) || null;
-  const latMax = trendNum(M, 'http_req_duration', 'max');
+  const latAvg = trendNum(M,'http_req_duration','avg');
+  const latMin = trendNum(M,'http_req_duration','min');
+  const latMed = trendNum(M,'http_req_duration','med');
+  const latP90 = trendPct(M,'http_req_duration',90);
+  const latP95 = trendPct(M,'http_req_duration',95);
+  const latP99 = trendPct(M,'http_req_duration',99);
+  const latMax = trendNum(M,'http_req_duration','max');
 
-  const failed = trendNum(M, 'http_req_failed', 'fails') || 0; // v0.46 exposes error rate via thresholds; we approximate via fails if available
-  const dataSent = trendNum(M, 'data_sent', 'count') || 0;
-  const dataRecv = trendNum(M, 'data_received', 'count') || 0;
-  const vusMax = trendNum(M, 'vus_max', 'max') || '';
-
-  // ---- ACCUMULATED PER FEATURE/ENDPOINT (from runner) ----
+  // ---- per feature / endpoint from runner accumulator ----
   const acc = data.acc || { byFeature:{}, byEndpoint:{} };
 
-  // Build tidy arrays for tables
-  const byFeature = Object.keys(acc.byFeature || {}).map(f => {
-    const v = acc.byFeature[f] || {};
-    return {
-      feature: f,
-      requests: v.count || 0,
-      avg: v.avg != null ? Math.round(v.avg) : null,
-      p95: v.p95 != null ? Math.round(v.p95) : null,
-      max: v.max != null ? Math.round(v.max) : null,
-      errs: v.errs != null ? v.errs : null,
-    };
-  }).sort((a,b)=> b.requests - a.requests);
+  const byFeature = Object.keys(acc.byFeature||{}).map(f=>{
+    const v=acc.byFeature[f]||{};
+    return { feature:f, requests:v.count||0, avg:v.avg!=null?Math.round(v.avg):null,
+             p95:v.p95!=null?Math.round(v.p95):null, max:v.max!=null?Math.round(v.max):null, errs:v.errs||0 };
+  }).sort((a,b)=>b.requests-a.requests);
 
-  const byEndpoint = Object.keys(acc.byEndpoint || {}).map(k => {
-    const v = acc.byEndpoint[k] || {};
-    // k format expected: "FeatureName|EndpointName"
-    let feature = '', endpoint = k;
-    if (k.includes('|')) [feature, endpoint] = k.split('|');
-    return {
-      feature,
-      endpoint,
-      requests: v.count || 0,
-      avg: v.avg != null ? Math.round(v.avg) : null,
-      p95: v.p95 != null ? Math.round(v.p95) : null,
-      max: v.max != null ? Math.round(v.max) : null,
-      errs: v.errs != null ? v.errs : null,
-    };
-  }).sort((a,b)=> b.requests - a.requests);
+  const byEndpoint = Object.keys(acc.byEndpoint||{}).map(k=>{
+    const v=acc.byEndpoint[k]||{};
+    let feature='', endpoint=k;
+    if(k.indexOf('|')>-1){ const parts=k.split('|'); feature=parts[0]; endpoint=parts.slice(1).join('|'); }
+    return { feature, endpoint, requests:v.count||0, avg:v.avg!=null?Math.round(v.avg):null,
+             p95:v.p95!=null?Math.round(v.p95):null, max:v.max!=null?Math.round(v.max):null, errs:v.errs||0 };
+  }).sort((a,b)=>b.requests-a.requests);
 
-  // Top charts sources
-  const topN = 8;
-  const chartLatency = byEndpoint
-    .filter(r => r.avg != null)
-    .sort((a,b)=> b.avg - a.avg)
-    .slice(0, topN)
-    .map(r => ({ name: r.endpoint, value: r.avg }));
+  const topN=8;
+  const chartLatency = byEndpoint.filter(r=>r.avg!=null).sort((a,b)=>b.avg-a.avg).slice(0,topN)
+    .map(r=>({ name:r.endpoint, value:r.avg }));
+  const chartReqs = byEndpoint.slice(0,topN).map(r=>({ name:r.endpoint, value:r.requests }));
 
-  const chartRps = byEndpoint
-    .slice(0, topN)
-    .map(r => ({ name: r.endpoint, value: r.requests })); // per test; a strict RPS would divide by duration, which we can add when available
+  const head = `<!doctype html><html><head><meta charset="utf-8"/>
+  <title>SDLC Auto Gov Load Test (ENHANCED)</title>
+  <style>
+    body{font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;color:#222}
+    h1{font-size:20px;margin:0 0 12px} h2{font-size:16px;margin:24px 0 8px}
+    table{border-collapse:collapse;width:100%;margin:8px 0 16px}
+    th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left} th{background:#f7f7f7}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px} .pill{padding:2px 6px;border-radius:10px;background:#f0f0f0}
+    details{margin:8px 0 16px} .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre}
+  </style></head><body>
+  <h1>SDLC Auto Gov Load Test (ENHANCED) — ${esc(new Date().toISOString().replace('T',' ').slice(0,19))}</h1>`;
 
-  // ---- HTML ----
-  const head = `
-  <!doctype html>
-  <html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>SDLC Auto Gov Load Test</title>
-    <style>
-      body { font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; color:#222; }
-      h1 { font-size: 20px; margin: 0 0 12px; }
-      h2 { font-size: 16px; margin: 24px 0 8px; }
-      table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; }
-      th, td { border: 1px solid #e0e0e0; padding: 6px 8px; text-align: left; }
-      th { background: #f7f7f7; }
-      .muted { color:#777; }
-      .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-      .pill { display:inline-block; padding:2px 6px; border-radius:10px; background:#f0f0f0; font-size:12px; }
-      details { margin: 8px 0 16px; }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; white-space:pre; }
-    </style>
-  </head>
-  <body>
-  <h1>SDLC Auto Gov Load Test — ${esc(new Date().toISOString().replace('T',' ').slice(0,19))}</h1>
-  `;
+  const overview = `<div class="grid">
+    <div><h2>Overview</h2><table>
+      <tr><th>Requests</th><td>${totalReqs}</td></tr>
+      <tr><th>VUs max</th><td>${vusMax||'—'}</td></tr>
+      <tr><th>Data</th><td>sent ${Math.round(sentB)} B, received ${Math.round(recvB)} B</td></tr>
+    </table></div>
+    <div><h2>Latency (ms)</h2><table>
+      <tr><th>avg</th><td>${latAvg!=null?Math.round(latAvg):'—'}</td></tr>
+      <tr><th>p50</th><td>${latMed!=null?Math.round(latMed):'—'}</td></tr>
+      <tr><th>p90</th><td>${latP90!=null?Math.round(latP90):'—'}</td></tr>
+      <tr><th>p95</th><td>${latP95!=null?Math.round(latP95):'—'}</td></tr>
+      <tr><th>p99</th><td>${latP99!=null?Math.round(latP99):'—'}</td></tr>
+      <tr><th>min / max</th><td>${latMin!=null?Math.round(latMin):'—'} / ${latMax!=null?Math.round(latMax):'—'}</td></tr>
+    </table></div></div>`;
 
-  const globalPanel = `
-  <div class="grid">
-    <div>
-      <h2>Overview</h2>
-      <table>
-        <tr><th>Requests</th><td>${totalReqs}</td></tr>
-        <tr><th>Throughput</th><td>${rps ? `${rps} req/s` : '<span class="muted">n/a</span>'}</td></tr>
-        <tr><th>VUs max</th><td>${vusMax || '<span class="muted">n/a</span>'}</td></tr>
-        <tr><th>Data</th><td>sent ${Math.round(dataSent)} B, received ${Math.round(dataRecv)} B</td></tr>
-        <tr><th>Error rate</th><td>${failed ? failed : 0}</td></tr>
-      </table>
-    </div>
-    <div>
-      <h2>Latency (ms)</h2>
-      <table>
-        <tr><th>avg</th><td>${latAvg != null ? Math.round(latAvg) : '—'}</td></tr>
-        <tr><th>p50</th><td>${latMed != null ? Math.round(latMed) : '—'}</td></tr>
-        <tr><th>p90</th><td>${latP90 != null ? Math.round(latP90) : '—'}</td></tr>
-        <tr><th>p95</th><td>${latP95 != null ? Math.round(latP95) : '—'}</td></tr>
-        <tr><th>p99</th><td>${latP99 != null ? Math.round(latP99) : '—'}</td></tr>
-        <tr><th>min / max</th><td>${latMin != null ? Math.round(latMin) : '—'} / ${latMax != null ? Math.round(latMax) : '—'}</td></tr>
-      </table>
-    </div>
-  </div>
-  `;
+  const featureTbl = `<h2>Feature breakdown</h2>${
+    byFeature.length?`<table>
+      <tr><th>Feature</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
+      ${byFeature.map(r=>`<tr><td>${esc(r.feature)}</td><td>${r.requests}</td><td>${r.avg??'—'}</td><td>${r.p95??'—'}</td><td>${r.max??'—'}</td><td>${r.errs||0}</td></tr>`).join('')}
+    </table>`:'<div class="mono">No feature data recorded.</div>'}`;
 
-  const featureTable = `
-  <h2>Feature breakdown</h2>
-  ${byFeature.length ? `
-  <table>
-    <tr><th>Feature</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
-    ${byFeature.map(r => `
-      <tr>
-        <td>${esc(r.feature)}</td>
-        <td>${r.requests}</td>
-        <td>${r.avg ?? '—'}</td>
-        <td>${r.p95 ?? '—'}</td>
-        <td>${r.max ?? '—'}</td>
-        <td>${r.errs ?? 0}</td>
-      </tr>`).join('')}
-  </table>` : `<div class="muted">No feature data recorded.</div>`}
-  `;
+  const endpointTbl = `<h2>Endpoint breakdown</h2>${
+    byEndpoint.length?`<table>
+      <tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
+      ${byEndpoint.map(r=>`<tr><td><span class="pill">${esc(r.feature)}</span></td><td>${esc(r.endpoint)}</td><td>${r.requests}</td>
+        <td>${r.avg??'—'}</td><td>${r.p95??'—'}</td><td>${r.max??'—'}</td><td>${r.errs||0}</td></tr>`).join('')}
+    </table>`:'<div class="mono">No endpoint data recorded.</div>'}`;
 
-  const endpointTable = `
-  <h2>Endpoint breakdown</h2>
-  ${byEndpoint.length ? `
-  <table>
-    <tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg ms</th><th>p95 ms</th><th>Max ms</th><th>Errors</th></tr>
-    ${byEndpoint.map(r => `
-      <tr>
-        <td><span class="pill">${esc(r.feature)}</span></td>
-        <td>${esc(r.endpoint)}</td>
-        <td>${r.requests}</td>
-        <td>${r.avg ?? '—'}</td>
-        <td>${r.p95 ?? '—'}</td>
-        <td>${r.max ?? '—'}</td>
-        <td>${r.errs ?? 0}</td>
-      </tr>`).join('')}
-  </table>` : `<div class="muted">No endpoint data recorded.</div>`}
-  `;
+  const charts = `<h2>Charts</h2><div class="grid">
+      <div>${svgBar(chartLatency,{title:'Top endpoints by avg latency (ms)',labelKey:'name',valueKey:'value',unit:' ms'})}</div>
+      <div>${svgBar(chartReqs,{title:'Top endpoints by requests',labelKey:'name',valueKey:'value'})}</div>
+    </div>`;
 
-  const charts = `
-  <h2>Charts</h2>
-  <div class="grid">
-    <div>${svgBarChart(chartLatency, { title:'Top endpoints by avg latency (ms)', labelKey:'name', valueKey:'value', unit:' ms' })}</div>
-    <div>${svgBarChart(chartRps, { title:'Top endpoints by requests', labelKey:'name', valueKey:'value' })}</div>
-  </div>
-  `;
+  const raw = `<details><summary>Raw JSON (truncated)</summary>
+    <div class="mono">${esc(JSON.stringify({acc:data.acc||{}, sample:{
+      http_reqs:M.http_reqs||{}, http_req_duration:M.http_req_duration||{}
+    }},null,2).slice(0,18000))}${JSON.stringify(data).length>18000?'\n…(truncated)…':''}</div></details>`;
 
-  const raw = `
-  <details>
-    <summary>Raw JSON (truncated)</summary>
-    <div class="mono">${esc(JSON.stringify({
-      acc: data.acc || {},
-      options: data.options || {},
-      scenario: data.options?.scenarios || {},
-      sample_metrics: {
-        http_reqs: M.http_reqs || {},
-        http_req_duration: M.http_req_duration || {},
-      }
-    }, null, 2).slice(0, 18000))}${data && JSON.stringify(data).length > 18000 ? '\n…(truncated)…' : ''}</div>
-  </details>`;
+  const html = head + overview + featureTbl + endpointTbl + charts + raw + '</body></html>';
 
-  const html = head + globalPanel + featureTable + endpointTable + charts + raw + '\n</body></html>';
-
-  // stdout keeps the pretty text; json+html are written as files
   return {
-    stdout: `\nSummary written with feature/endpoint tables${byEndpoint.length ? '' : ' (no endpoints found)'}\n`,
+    stdout: `\n${banner}\n`,
     'perf/k6/reports/summary.json': JSON.stringify(data, null, 2),
     'perf/k6/reports/summary.html': html,
   };
