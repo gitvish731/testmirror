@@ -1,187 +1,197 @@
-// perf/k6/vendor/handleSummary.js
-//
-// Plain-ES5 handleSummary that k6 can parse. No imports, no destructuring.
-// Looks for custom per-endpoint metrics named:
-//   - reqs_ep_<id>  (Counter)
-//   - time_ep_<id>  (Trend with avg/p(95)/max)
-// where <id> is "<feature>__<endpoint>" (lowercased, spaces -> _).
-//
-// Produces: perf/k6/reports/summary.html
+/* eslint-disable no-undef */
+// k6 runner for endpoints generated from Playwright specs (HTTP-only)
 
-function esc(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const http = require('k6/http');
+const { check, sleep, Trend, Counter } = require('k6');
+
+// -------------------------------
+// Env helpers (defaults are safe)
+// -------------------------------
+const ENV = (k => ({
+  FEATURES: (k.FEATURES || '').trim(),        // comma-separated display names from the JSON (case-insensitive)
+  ENDPOINT_FILTER: (k.ENDPOINT_FILTER || '').trim(), // substring match on endpoint name
+  BASE_URL: (k.BASE_URL || '').trim(),        // e.g. https://api.dev.example.com
+  TOKEN: (k.TOKEN || k.GRAFEAS_LOGIN_TOKEN || '').trim(),
+  RPS: Number(k.RPS || 1),
+  DURATION: (k.DURATION || '30s').trim(),
+  PREALLOC: Number(k.PREALLOC || 5),
+  MAXVUS: Number(k.MAXVUS || 35),
+}))(__ENV);
+
+// ---------------------------------
+// Load endpoints map (generated)
+// ---------------------------------
+// Prefer JSON file (fast), fallback to JS module if ever needed.
+const ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
+
+// ---------------------------------
+// Small utils
+// ---------------------------------
+function slug(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
 }
 
-function fmtMs(n) { return (Math.round(Number(n) * 1000) / 1000) + ' ms'; }
-function bar(widthPx) {
-  return '<div style="height:10px;background:#2b6cb0;width:'+widthPx+'px;border-radius:3px;"></div>';
-}
-
-function metricValue(data, name, keyPath) {
-  // keyPath e.g. ['values','p(95)'] or ['values','count']
-  if (!data || !data.metrics) return null;
-  var m = data.metrics[name];
-  if (!m) return null;
-  var v = m;
-  for (var i = 0; i < keyPath.length; i++) {
-    if (v == null) return null;
-    v = v[keyPath[i]];
-  }
-  return v;
-}
-
-function computeLatencyNumbers(data) {
-  var p95 = metricValue(data, 'http_req_duration', ['values','p(95)']);
-  var avg = metricValue(data, 'http_req_duration', ['values','avg']);
-  var min = metricValue(data, 'http_req_duration', ['values','min']);
-  var max = metricValue(data, 'http_req_duration', ['values','max']);
-  return { p95: p95 || 0, avg: avg || 0, min: min || 0, max: max || 0 };
-}
-
-function summarizeEndpointRows(data) {
-  var rows = [];               // { feature, endpoint, count, avg, p95, max }
-  var metrics = data && data.metrics ? data.metrics : {};
-  for (var k in metrics) {
-    if (!metrics.hasOwnProperty(k)) continue;
-
-    // reqs_ep_<id> gives us the existence + count
-    if (k.indexOf('reqs_ep_') === 0) {
-      var id = k.substring('reqs_ep_'.length); // <feature>__<endpoint>
-      var cnt = metricValue(data, k, ['values','count']) || 0;
-
-      // get timing trend with the same id
-      var tname = 'time_ep_' + id;
-      var avg = metricValue(data, tname, ['values','avg']);
-      var p95 = metricValue(data, tname, ['values','p(95)']);
-      var max = metricValue(data, tname, ['values','max']);
-
-      // Split id to feature/endpoint (we assembled it as "<feature>__<endpoint>")
-      var feature = id;
-      var endpoint = '';
-      var sep = id.indexOf('__');
-      if (sep !== -1) {
-        feature = id.substring(0, sep);
-        endpoint = id.substring(sep + 2);
-      }
-
-      rows.push({
-        feature: feature.replace(/_/g, ' '),
-        endpoint: endpoint.replace(/_/g, ' '),
-        count: cnt,
-        avg: avg || 0,
-        p95: p95 || 0,
-        max: max || 0
-      });
-    }
-  }
-
-  // sort by p95 desc
-  rows.sort(function(a, b) { return (b.p95 - a.p95); });
-  return rows;
-}
-
-function renderTable(rows) {
-  if (!rows.length) {
-    return '<p style="color:#666">No per-feature data (did the runner send tags/metrics?).</p>';
-  }
-  var html = '';
-  html += '<table style="width:100%;border-collapse:collapse;margin-top:8px">';
-  html += '<thead><tr>';
-  var th = 'padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:left;background:#f7fafc;font-weight:600;';
-  html += '<th style="'+th+'">Feature</th>';
-  html += '<th style="'+th+'">Endpoint</th>';
-  html += '<th style="'+th+'">Requests</th>';
-  html += '<th style="'+th+'">Avg</th>';
-  html += '<th style="'+th+'">p(95)</th>';
-  html += '<th style="'+th+'">Max</th>';
-  html += '</tr></thead><tbody>';
-
-  for (var i=0;i<rows.length;i++) {
-    var r = rows[i];
-    html += '<tr>';
-    html += '<td style="padding:6px 8px;border-bottom:1px solid #edf2f7">'+esc(r.feature)+'</td>';
-    html += '<td style="padding:6px 8px;border-bottom:1px solid #edf2f7">'+esc(r.endpoint)+'</td>';
-    html += '<td style="padding:6px 8px;border-bottom:1px solid #edf2f7">'+esc(r.count)+'</td>';
-    html += '<td style="padding:6px 8px;border-bottom:1px solid #edf2f7">'+esc(fmtMs(r.avg))+'</td>';
-    html += '<td style="padding:6px 8px;border-bottom:1px solid #edf2f7">'+esc(fmtMs(r.p95))+'</td>';
-    html += '<td style="padding:6px 8px;border-bottom:1px solid #edf2f7">'+esc(fmtMs(r.max))+'</td>';
-    html += '</tr>';
-  }
-  html += '</tbody></table>';
-  return html;
-}
-
-function renderHtml(data) {
-  var checksPass = metricValue(data, 'checks', ['values','passes']) || 0;
-  var checksFail = metricValue(data, 'checks', ['values','fails']) || 0;
-  var reqs       = metricValue(data, 'http_reqs', ['values','count']) || 0;
-  var iters      = metricValue(data, 'iterations', ['values','count']) || 0;
-  var vusMax     = metricValue(data, 'vus_max', ['values','value']) || 0;
-
-  var lat = computeLatencyNumbers(data);
-  var maxBar = Math.max(lat.avg, lat['p95'] || lat.p95, lat.max, 1);
-  var scale = 400 / maxBar; // 400px max bar
-
-  var now = new Date().toISOString().replace('T',' ').replace(/\..+/, '');
-  var h = '';
-  h += '<!doctype html><html><head><meta charset="utf-8">';
-  h += '<title>SDLC Auto Gov Load Test - '+esc(now)+'</title>';
-  h += '<meta name="viewport" content="width=device-width, initial-scale=1">';
-  h += '</head><body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:#1a202c;margin:24px">';
-  h += '<h1 style="margin:0 0 16px 0">SDLC Auto Gov Load Test – '+esc(now)+'</h1>';
-
-  // Top table
-  h += '<table style="border-collapse:collapse;margin-bottom:16px">';
-  var cell = 'padding:8px 12px;border:1px solid #e2e8f0';
-  h += '<tr><td style="'+cell+'">Checks (pass/fail)</td><td style="'+cell+'">'+esc(checksPass)+' / '+esc(checksFail)+'</td></tr>';
-  h += '<tr><td style="'+cell+'">Requests</td><td style="'+cell+'">'+esc(reqs)+' total</td></tr>';
-  h += '<tr><td style="'+cell+'">Latency p(95)</td><td style="'+cell+'">'+esc(fmtMs(lat.p95))+'</td></tr>';
-  h += '<tr><td style="'+cell+'">Latency avg / min / max</td><td style="'+cell+'">'+esc(fmtMs(lat.avg))+' / '+esc(fmtMs(lat.min))+' / '+esc(fmtMs(lat.max))+'</td></tr>';
-  h += '<tr><td style="'+cell+'">Iterations</td><td style="'+cell+'">'+esc(iters)+'</td></tr>';
-  h += '<tr><td style="'+cell+'">VUs max</td><td style="'+cell+'">'+esc(vusMax)+'</td></tr>';
-  h += '</table>';
-
-  // Bars
-  h += '<div style="margin:8px 0 16px 0">';
-  h += '<div style="margin-bottom:6px">Latency bars</div>';
-  h += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0"><div style="width:420px;background:#edf2f7;height:10px;border-radius:3px;position:relative">'+bar(Math.max(1, Math.round(lat.avg * scale)))+'</div><div>'+esc(fmtMs(lat.avg))+' <span style="color:#718096">(avg)</span></div></div>';
-  h += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0"><div style="width:420px;background:#edf2f7;height:10px;border-radius:3px;position:relative">'+bar(Math.max(1, Math.round(lat.p95 * scale)))+'</div><div>'+esc(fmtMs(lat.p95))+' <span style="color:#718096">p(95)</span></div></div>';
-  h += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0"><div style="width:420px;background:#edf2f7;height:10px;border-radius:3px;position:relative">'+bar(Math.max(1, Math.round(lat.max * scale)))+'</div><div>'+esc(fmtMs(lat.max))+' <span style="color:#718096">max</span></div></div>';
-  h += '</div>';
-
-  // Feature/Endpoint table
-  h += '<h2 style="margin:16px 0 8px 0">Feature / Endpoint breakdown</h2>';
-  h += renderTable(summarizeEndpointRows(data));
-
-  // Raw JSON (truncated)
-  h += '<details style="margin-top:16px"><summary>Raw JSON (truncated)</summary>';
-  var json = JSON.stringify(data, null, 2);
-  if (json.length > 15000) json = json.substring(0, 15000) + '\n... (truncated)\n';
-  h += '<pre style="white-space:pre-wrap;background:#f7fafc;border:1px solid #e2e8f0;padding:12px;border-radius:6px;max-height:420px;overflow:auto">'+esc(json)+'</pre>';
-  h += '</details>';
-
-  h += '</body></html>';
+function buildHeaders(method) {
+  const h = { 'Content-Type': 'application/json' };
+  if (ENV.TOKEN) h.Authorization = `Bearer ${ENV.TOKEN}`;
+  // allow method-specific tweaks if ever needed
   return h;
 }
 
-function textSummaryMinimal(data) {
-  // extremely small text summary for stdout
-  var checksPass = metricValue(data, 'checks', ['values','passes']) || 0;
-  var checksFail = metricValue(data, 'checks', ['values','fails']) || 0;
-  var reqs       = metricValue(data, 'http_reqs', ['values','count']) || 0;
-  var lat        = computeLatencyNumbers(data);
-  var out  = '';
-  out += 'Checks: ' + checksPass + ' pass, ' + checksFail + ' fail\n';
-  out += 'Requests: ' + reqs + '\n';
-  out += 'Latency p(95): ' + fmtMs(lat.p95) + ' | avg: ' + fmtMs(lat.avg) + ' | max: ' + fmtMs(lat.max) + '\n';
-  return out;
+function overrideBase(url) {
+  if (!ENV.BASE_URL) return url;
+  try {
+    const u = new URL(url);
+    const b = new URL(ENV.BASE_URL);
+    u.protocol = b.protocol;
+    u.host = b.host;
+    return u.toString();
+  } catch (_) {
+    return url;
+  }
 }
 
-module.exports = function handleSummary(data) {
-  var files = {};
-  files['perf/k6/reports/summary.html'] = renderHtml(data);
-  files['stdout'] = textSummaryMinimal(data);
-  return files;
+// ---------------------------------
+// Select features & endpoints list
+// ---------------------------------
+const SELECTED_FEATURES =
+  (ENV.FEATURES ? ENV.FEATURES.split(',').map(s => s.trim()).filter(Boolean) : [])
+    .map(x => x.toLowerCase());
+
+const ENDPOINT_FILTER = ENV.ENDPOINT_FILTER.toLowerCase();
+
+const ALL_FEATURE_NAMES = Object.keys(ENDPOINTS_BY_FEATURE);
+
+function featureSelected(name) {
+  if (SELECTED_FEATURES.length === 0) return true;
+  return SELECTED_FEATURES.indexOf(String(name).toLowerCase()) !== -1;
+}
+
+const ENDPOINTS = [];
+for (const featureName of ALL_FEATURE_NAMES) {
+  if (!featureSelected(featureName)) continue;
+  const eps = ENDPOINTS_BY_FEATURE[featureName] || [];
+  for (const ep of eps) {
+    if (ENDPOINT_FILTER && String(ep.name || '').toLowerCase().indexOf(ENDPOINT_FILTER) === -1) {
+      continue;
+    }
+    ENDPOINTS.push({ feature: featureName, ...ep });
+  }
+}
+
+if (!ENDPOINTS.length) {
+  console.log('No endpoints selected. Check FEATURES=', ENV.FEATURES, ' and ENDPOINT_FILTER=', ENV.ENDPOINT_FILTER);
+}
+
+// ---------------------------------
+// Per-endpoint custom metrics
+// ---------------------------------
+const __CUSTOM_METRICS = {}; // name -> metric
+
+for (const ep of ENDPOINTS) {
+  const id = slug(ep.feature) + '__' + slug(ep.name || ep.url || 'endpoint');
+  ep.__metricReqs = 'reqs_ep_' + id;
+  ep.__metricTime = 'time_ep_' + id;
+
+  if (!__CUSTOM_METRICS[ep.__metricReqs]) {
+    __CUSTOM_METRICS[ep.__metricReqs] = new Counter(ep.__metricReqs);
+  }
+  if (!__CUSTOM_METRICS[ep.__metricTime]) {
+    __CUSTOM_METRICS[ep.__metricTime] = new Trend(ep.__metricTime);
+  }
+}
+
+// ---------------------------------
+// k6 options (single CAR scenario)
+// ---------------------------------
+export const options = {
+  scenarios: {
+    default: {
+      executor: 'constant-arrival-rate',
+      rate: Math.max(1, ENV.RPS),
+      timeUnit: '1s',
+      duration: ENV.DURATION,
+      preAllocatedVUs: Math.max(1, ENV.PREALLOC),
+      maxVUs: Math.max(1, ENV.MAXVUS),
+      exec: 'default',
+    },
+  },
+  thresholds: {
+    // feel free to adjust/remove
+    http_req_failed: ['rate<0.05'],
+    http_req_duration: ['p(95)<60000'], // 60s
+  },
+  // we keep tags clean; reporter uses custom metrics above
 };
+
+// round-robin pointer
+let __idx = 0;
+
+// ---------------------------------
+// Main iteration
+// ---------------------------------
+export function default() {
+  if (!ENDPOINTS.length) {
+    sleep(0.2);
+    return;
+  }
+  const ep = ENDPOINTS[(__idx++ % ENDPOINTS.length)];
+
+  const url = overrideBase(ep.url);
+  const headers = buildHeaders(ep.method || 'GET');
+  const tags = { feature: ep.feature, endpoint: ep.name || ep.url };
+
+  let res;
+  try {
+    const method = String((ep.method || 'GET')).toUpperCase();
+    if (method === 'GET') {
+      res = http.get(url, { headers, tags });
+    } else if (method === 'POST') {
+      res = http.post(url, ep.body || null, { headers, tags });
+    } else if (method === 'PUT') {
+      res = http.put(url, ep.body || null, { headers, tags });
+    } else if (method === 'PATCH') {
+      res = http.patch(url, ep.body || null, { headers, tags });
+    } else if (method === 'DELETE') {
+      res = http.del(url, null, { headers, tags });
+    } else {
+      // unknown -> GET
+      res = http.get(url, { headers, tags });
+    }
+
+    // push custom per-endpoint metrics
+    __CUSTOM_METRICS[ep.__metricReqs].add(1);
+    __CUSTOM_METRICS[ep.__metricTime].add(res.timings.duration);
+
+    // checks
+    const expectStatus = (ep.expect && ep.expect.status) ? Number(ep.expect.status) : 200;
+    const mustContain = (ep.expect && ep.expect.text) ? String(ep.expect.text) : null;
+
+    check(res, {
+      'status ok': (r) => r.status === expectStatus,
+      'body has text': (r) => {
+        if (!mustContain) return String(r.body || '').length > 0;
+        return String(r.body || '').indexOf(mustContain) !== -1;
+      },
+    }, tags);
+  } catch (e) {
+    // still count the request for visibility, and add a large duration to show as slow
+    __CUSTOM_METRICS[ep.__metricReqs].add(1);
+    __CUSTOM_METRICS[ep.__metricTime].add(60000);
+    console.error(`Request error for ${ep.feature} / ${ep.name}: ${String(e)}`);
+  }
+
+  // small think time; CAR controls throughput anyway
+  sleep(0.01);
+}
+
+// ---------------------------------
+// Summary -> vendor HTML
+// ---------------------------------
+export function handleSummary(data) {
+  // IMPORTANT: keep the relative path correct
+  return require('../vendor/handleSummary.js')(data);
+}
