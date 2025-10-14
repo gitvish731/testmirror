@@ -1,108 +1,157 @@
 /* eslint-disable no-undef */
-// perf/k6/scenarios/from-playwright.http.js
 
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-import { Counter, Trend } from 'k6/metrics';
-import { SharedArray } from 'k6/data';               // <-- FIX: was k6/experimental
+// Small helpers
+function esc(s) { return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function fmtMs(v) { return (v == null || isNaN(v)) ? '–' : `${(+v).toFixed(3)} ms`; }
+function bar(widthPct) {
+  const pct = Math.max(0, Math.min(100, widthPct || 0));
+  return `<div style="height:10px;background:#e5e7eb;border-radius:6px;"><div style="width:${pct}%;height:10px;background:#3b82f6;border-radius:6px;"></div></div>`;
+}
 
-// ---- Load endpoint catalog --------------------------------------------------
-// Keep using require() since your catalog is CommonJS (module.exports)
-const ENDPOINTS_BY_FEATURE = require('../sources/endpoints.byFeature.js');
+// Parse a metric name like: latency_ep{feature:ReportingAPI Alpha1,endpoint:lists}
+function parseTagsFromSeriesName(name) {
+  const open = name.indexOf('{');
+  const close = name.lastIndexOf('}');
+  if (open === -1 || close === -1) return null;
+  const inner = name.slice(open + 1, close);
+  const obj = {};
+  inner.split(',').forEach(kv => {
+    const p = kv.split(':');
+    const k = p[0] && p[0].trim();
+    const v = p.slice(1).join(':'); // allow ':' in values
+    if (k) obj[k] = v;
+  });
+  return obj;
+}
 
-// ---- Env/config -------------------------------------------------------------
-const FEATURES_RAW = String(__ENV.FEATURES || '').trim();
-const SELECTED = FEATURES_RAW
-  ? FEATURES_RAW.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; })
-  : Object.keys(ENDPOINTS_BY_FEATURE);
+function pick(obj, key, dflt) {
+  return (obj && Object.prototype.hasOwnProperty.call(obj, key)) ? obj[key] : dflt;
+}
 
-const VUS      = Number(__ENV.VUS || 1);
-const ITER     = Number(__ENV.ITER || 1);
-const DURATION = String(__ENV.DURATION || '');
+export default function handleSummary(data) {
+  // Always also write JSON so we can quickly inspect what k6 actually produced
+  const files = {
+    'perf/k6/reports/last.json': JSON.stringify(data, null, 2),
+  };
 
-// ---- Custom metrics for the HTML report ------------------------------------
-const REQS_EP = new Counter('reqs_ep');   // tagged {feature, endpoint}
-const LAT_EP  = new Trend('latency_ep');  // tagged {feature, endpoint}
+  const metrics = data.metrics || {};
 
-// ---- Build once, share to all VUs ------------------------------------------
-const ENDPOINTS = new SharedArray('selected endpoints', function build() {
-  var out = [];
-  var picked = Array.isArray(SELECTED) ? SELECTED : (SELECTED ? [SELECTED] : []);
+  // 1) Top tiles
+  const checksM = metrics.checks || {};
+  const checksValues = checksM.values || {};
+  const checksPass = pick(checksValues, 'passes', 0);
+  const checksFail = pick(checksValues, 'fails', 0);
 
-  for (var i = 0; i < picked.length; i++) {
-    var feature = picked[i];
-    var list = ENDPOINTS_BY_FEATURE[feature];
-    if (!Array.isArray(list)) continue;
+  const httpReqs = metrics.http_reqs || {};
+  const reqCount = pick(httpReqs.values || {}, 'count', 0);
 
-    for (var j = 0; j < list.length; j++) {
-      var ep = list[j];
-      out.push({
-        feature: feature,
-        name: String(ep.name || ''),
-        method: String(ep.method || 'GET').toUpperCase(),
-        url: String(ep.url || ''),
-        expect: ep.expect || {},            // { status, text }
-        headers: ep.headers || undefined,
-        body: (ep.body === undefined ? undefined : ep.body)
-      });
+  const httpDur = metrics.http_req_duration || {};
+  const durVals = httpDur.values || {};
+  const p95 = pick(durVals, 'p(95)', null);
+  const avg = pick(durVals, 'avg', null);
+  const min = pick(durVals, 'min', null);
+  const max = pick(durVals, 'max', null);
+
+  // 2) Aggregate per feature/endpoint from tagged series
+  const table = {}; // key: feature::endpoint => { feature, endpoint, count, avg, p95, max }
+  let sawReqs = false;
+  let sawLat = false;
+
+  for (const [name, series] of Object.entries(metrics)) {
+    if (name.startsWith('reqs_ep{')) {
+      const tags = parseTagsFromSeriesName(name);
+      if (!tags || !tags.feature || !tags.endpoint) continue;
+      const key = `${tags.feature}::${tags.endpoint}`;
+      const row = table[key] || (table[key] = { feature: tags.feature, endpoint: tags.endpoint, count: 0, avg: null, p95: null, max: null });
+      row.count += pick(series.values || {}, 'count', 0);
+      sawReqs = true;
+    } else if (name.startsWith('latency_ep{')) {
+      const tags = parseTagsFromSeriesName(name);
+      if (!tags || !tags.feature || !tags.endpoint) continue;
+      const key = `${tags.feature}::${tags.endpoint}`;
+      const row = table[key] || (table[key] = { feature: tags.feature, endpoint: tags.endpoint, count: 0, avg: null, p95: null, max: null });
+      const vals = series.values || {};
+      row.avg = pick(vals, 'avg', row.avg);
+      row.p95 = pick(vals, 'p(95)', row.p95);
+      row.max = pick(vals, 'max', row.max);
+      sawLat = true;
     }
   }
-  return out; // SharedArray requires a plain array
-});
 
-// ---- k6 options -------------------------------------------------------------
-export const options = (function () {
-  if (DURATION) {
-    return {
-      scenarios: {
-        by_time: { executor: 'constant-vus', vus: VUS, duration: DURATION }
-      },
-      thresholds: { 'http_req_failed': ['rate<0.05'] },
-      summaryTrendStats: ['avg', 'min', 'max', 'p(90)', 'p(95)']
-    };
+  // Build the HTML
+  let html = '';
+  html += `<!doctype html><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>`;
+  html += `<div style="font:14px/1.5 system-ui,Segoe UI,Roboto,Arial,sans-serif;max-width:980px;margin:24px auto;padding:0 12px;">`;
+  html += `<h1 style="margin:0 0 16px;">SDLC Auto Gov Load Test — ${new Date().toISOString().replace('T',' ').slice(0,19)}</h1>`;
+
+  // Summary tiles
+  html += `<table style="width:100%;border-collapse:collapse;margin:8px 0 16px;">
+    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Checks (pass/fail)</td><td style="padding:8px;border:1px solid #e5e7eb;">${checksPass} / ${checksFail}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Requests</td><td style="padding:8px;border:1px solid #e5e7eb;">${reqCount} total</td></tr>
+    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Latency p(95)</td><td style="padding:8px;border:1px solid #e5e7eb;">${fmtMs(p95)}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Latency avg / min / max</td><td style="padding:8px;border:1px solid #e5e7eb;">${fmtMs(avg)} / ${fmtMs(min)} / ${fmtMs(max)}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #e5e7eb;">Iterations</td><td style="padding:8px;border:1px solid #e5e7eb;">${pick(metrics.iterations?.values || {}, 'count', 0)}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #e5e7eb;">VUs max</td><td style="padding:8px;border:1px solid #e5e7eb;">${pick(metrics.vus_max?.values || {}, 'value', pick(metrics.vus_max?.values || {}, 'max', 0))}</td></tr>
+  </table>`;
+
+  // Simple latency bars
+  const scale = Math.max(1, Number(max || p95 || avg || 1));
+  html += `<div style="margin:12px 0 24px;">
+    <div style="display:grid;grid-template-columns:140px 1fr 80px;align-items:center;gap:10px;margin:6px 0;">
+      <div>avg</div><div>${bar((avg || 0) / scale * 100)}</div><div style="text-align:right">${fmtMs(avg)}</div>
+    </div>
+    <div style="display:grid;grid-template-columns:140px 1fr 80px;align-items:center;gap:10px;margin:6px 0;">
+      <div>p(95)</div><div>${bar((p95 || 0) / scale * 100)}</div><div style="text-align:right">${fmtMs(p95)}</div>
+    </div>
+    <div style="display:grid;grid-template-columns:140px 1fr 80px;align-items:center;gap:10px;margin:6px 0;">
+      <div>max</div><div>${bar((max || 0) / scale * 100)}</div><div style="text-align:right">${fmtMs(max)}</div>
+    </div>
+  </div>`;
+
+  // Feature / Endpoint table
+  html += `<h2 style="margin:24px 0 8px;">Feature / Endpoint breakdown</h2>`;
+  const rows = Object.values(table).sort((a, b) => (b.count || 0) - (a.count || 0));
+
+  if (!rows.length) {
+    const hint = (!sawReqs && !sawLat)
+      ? 'No per-feature data (did the runner emit endpoint metrics?).'
+      : 'Per-feature metrics were sparse; nothing to show.';
+    html += `<p style="color:#6b7280">${esc(hint)}</p>`;
+  } else {
+    html += `<table style="width:100%;border-collapse:collapse;margin:6px 0 18px;">
+      <thead><tr>
+        <th style="text-align:left;padding:6px;border-bottom:1px solid #e5e7eb;">Feature</th>
+        <th style="text-align:left;padding:6px;border-bottom:1px solid #e5e7eb;">Endpoint</th>
+        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">Requests</th>
+        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">Avg</th>
+        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">p(95)</th>
+        <th style="text-align:right;padding:6px;border-bottom:1px solid #e5e7eb;">Max</th>
+      </tr></thead><tbody>`;
+    for (const r of rows) {
+      html += `<tr>
+        <td style="padding:6px;border-bottom:1px solid #f3f4f6;">${esc(r.feature)}</td>
+        <td style="padding:6px;border-bottom:1px solid #f3f4f6;">${esc(r.endpoint)}</td>
+        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${r.count || 0}</td>
+        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${fmtMs(r.avg)}</td>
+        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${fmtMs(r.p95)}</td>
+        <td style="padding:6px;text-align:right;border-bottom:1px solid #f3f4f6;">${fmtMs(r.max)}</td>
+      </tr>`;
+    }
+    html += `</tbody></table>`;
   }
-  return {
-    scenarios: {
-      by_iter: { executor: 'per-vu-iterations', vus: VUS, iterations: ITER }
-    },
-    thresholds: { 'http_req_failed': ['rate<0.05'] },
-    summaryTrendStats: ['avg', 'min', 'max', 'p(90)', 'p(95)']
-  };
-})();
 
-// ---- Main iteration ---------------------------------------------------------
-export default function () {
-  if (!ENDPOINTS.length) { sleep(0.2); return; }
+  // Raw JSON (truncated)
+  const jsonShort = JSON.stringify({
+    options: data.options || {},
+    state: data.state || {},
+    metrics: Object.fromEntries(
+      Object.entries(metrics).slice(0, 30) // not to blow up the page
+    ),
+  }, null, 2);
 
-  var idx = (__ITER || 0) % ENDPOINTS.length;
-  var ep = ENDPOINTS[idx];
+  html += `<details style="margin-top:8px;"><summary>Raw JSON (truncated)</summary><pre style="white-space:pre-wrap;background:#f9fafb;padding:12px;border:1px solid #e5e7eb;border-radius:8px;">${esc(jsonShort)}</pre></details>`;
+  html += `</div>`;
 
-  var tags = { feature: ep.feature, endpoint: ep.name };
-  var params = { headers: ep.headers || {}, tags: tags };
-
-  var res;
-  switch (ep.method) {
-    case 'POST':   res = http.post(ep.url, ep.body !== undefined ? ep.body : null, params); break;
-    case 'PUT':    res = http.put(ep.url,  ep.body !== undefined ? ep.body : null, params); break;
-    case 'PATCH':  res = http.patch(ep.url,ep.body !== undefined ? ep.body : null, params); break;
-    case 'DELETE': res = http.del(ep.url,  null, params); break;
-    case 'GET':
-    default:       res = http.get(ep.url, params); break;
-  }
-
-  // custom metrics for per-feature/endpoint table
-  REQS_EP.add(1, tags);
-  LAT_EP.add(res.timings.duration, tags);
-
-  var want = ep.expect || {};
-  var mustStatus  = Number(want.status || 200);
-  var mustContain = String(want.text || '').trim();
-
-  var checks = { 'status ok': function (r) { return r.status === mustStatus; } };
-  if (mustContain) {
-    checks['body has text'] = function (r) { return String(r.body || '').indexOf(mustContain) !== -1; };
-  }
-  check(res, checks, tags);
-
-  sleep(0.2);
+  files['perf/k6/reports/summary.html'] = html;
+  return files;
 }
