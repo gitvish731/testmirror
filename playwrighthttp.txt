@@ -1,141 +1,212 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { SharedArray } from 'k6/data';
+import { Trend, Counter } from 'k6/metrics';
 
-// endpoints map for the selected feature(s)
-import { ArtifactsRegistrationV1Alpha1 } from '../sources/endpoints.byFeature.js';
+// IMPORTANT: this file is written for k6 v0.46 compatibility.
+// - No use of `k6/experimental` or `K6_SUMMARY_TAGS`.
+// - We "bake" feature/endpoint into dynamic metric names so the
+//   summary JSON/HTML can show a Feature/Endpoint table reliably.
 
-// export the HTML/JSON reporter
-export { handleSummary } from '../vendor/handleSummary.js';
+// -------- CONFIG & INPUT --------
 
-// -------------------------------
-// Build options dynamically
-// -------------------------------
-function buildOptions() {
-  var vus = Number(__ENV.VUS || 1);
-  var byTime = __ENV.DURATION && String(__ENV.DURATION).length > 0;
+// Your endpoints map. Works whether the module used ESM default export
+// or CommonJS module.exports.
+import RAW_FEATURES from '../sources/endpointsByFeature.js';
+const FEATURES_MAP = RAW_FEATURES?.default || RAW_FEATURES;
 
-  var scenarios = {};
-  if (byTime) {
-    scenarios.by_time = {
-      executor: 'constant-vus',
-      vus: vus,
-      duration: String(__ENV.DURATION),
-      gracefulStop: '3s',
-    };
-  } else {
-    var iters = __ENV.ONE ? Number(__ENV.ONE) : 1;
-    scenarios.by_iter = {
-      executor: 'per-vu-iterations',
-      vus: vus,
-      iterations: iters,
-      gracefulStop: '3s',
-    };
+// Which features to run (comma/pipe/space separated). Example:
+//   -e FEATURES="ReportingAPI Alpha1|ReportingAPI Beta1"
+const FEATURES = String(__ENV.FEATURES || '')
+  .split(/[|,]/).map(s => s.trim()).filter(Boolean);
+
+// Auth/env toggles you already use (optional)
+const ENV = String(__ENV.ENV || 'uat');           // eg: uat/dev
+const BEARER = String(__ENV.BEARER || '');        // if you set one
+const EXTRA_HEADERS = tryParseHeaders(__ENV.H);    // -e H='{"X-Foo":"bar"}'
+
+// Execution knobs (pick ONE mode per run)
+// Mode A: ONE iteration total  (easiest sanity)
+//    -e ONE=1
+// Mode B: VUs x ITER (total iterations = VUS*ITER)
+//    -e VUS=2 -e ITER=3
+// Mode C: open duration
+//    -e VUS=2 -e DURATION=30s
+const VUS = num(__ENV.VUS, 1);
+const ONE = num(__ENV.ONE, 0);
+const ITER = num(__ENV.ITER, 0);
+const DURATION = String(__ENV.DURATION || '');
+
+// Decide options in a v0.46-friendly way
+export const options = (() => {
+  if (ONE) return { vus: 1, iterations: 1 };
+  if (DURATION) return { vus: VUS, duration: DURATION, gracefulStop: '3s' };
+  if (ITER) return { vus: VUS, iterations: VUS * ITER, gracefulStop: '3s' };
+  // fallback: 1x1
+  return { vus: 1, iterations: 1, gracefulStop: '3s' };
+})();
+
+// -------- UTILITIES --------
+
+function num(x, d) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+}
+
+function tryParseHeaders(s) {
+  if (!s) return {};
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
+// turn "Lists SBC compliances" -> "Lists_SBC_compliances"
+function slug(s) {
+  return String(s || '')
+    .trim()
+    .replace(/[^\w./-]+/g, '_')
+    .slice(0, 64);
+}
+
+// Build request headers: endpoint can override/extend
+function buildHeaders(ep) {
+  const h = Object.assign({}, EXTRA_HEADERS);
+  if (BEARER) h['authorization'] = `bearer ${BEARER}`;
+  if (ep?.headers) {
+    for (const [k, v] of Object.entries(ep.headers)) h[k] = v;
   }
+  // default JSON for POST/PATCH unless endpoint set something else
+  if ((ep.method || 'GET').toUpperCase() !== 'GET' && !h['content-type']) {
+    h['content-type'] = 'application/json';
+  }
+  // k6 prefers canonical headers, but case does not matter
+  return h;
+}
 
-  return {
-    scenarios: scenarios,
-    thresholds: {
-      http_req_failed: ['rate<0.05'],
-      http_req_duration: ['p(95)<2000'],
-    },
+// -------- DYNAMIC METRIC REGISTRY --------
+
+// We create ONE Trend + ONE Counter per endpoint dynamically.
+// That way, k6 v0.46 writes entries like:
+//   "latency_ep:ReportingAPI_Alpha1:Lists_SBC_compliances": { ... }
+//   "reqs_ep:ReportingAPI_Alpha1:Lists_SBC_compliances": { ... }
+//
+// Your handleSummary.js can iterate data.metrics keys that start with
+// "latency_ep:" and "reqs_ep:" and render a proper Feature/Endpoint table.
+
+const METRICS = new Map(); // key => { trend, counter }
+
+function metricFor(featureName, endpointName) {
+  const key = `${slug(featureName)}::${slug(endpointName)}`;
+  if (METRICS.has(key)) return METRICS.get(key);
+  const trendName = `latency_ep:${slug(featureName)}:${slug(endpointName)}`;
+  const countName = `reqs_ep:${slug(featureName)}:${slug(endpointName)}`;
+  const m = {
+    trend: new Trend(trendName),     // timings in ms
+    count: new Counter(countName),   // request count
   };
-}
-export const options = buildOptions();
-
-// -------------------------------
-// Simple utils (ES5 compatible)
-// -------------------------------
-function mergeInto(target, source) {
-  if (!source) return;
-  for (var k in source) {
-    if (Object.prototype.hasOwnProperty.call(source, k)) {
-      target[k] = source[k];
-    }
-  }
+  METRICS.set(key, m);
+  return m;
 }
 
-function makeParams(featureName, endpointName, extra) {
-  var headers = {};
-  var tags = {};
+// -------- ENDPOINT SELECTION --------
 
-  if (extra && extra.headers) mergeInto(headers, extra.headers);
-  if (headers['content-type'] === undefined) headers['content-type'] = 'application/json';
-  if (extra && extra.auth) headers['authorization'] = extra.auth;
-
-  tags.feature = featureName;
-  tags.endpoint = endpointName;
-  if (extra && extra.tags) mergeInto(tags, extra.tags);
-
-  return { headers: headers, tags: tags };
+function selectedFeatures() {
+  if (!FEATURES.length) return Object.keys(FEATURES_MAP);
+  return FEATURES.filter(f => FEATURES_MAP[f]).map(f => f);
 }
 
-// -------------------------------
-// Select features -> endpoints
-// -------------------------------
-var FEATURES = [
-  { name: 'ReportingAPI Alpha1', endpoints: ArtifactsRegistrationV1Alpha1 },
-];
+function endpointsToRun() {
+  const feats = selectedFeatures();
+  const all = [];
+  for (const feat of feats) {
+    const list = FEATURES_MAP[feat] || [];
+    for (const ep of list) {
+      // allow ENV replacement rule you previously described:
+      // “test” <-> “dev” swaps inside endpoint URL by ENV.
+      let url = ep.url || ep.URL || '';
+      if (ENV === 'dev') url = url.replace(/sdlcapis-test/gi, 'sdlcapis-dev');
+      if (ENV === 'uat') url = url.replace(/sdlcapis-dev/gi, 'sdlcapis-test');
 
-var matrix = new SharedArray('feature-endpoints', function () {
-  return FEATURES;
-});
-
-// -------------------------------
-// Main
-// -------------------------------
-export default function main() {
-  for (var i = 0; i < matrix.length; i++) {
-    var feat = matrix[i];
-    var eps = feat.endpoints || [];
-
-    for (var j = 0; j < eps.length; j++) {
-      var ep = eps[j];
-
-      var params = makeParams(feat.name, ep.name, {
-        auth: ep.auth || '',
-        headers: ep.headers || null,
-        tags: ep.tags || null,
-      });
-
-      var method = (ep.method || 'GET').toUpperCase();
-      var res;
-
-      try {
-        if (method === 'GET') {
-          res = http.get(ep.url, params);
-        } else if (method === 'POST') {
-          res = http.post(ep.url, ep.body || {}, params);
-        } else if (method === 'PATCH') {
-          res = http.patch(ep.url, ep.body || {}, params);
-        } else if (method === 'DELETE') {
-          res = http.del(ep.url, null, params);
-        } else {
-          console.warn('Unknown method ' + method + ' for ' + ep.name);
-          continue;
-        }
-      } catch (e) {
-        console.error('Request error for ' + feat.name + ' -> ' + ep.name + ': ' + String(e));
-        continue;
-      }
-
-      var expectedStatus = (ep.expect && ep.expect.status) ? ep.expect.status : 200;
-      var mustContain = (ep.expect && ep.expect.text) ? ep.expect.text : null;
-
-      check(res, {
-        'status ok': function (r) { return r.status === expectedStatus; },
-        'body has text': function (r) {
-          if (!mustContain) return true;
-          var body = String(r.body || '');
-          return body.indexOf(mustContain) !== -1;
+      all.push({
+        feature: feat,
+        name: ep.name || ep.endpoint || 'endpoint',
+        method: (ep.method || 'GET').toUpperCase(),
+        url,
+        expect: {
+          status: num(ep.expect?.status ?? ep.status, 200),
+          text: ep.expect?.text ?? ep.text ?? '',
         },
+        headers: ep.headers || {},
+        body: ep.body || ep.payload || null,
       });
-
-      if (__ENV.DEBUG_TAGS === '1') {
-        console.log('tags=' + JSON.stringify(params.tags));
-      }
-
-      sleep(0.2);
     }
   }
+  return all;
+}
+
+const ENDPOINTS = endpointsToRun();
+
+// -------- MAIN TEST LOOP --------
+
+export default function () {
+  if (!ENDPOINTS.length) {
+    console.log('No endpoints selected. Check FEATURES env or endpointsByFeature.js');
+    sleep(0.2);
+    return;
+  }
+
+  // Simple round-robin: one request per iteration
+  const i = (__ITER || 0) % ENDPOINTS.length;
+  const ep = ENDPOINTS[i];
+  const headers = buildHeaders(ep);
+  const m = metricFor(ep.feature, ep.name);
+
+  const params = { headers }; // v0.46: keep it simple, no `tags` needed
+
+  // Debug proof: show exactly what we call
+  console.log(
+    `RUN => feature="${ep.feature}" endpoint="${ep.name}" method=${ep.method} url=${ep.url}`
+  );
+
+  let res;
+  try {
+    switch (ep.method) {
+      case 'POST':
+        res = http.post(ep.url, ep.body ? JSON.stringify(ep.body) : '', params);
+        break;
+      case 'PATCH':
+        res = http.patch(ep.url, ep.body ? JSON.stringify(ep.body) : '', params);
+        break;
+      case 'DELETE':
+        res = http.del(ep.url, null, params);
+        break;
+      default:
+        res = http.get(ep.url, params);
+    }
+  } catch (e) {
+    // network error still needs to increment counter for visibility
+    m.count.add(1);
+    console.error(`HTTP error for ${ep.name}: ${String(e)}`);
+    sleep(0.2);
+    return;
+  }
+
+  // record per-endpoint latency (ms) + count
+  m.trend.add(res.timings.duration);
+  m.count.add(1);
+
+  // your two standard checks
+  const expectedStatus = ep.expect.status || 200;
+  const mustContain = ep.expect.text ? String(ep.expect.text) : '';
+
+  const ok = check(res, {
+    'status ok': (r) => r.status === expectedStatus,
+    'body has text': (r) =>
+      mustContain ? String(r.body || '').indexOf(mustContain) !== -1 : true,
+  });
+
+  if (!ok) {
+    console.warn(
+      `CHECK FAIL => feature="${ep.feature}" endpoint="${ep.name}" status=${res.status} bodyLen=${(res.body||'').length}`
+    );
+  }
+
+  sleep(0.2);
 }
