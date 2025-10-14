@@ -1,304 +1,52 @@
-// Simple in-memory aggregator for per-feature/endpoint stats (Goja-safe)
-var store = Object.create(null); // { feature: { endpoint: { durs:[], count, ok, min, max, sum } } }
+// perf/k6/vendor/accumulator.js
+/* eslint-disable */
+
+// --- Global singleton (works even if required from different paths/files) ---
+var G = (typeof globalThis !== 'undefined') ? globalThis : this;
+if (!G.__ACC_SINGLETON__) {
+  G.__ACC_SINGLETON__ = { store: Object.create(null) };
+}
+var STORE = G.__ACC_SINGLETON__.store;
+
+// Cap samples per endpoint to avoid memory blowups
+var CAP = 2000;
 
 function ensure(feat, ep) {
-  if (!store[feat]) store[feat] = Object.create(null);
-  if (!store[feat][ep]) store[feat][ep] = { durs: [], count: 0, ok: 0, min: null, max: null, sum: 0 };
-  return store[feat][ep];
+  if (!feat) feat = 'unknown_feature';
+  if (!ep) ep = 'unknown_endpoint';
+  if (!STORE[feat]) STORE[feat] = Object.create(null);
+  if (!STORE[feat][ep]) {
+    STORE[feat][ep] = { durs: [], count: 0, ok: 0, min: null, max: null, sum: 0 };
+  }
+  return STORE[feat][ep];
 }
-
-// cap how many samples we keep per endpoint (memory safety)
-var CAP = 2000;
 
 function add(feat, ep, ms, passed) {
   var node = ensure(feat, ep);
   node.count += 1;
   if (passed) node.ok += 1;
-  node.sum += ms;
-  if (node.min === null || ms < node.min) node.min = ms;
-  if (node.max === null || ms > node.max) node.max = ms;
-  if (node.durs.length < CAP) node.durs.push(ms);
+  var x = Number(ms) || 0;
+  node.sum += x;
+  if (node.min === null || x < node.min) node.min = x;
+  if (node.max === null || x > node.max) node.max = x;
+  if (node.durs.length < CAP) node.durs.push(x);
 }
 
-function snapshot() { return store; }
+function snapshot() {
+  return STORE;
+}
 
 module.exports = { add: add, snapshot: snapshot };
 
-//----------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------
 
-/* eslint-disable */
-var path = 'perf/k6/reports/summary.html';
-var x = require('./k6-text-summary-lite.js');     // existing tty text block (we still print it)
-var acc = require('./accumulator.js');            // our in-memory stats
-
-function fmt(n) { return (Math.round(n * 1000) / 1000) + ' ms'; }
-function safe(n) { return typeof n === 'number' && isFinite(n) ? n : 0; }
-
-function p95From(arr) {
-  if (!arr || !arr.length) return 0;
-  var a = arr.slice(0).sort(function (a, b) { return a - b; });
-  var idx = Math.floor(0.95 * (a.length - 1));
-  if (idx < 0) idx = 0;
-  return a[idx];
-}
-
-function renderTable() {
-  var snap = acc.snapshot();
-  var feats = Object.keys(snap);
-  if (!feats.length) {
-    return '<p><em>No per-feature data (did the runner call accumulator.add()?).</em></p>';
-  }
-
-  var html = '';
-  for (var i = 0; i < feats.length; i++) {
-    var f = feats[i];
-    var eps = snap[f];
-    var names = Object.keys(eps);
-    html += '<h3 style="margin-top:24px">' + f + '</h3>';
-    html += '<table style="width:100%;border-collapse:collapse" border="1" cellpadding="6">';
-    html += '<tr><th align="left">Endpoint</th><th align="right">Requests</th><th align="right">Pass%</th><th align="right">Avg</th><th align="right">p95</th><th align="right">Min</th><th align="right">Max</th></tr>';
-    for (var j = 0; j < names.length; j++) {
-      var epn = names[j];
-      var n = eps[epn];
-      var avg = n.count ? n.sum / n.count : 0;
-      var p95 = p95From(n.durs);
-      var passPct = n.count ? (100 * n.ok / n.count) : 0;
-      html += '<tr>' +
-        '<td>' + epn + '</td>' +
-        '<td align="right">' + n.count + '</td>' +
-        '<td align="right">' + (Math.round(passPct * 10) / 10) + '%</td>' +
-        '<td align="right">' + fmt(safe(avg)) + '</td>' +
-        '<td align="right">' + fmt(safe(p95)) + '</td>' +
-        '<td align="right">' + fmt(safe(n.min)) + '</td>' +
-        '<td align="right">' + fmt(safe(n.max)) + '</td>' +
-      '</tr>';
-    }
-    html += '</table>';
-  }
-  return html;
-}
-
-function htmlShell(title, head, body) {
-  return '<!doctype html><html><head><meta charset="utf-8"><title>' + title +
-    '</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}' +
-    'table{font-size:14px;background:#fff}th{background:#f5f6f8}</style>' + head + '</head><body>' + body + '</body></html>';
-}
-
-function topPanel(data) {
-  // basic top metrics
-  var m = data.metrics || {};
-  var http = m['http_req_duration'] || { values: {} };
-  var p95 = safe(http.values['p(95)'] || 0);
-  var avg = safe(http.values.avg || 0);
-  var min = safe(http.values.min || 0);
-  var max = safe(http.values.max || 0);
-
-  var reqs = m['http_reqs'] && m['http_reqs'].values ? (m['http_reqs'].values.count || 0) : 0;
-  var iters = m['iterations'] && m['iterations'].values ? (m['iterations'].values.count || 0) : 0;
-  var vusmax = m['vus_max'] && m['vus_max'].values ? (m['vus_max'].values.value || 0) : 0;
-
-  // checks
-  var checks = m['checks'] && m['checks'].values ? (m['checks'].values.passes || 0) : 0;
-  var fails = m['checks'] && m['checks'].values ? (m['checks'].values.fails || 0) : 0;
-
-  var out = '';
-  out += '<h1>SDLC Auto Gov Load Test – ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + '</h1>';
-  out += '<table style="width:520px;border-collapse:collapse" border="1" cellpadding="6">';
-  out += '<tr><td>Checks (pass/fail)</td><td>' + checks + ' / ' + fails + '</td></tr>';
-  out += '<tr><td>Requests</td><td>' + reqs + ' total</td></tr>';
-  out += '<tr><td>Latency p(95)</td><td>' + fmt(p95) + '</td></tr>';
-  out += '<tr><td>Latency avg / min / max</td><td>' + fmt(avg) + ' / ' + fmt(min) + ' / ' + fmt(max) + '</td></tr>';
-  out += '<tr><td>Iterations</td><td>' + iters + '</td></tr>';
-  out += '<tr><td>VUs max</td><td>' + vusmax + '</td></tr>';
-  out += '</table>';
-  return out;
-}
+// inside handleSummary.js
+var acc = require('./accumulator.js');
 
 function handleSummary(data) {
-  // keep the pretty tty output too
-  var text = x && typeof x.extSummary === 'function' ? x.extSummary(data) : '';
-
-  var body = topPanel(data) +
-             '<h2 style="margin-top:28px">Feature / Endpoint breakdown</h2>' +
-             renderTable() +
-             '<h3 style="margin-top:28px">Raw JSON (truncated)</h3>' +
-             '<pre style="white-space:pre-wrap;font-size:12px;background:#f8f9fb;padding:12px;border:1px solid #eee;max-height:420px;overflow:auto">' +
-             JSON.stringify(data, null, 2).slice(0, 25000) + '</pre>';
-
-  var html = htmlShell('SDLC Auto Gov Load Test', '', body);
-
-  var out = { stdout: text };
-  out[path] = html;
-  return out;
+  // ...
+  var snap = acc.snapshot();
+  var feats = Object.keys(snap);
+  console.log(`[k6] handleSummary: features seen in accumulator = ${feats.length} -> ${feats.join(', ')}`);
+  // ...
 }
-
-exports.handleSummary = handleSummary;
-module.exports = handleSummary;
-
-//------------------------------------------------------------------------------------------------------------------
-
-/* eslint-disable */
-const http = require('k6/http');
-const { check, sleep } = require('k6');
-const { Counter, Trend } = require('k6/metrics');
-const hs = require('../vendor/handleSummary.js');        // HTML summary
-const acc = require('../vendor/accumulator.js');         // <— NEW: per-endpoint aggregator
-
-// ---------- Env ----------
-const ENV = (__ENV.ENV || 'dev').toLowerCase();
-const FEATURES_RAW = (__ENV.FEATURES || '').trim();
-const ENDPOINT_FILTER = (__ENV.ENDPOINT_FILTER || '').trim();
-const DURATION = __ENV.DURATION || '30s';
-const RPS = Number(__ENV.RPS || 1);
-const PREALLOC = Number(__ENV.PREALLOC || 5);
-const MAXVUS = Number(__ENV.MAXVUS || 35);
-const BASE_URL_OVERRIDE = (__ENV.BASE_URL || '').trim();
-const TOKEN = (__ENV.TOKEN || '').trim();
-
-// ---------- Load endpoints map ----------
-function loadMap() {
-  const raw = open('../sources/endpoints.byFeature.json');
-  return JSON.parse(raw);
-}
-const ENDPOINTS_BY_FEATURE = loadMap();
-
-// ---------- Select features ----------
-const ALL_FEATURES = Object.keys(ENDPOINTS_BY_FEATURE || {});
-const SELECTED_FEATURES = FEATURES_RAW
-  ? FEATURES_RAW.split(',').map(s => s.trim()).filter(Boolean)
-  : ALL_FEATURES;
-
-// ---------- Optional endpoint filter ----------
-let FILTER_RE = null;
-if (ENDPOINT_FILTER) {
-  try { FILTER_RE = new RegExp(ENDPOINT_FILTER, 'i'); } catch (_) { FILTER_RE = null; }
-}
-
-// ---------- Flatten selection ----------
-let ENDPOINTS = [];
-for (const feat of SELECTED_FEATURES) {
-  const list = ENDPOINTS_BY_FEATURE[feat];
-  if (!list || !list.length) continue;
-  for (const ep of list) {
-    const nameStr = String(ep.name || '');
-    const matches = FILTER_RE ? FILTER_RE.test(nameStr) : true;
-    if (!matches) continue;
-    ENDPOINTS.push({
-      feature: feat,
-      url: ep.url,
-      method: ep.method || 'GET',
-      body: ep.body,
-      expectStatus: ep.expectStatus,
-      expectBodyContains: ep.expectBodyContains,
-      name: ep.name
-    });
-  }
-}
-
-console.log(
-  `[k6] Selected ${ENDPOINTS.length} endpoint(s) across FEATURES=[${SELECTED_FEATURES.join(', ')}], FILTER=${ENDPOINT_FILTER || 'none'}`
-);
-if (!ENDPOINTS.length) {
-  console.error('[k6] No endpoints selected. Available features: ' + ALL_FEATURES.join(', '));
-}
-
-// ---------- k6 options ----------
-export const options = ENDPOINTS.length
-  ? {
-      scenarios: {
-        default: {
-          executor: 'constant-arrival-rate',
-          rate: RPS,
-          timeUnit: '1s',
-          duration: DURATION,
-          preAllocatedVUs: PREALLOC,
-          maxVUs: Math.max(PREALLOC, MAXVUS),
-        },
-      },
-      thresholds: {
-        'http_req_duration{expected_response:true}': ['p(95) < 60000'],
-      },
-    }
-  : { scenarios: {} };
-
-// ---------- Custom metrics (still useful globally) ----------
-const reqs_ep = new Counter('reqs_ep');
-const latency_ep = new Trend('latency_ep');
-const checks_ep = new Counter('checks_ep');
-
-// ---------- Helpers ----------
-function buildHeaders(method) {
-  const h = { Accept: 'application/json' };
-  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
-  return h;
-}
-function resolveUrl(sourceUrl) {
-  if (!BASE_URL_OVERRIDE) return sourceUrl;
-  try {
-    const src = new URL(sourceUrl);
-    const base = new URL(BASE_URL_OVERRIDE);
-    base.pathname = src.pathname;
-    base.search = src.search;
-    return base.toString();
-  } catch (_) { return sourceUrl; }
-}
-let rr = 0; // round-robin index
-
-// ---------- Main iteration ----------
-export default function () {
-  if (!ENDPOINTS.length) { sleep(0.2); return; }
-
-  const ep = ENDPOINTS[rr++ % ENDPOINTS.length];
-  const tags = { feature: ep.feature, endpoint: String(ep.name || 'unknown') };
-
-  const url = resolveUrl(ep.url);
-  const headers = buildHeaders(ep.method);
-
-  let res;
-  try {
-    const m = String(ep.method || 'GET').toUpperCase();
-    if (m === 'GET')        res = http.get(url, { headers, tags });
-    else if (m === 'POST')  res = http.post(url, ep.body || null, { headers, tags });
-    else if (m === 'PUT')   res = http.put(url, ep.body || null, { headers, tags });
-    else if (m === 'PATCH') res = http.patch(url, ep.body || null, { headers, tags });
-    else if (m === 'DELETE')res = http.del(url, null, { headers, tags });
-    else                    res = http.get(url, { headers, tags });
-  } catch (e) {
-    reqs_ep.add(1, tags);
-    latency_ep.add(0, tags);
-    checks_ep.add(0, tags);
-    acc.add(tags.feature, tags.endpoint, 0, false);   // <— record failure
-    sleep(0.2);
-    return;
-  }
-
-  const dur = (res.timings && res.timings.duration) ? res.timings.duration : 0;
-  reqs_ep.add(1, tags);
-  latency_ep.add(dur, tags);
-
-  const expectStatus = Number(ep.expectStatus || 200);
-  const expectBody = ep.expectBodyContains || null;
-
-  // Goja-safe checks object (no object spread)
-  const checksObj = {
-    'status ok': r => r.status === expectStatus
-  };
-  if (expectBody) {
-    checksObj['body has text'] = r => String(r.body || '').indexOf(expectBody) !== -1;
-  }
-
-  const ok = check(res, checksObj, tags);
-  checks_ep.add(ok ? 1 : 0, tags);
-
-  // <— NEW: feed accumulator so the HTML can render per feature/endpoint
-  acc.add(tags.feature, tags.endpoint, dur, ok);
-
-  sleep(0.2);
-}
-
-// ---------- HTML summary ----------
-export function handleSummary(data) {
-  const fn = hs && (hs.handleSummary || (typeof hs === 'function' ? hs : null));
-  return fn ? fn(data) : {};
-}
-
