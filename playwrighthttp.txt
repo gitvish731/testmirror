@@ -4,7 +4,7 @@
 const features = {
   "": [
     {
-      name: "Lists_SBC_compliances for all found Release Registrations",
+      name: "Lists_Registrations",
       method: "GET",
       url: "https://",
       // optional helpers (won’t break anything if your runner ignores them)
