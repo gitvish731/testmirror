@@ -1,39 +1,37 @@
 /* eslint-disable */
-// k6 runner that sends per-request tags + pushes feature/endpoint stats to vendor/accumulator.js
+
+// k6 runner that emits per-request tags and pushes data into vendor/accumulator
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.4/index.js'; // harmless in case you still want tty summary
+import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.4/index.js';
 
-// ---- local (vendor) helpers -------------------------------------------------
-const ACC = require('../vendor/accumulator.js');           // <— your accumulator
-const handleSummary = require('../vendor/handleSummary.js'); // <— HTML reporter (exports a function)
+// ---- local vendor helpers (CommonJS) ---------------------------------------
+const ACC = require('../vendor/accumulator.js');          // must export add(feature, endpoint, durMs, ok) and snapshot()
+const vendorSummary = require('../vendor/handleSummary.js'); // must export function (data) -> { 'reports/summary.html': html }
 
-// ---- config from ENV (k6 -e NAME=value) ------------------------------------
-const ENV = (__ENV.ENV || 'dev').toLowerCase();            // dev / uat
-const BASE_URL = (__ENV.BASE_URL || '').trim();            // optional override
-const TOKEN = (__ENV.TOKEN || '').trim();                  // optional bearer token
+// ---- ENV -------------------------------------------------------------------
+const ENV = (__ENV.ENV || 'dev').toLowerCase();
+const BASE_URL = (__ENV.BASE_URL || '').trim();
+const TOKEN = (__ENV.TOKEN || '').trim();
 
-const FEATURES_RAW = (__ENV.FEATURES || '').trim();        // comma list, e.g. "ReportingAPI_Alpha1"
-const ENDPOINT_FILTER = (__ENV.ENDPOINT_FILTER || '').trim(); // optional substring match
+const FEATURES_RAW = (__ENV.FEATURES || '').trim();          // comma list or empty for all
+const ENDPOINT_FILTER = (__ENV.ENDPOINT_FILTER || '').trim(); // substring filter (optional)
 
-// optional tunables
 const DURATION = Number(__ENV.DURATION || '20'); // seconds
-const RPS      = Number(__ENV.RPS      || '1');  // per endpoint constant-arrival-rate
+const RPS      = Number(__ENV.RPS      || '1');
 const PREALLOC = Number(__ENV.PREALLOC || '5');
 const MAXVUS   = Number(__ENV.MAXVUS   || '35');
 
-// ---- load endpoints map -----------------------------------------------------
-// We read the JSON file your generator creates.
+// ---- endpoints map ---------------------------------------------------------
 const ENDPOINTS_BY_FEATURE = JSON.parse(open('../sources/endpoints.byFeature.json'));
 
-// small util
-function slug(s) { return String(s || '').replace(/\s+/g, '_'); }
-
-// ---- select endpoints by requested features ---------------------------------
+// ---- util ------------------------------------------------------------------
 function allFeatures() {
   const keys = Object.keys(ENDPOINTS_BY_FEATURE || {});
-  return (FEATURES_RAW ? FEATURES_RAW.split(',') : keys).map(s => s.trim()).filter(Boolean);
+  return (FEATURES_RAW ? FEATURES_RAW.split(',') : keys)
+    .map(s => String(s).trim())
+    .filter(Boolean);
 }
 
 function selectEndpoints(features) {
@@ -42,18 +40,17 @@ function selectEndpoints(features) {
     const feature = features[i];
     const list = ENDPOINTS_BY_FEATURE[feature] || [];
     for (let j = 0; j < list.length; j++) {
-      const ep = list[j]; // { name, method, url, expectStatus, mustContain?, headers? }
+      const ep = list[j];
       if (ENDPOINT_FILTER && String(ep.name).indexOf(ENDPOINT_FILTER) === -1) continue;
-      out.push({ feature, ep });
+      out.push({ feature, ep }); // { feature, ep:{ name, method, url, expectStatus, mustContain, body } }
     }
   }
   return out;
 }
 
-// ---- headers / url helpers --------------------------------------------------
 function buildHeaders(method) {
-  const h = { 'accept': 'application/json' };
-  if (TOKEN) h['authorization'] = 'Bearer ' + TOKEN;
+  const h = { accept: 'application/json' };
+  if (TOKEN) h.authorization = 'Bearer ' + TOKEN;
   if (method && method !== 'GET' && method !== 'DELETE') {
     h['content-type'] = 'application/json';
   }
@@ -61,8 +58,7 @@ function buildHeaders(method) {
 }
 
 function resolveURL(rawUrl) {
-  // If a full absolute URL is already provided, use it. Else prepend BASE URL (ENV specific).
-  try { new URL(rawUrl); return rawUrl; } catch (_) { /* not absolute */ }
+  try { new URL(rawUrl); return rawUrl; } catch (_) {}
   let base = BASE_URL;
   if (!base) {
     base = (ENV === 'uat')
@@ -74,41 +70,35 @@ function resolveURL(rawUrl) {
   return base + rawUrl;
 }
 
-// ---- request wrapper that ALWAYS tags + pushes to ACC -----------------------
+// ---- request wrapper (no spread syntax) ------------------------------------
 function fire(method, url, body, params, feature, endpoint, expectStatus, mustContain) {
   const tags = { feature: String(feature), endpoint: String(endpoint) };
   const p = Object.assign({}, params || {}, { tags, headers: buildHeaders(method) });
 
   const t0 = Date.now();
-  let res;
-  if (method === 'GET') {
-    res = http.get(url, p);
-  } else if (method === 'DELETE') {
-    res = http.del(url, null, p);
-  } else if (method === 'PATCH') {
-    res = http.patch(url, body || '', p);
-  } else if (method === 'PUT') {
-    res = http.put(url, body || '', p);
-  } else { // POST / fallback
-    res = http.post(url, body || '', p);
-  }
 
-  // checks (these are standard k6 'checks' so the global numbers still work)
-  const ok = check(res, {
-    'status ok': (r) => r.status === (expectStatus || 200),
-    ...(mustContain
-      ? { 'body has text': (r) => String(r.body || '').indexOf(String(mustContain)) !== -1 }
-      : {})
-  }, tags);
+  let res;
+  if (method === 'GET') res = http.get(url, p);
+  else if (method === 'DELETE') res = http.del(url, null, p);
+  else if (method === 'PATCH') res = http.patch(url, body || '', p);
+  else if (method === 'PUT') res = http.put(url, body || '', p);
+  else res = http.post(url, body || '', p);
+
+  // build checks without object spread
+  const checks = {};
+  checks['status ok'] = (r) => r.status === (expectStatus || 200);
+  if (mustContain) {
+    checks['body has text'] = (r) => String(r.body || '').indexOf(String(mustContain)) !== -1;
+  }
+  const ok = check(res, checks, tags);
 
   const dur = Date.now() - t0;
-  // push to our in-memory accumulator for the HTML "Feature / Endpoint" table
   try { ACC.add(feature, endpoint, dur, !!ok); } catch (_) {}
 
   return res;
 }
 
-// ---- build scenarios (one per selected endpoint) ----------------------------
+// ---- scenarios --------------------------------------------------------------
 const FEATURE_LIST = allFeatures();
 const SELECTED = selectEndpoints(FEATURE_LIST);
 
@@ -122,45 +112,34 @@ for (let i = 0; i < SELECTED.length; i++) {
     duration: `${DURATION}s`,
     preAllocatedVUs: PREALLOC,
     maxVUs: MAXVUS,
-    tags: { feature: SELECTED[i].feature, endpoint: SELECTED[i].ep.name }
+    tags: { feature: SELECTED[i].feature, endpoint: SELECTED[i].ep.name },
   };
 }
 
 export const options = {
   scenarios,
   thresholds: {
-    // keep something simple; adjust later
-    'http_req_failed': ['rate<0.05']
+    'http_req_failed': ['rate<0.05'],
   },
 };
 
-// ---- main iteration ---------------------------------------------------------
+// ---- main -------------------------------------------------------------------
 export default function () {
-  // round-robin over endpoints so each scenario instance hits all (cheap & simple)
   for (let i = 0; i < SELECTED.length; i++) {
     const { feature, ep } = SELECTED[i];
     const url = resolveURL(ep.url);
-    fire(
-      (ep.method || 'GET').toUpperCase(),
-      url,
-      ep.body ? JSON.stringify(ep.body) : '',
-      {},                    // extra k6 params if you want to pass
-      feature,
-      ep.name,
-      ep.expectStatus || 200,
-      ep.mustContain || null
-    );
+    const method = String(ep.method || 'GET').toUpperCase();
+    const body = ep.body ? JSON.stringify(ep.body) : '';
+    fire(method, url, body, {}, feature, ep.name, ep.expectStatus || 200, ep.mustContain || null);
   }
   sleep(1);
 }
 
-// ---- HTML summary writer (keeps tty text too) -------------------------------
+// ---- summary ---------------------------------------------------------------
 export function handleSummary(data) {
-  // fall back to textSummary for console if vendor file missing
-  if (typeof handleSummary === 'function' && handleSummary !== undefined && handleSummary.name) {
-    try { return handleSummary(data); } catch (_) {}
+  // prefer vendor HTML; fall back to text summary
+  if (vendorSummary && typeof vendorSummary === 'function') {
+    try { return vendorSummary(data); } catch (_) { /* fall back */ }
   }
-  return {
-    stdout: textSummary(data, { indent: ' ', enableColors: true }),
-  };
+  return { stdout: textSummary(data, { indent: ' ', enableColors: true }) };
 }
