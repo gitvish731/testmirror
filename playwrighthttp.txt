@@ -1,159 +1,116 @@
-// perf/k6/scenarios/from-playwright.http.min.js
-// Minimal runner (k6 v0.46 compatible) + vendor handleSummary + feature/endpoint tagging
+// perf/k6/vendor/handleSummary.js
+// k6 v0.46-safe summary writer (no template literals, no JSX-like strings)
 
-import http from 'k6/http';
-import { sleep, check } from 'k6';
-import features from '../sources/endpoints.byFeature.js';
-import handleSummary from '../vendor/handleSummary.js'; // <— use the enhanced summary
+function esc(s) {
+  if (s == null) return "";
+  s = String(s);
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
-// ---------- ENV / CLI switches ----------
-// Examples:
-//   k6 run perf/k6/scenarios/from-playwright.http.min.js -e VUS=2 -e ITER=2 -e FEATURES='ReportingAPI Alpha1' -e ENV=uat
-//   k6 run perf/k6/scenarios/from-playwright.http.min.js -e VUS=2 -e DURATION=10s -e FEATURES='ReportingAPI Alpha1' -e ENV=uat
-const RAW_FEATURES = (__ENV.FEATURES || '').trim();
-const SELECTED_FEATURES = RAW_FEATURES
-  ? RAW_FEATURES.split(',').map(s => s.trim()).filter(Boolean)
-  : Object.keys(features); // default: all feature keys
+function asTable(title, rows) {
+  if (!rows || !rows.length) {
+    return [
+      '<h3 style="margin-top:14px;">', esc(title), '</h3>',
+      '<div class="mono">No ', esc(title.toLowerCase()), ' recorded.</div>'
+    ].join("");
+  }
+  var out = [];
+  out.push('<h3 style="margin-top:14px;">', esc(title), '</h3>');
+  out.push('<table style="border-collapse:collapse;width:100%;">');
+  out.push('<thead><tr>',
+           '<th style="text-align:left;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Name</th>',
+           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Requests</th>',
+           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Avg latency</th>',
+           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">p(95)</th>',
+           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">max</th>',
+           '</tr></thead><tbody>');
+  for (var i = 0; i < rows.length; i += 1) {
+    var r = rows[i];
+    out.push('<tr>',
+      '<td style="padding:6px 8px;border-bottom:1px solid #f1f1f1;">', esc(r.name), '</td>',
+      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', String(r.count || 0), '</td>',
+      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.avg || 0), ' ms</td>',
+      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.p95 || 0), ' ms</td>',
+      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.max || 0), ' ms</td>',
+    '</tr>');
+  }
+  out.push('</tbody></table>');
+  return out.join("");
+}
 
-const VUS = Number(__ENV.VUS || '1');
-const ITER = __ENV.ITER ? Number(__ENV.ITER) : null;
-const DURATION = (__ENV.DURATION || '').trim(); // e.g. "10s"
+export default function handleSummary(data) {
+  // We’ll read pre-aggregated accumulators if your runner provided them.
+  // Expecting shape: data.acc.byFeature[featureName] = { count, avg, p95, max }
+  // and data.acc.byEndpoint[endpointName] = { count, avg, p95, max }
+  var acc = (data && data.acc) ? data.acc : { byFeature: {}, byEndpoint: {} };
 
-// Optional base URL/env tweak (no-op unless you want to use it in URLs)
-const ENV = (__ENV.ENV || '').trim(); // "uat" | "dev" | etc.
-
-// ---------- Build endpoint list from features map ----------
-/*
-Expected shape in ../sources/endpoints.byFeature.js:
-export default {
-  "ReportingAPI Alpha1": [
-    {
-      name: "Lists SBC compliances for all found Release Registrations",
-      method: "GET",
-      url: "https://grafeas.sdlcapis-test.azpriv-cloud.ubs.net/v1alpha1/compliances",
-      headers: null,          // optional
-      auth: null,             // optional, e.g. "bearer"
-      expect: { status: 200, text: "releaseTagStatus" } // text optional
+  // Build rows
+  var featRows = [];
+  if (acc.byFeature) {
+    for (var f in acc.byFeature) {
+      if (!acc.byFeature.hasOwnProperty(f)) continue;
+      var v = acc.byFeature[f] || {};
+      featRows.push({
+        name: f,
+        count: v.count || 0,
+        avg: Math.round((v.avg || 0) * 100) / 100,
+        p95: Math.round((v.p95 || 0) * 100) / 100,
+        max: Math.round((v.max || 0) * 100) / 100
+      });
     }
-  ]
-}
-*/
-const ENDPOINTS = [];
-for (let i = 0; i < SELECTED_FEATURES.length; i += 1) {
-  const fname = SELECTED_FEATURES[i];
-  const eps = features[fname];
-  if (!eps || !Array.isArray(eps)) {
-    console.warn(`[WARN] feature "${fname}" not found or has no endpoints`);
-    continue;
   }
-  for (let j = 0; j < eps.length; j += 1) {
-    const ep = eps[j];
-    ENDPOINTS.push({ feature: fname, ep });
-  }
-}
-
-console.info(`features loaded: ${JSON.stringify(SELECTED_FEATURES)}`);
-console.info(`endpoints built: ${ENDPOINTS.length}`);
-
-// ---------- k6 options (choose executor based on what you passed) ----------
-let scenarios;
-if (ITER && !DURATION) {
-  // run a fixed number of iterations per VU
-  scenarios = {
-    by_iter: {
-      executor: 'per-vu-iterations',
-      vus: VUS,
-      iterations: ITER,
-      maxDuration: '10m', // safety net
-    },
-  };
-} else if (!ITER && DURATION) {
-  // run for a duration at constant VUs
-  scenarios = {
-    by_time: {
-      executor: 'constant-vus',
-      vus: VUS,
-      duration: DURATION,
-      gracefulStop: '30s',
-    },
-  };
-} else if (ITER && DURATION) {
-  // both provided — honor ITER (explicit), ignore duration
-  scenarios = {
-    by_iter: {
-      executor: 'per-vu-iterations',
-      vus: VUS,
-      iterations: ITER,
-      maxDuration: DURATION || '10m',
-    },
-  };
-} else {
-  // nothing provided — smallest sensible default
-  scenarios = {
-    by_iter: {
-      executor: 'per-vu-iterations',
-      vus: 1,
-      iterations: 1,
-      maxDuration: '10m',
-    },
-  };
-}
-
-export const options = {
-  scenarios,
-  // show p(95) and avg in console & summary.json
-  summaryTrendStats: ['avg', 'min', 'max', 'p(90)', 'p(95)'],
-};
-
-// ---------- tiny helper ----------
-function hasText(body, mustContain) {
-  if (!mustContain) return true;
-  const s = typeof body === 'string' ? body : String(body || '');
-  return s.indexOf(mustContain) !== -1;
-}
-
-// ---------- the test ----------
-export default function () {
-  if (ENDPOINTS.length === 0) {
-    console.warn('No endpoints to run; sleeping this iteration.');
-    sleep(0.2);
-    return;
-  }
-
-  // For this minimal runner: hit every endpoint once per iteration
-  for (let i = 0; i < ENDPOINTS.length; i += 1) {
-    const { feature, ep } = ENDPOINTS[i];
-    const method = (ep.method || 'GET').toUpperCase();
-    const url = ep.url;
-    const headers = ep.headers || null;
-
-    let res;
-    if (method === 'GET') {
-      res = http.get(url, { headers, tags: { feature, endpoint: ep.name } });
-    } else if (method === 'DELETE') {
-      res = http.del(url, null, { headers, tags: { feature, endpoint: ep.name } });
-    } else if (method === 'PATCH') {
-      // if your ep has a body, include ep.body; otherwise send empty object
-      res = http.patch(url, ep.body || {}, { headers, tags: { feature, endpoint: ep.name } });
-    } else if (method === 'POST') {
-      res = http.post(url, ep.body || {}, { headers, tags: { feature, endpoint: ep.name } });
-    } else if (method === 'PUT') {
-      res = http.put(url, ep.body || {}, { headers, tags: { feature, endpoint: ep.name } });
-    } else {
-      console.warn(`Unsupported method: ${method} for ${ep.name}`);
-      continue;
+  var epRows = [];
+  if (acc.byEndpoint) {
+    for (var e in acc.byEndpoint) {
+      if (!acc.byEndpoint.hasOwnProperty(e)) continue;
+      var w = acc.byEndpoint[e] || {};
+      epRows.push({
+        name: e,
+        count: w.count || 0,
+        avg: Math.round((w.avg || 0) * 100) / 100,
+        p95: Math.round((w.p95 || 0) * 100) / 100,
+        max: Math.round((w.max || 0) * 100) / 100
+      });
     }
-
-    const expect = ep.expect || {};
-    check(res, {
-      'status ok': (r) => (!expect.status ? r.status >= 200 && r.status < 400 : r.status === expect.status),
-      'body has text': (r) => hasText(r.body, expect.text),
-    }, { feature, endpoint: ep.name });
-
-    // very short wait between endpoints (keeps output readable)
-    sleep(0.1);
   }
-}
 
-// ---------- export the enhanced summary from vendor ----------
-export { handleSummary };
+  // Sort by count desc
+  featRows.sort(function (a, b) { return (b.count || 0) - (a.count || 0); });
+  epRows.sort(function (a, b) { return (b.count || 0) - (a.count || 0); });
+
+  // Minimal header
+  var title = 'SDLC Auto Gov Load Test — ' + new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  var html = [
+    '<!doctype html><html><head><meta charset="utf-8">',
+    '<title>', esc(title), ' (ENHANCED)</title>',
+    '<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px;color:#111} ',
+    'h2{margin:0 0 12px 0} h3{margin:18px 0 8px 0} .mono{font-family:ui-monospace,Consolas,Monaco,monospace;color:#555}</style>',
+    '</head><body>',
+    '<h2>', esc(title), ' <span class="mono">(enhanced summary)</span></h2>',
+    asTable('Feature breakdown', featRows),
+    asTable('Endpoint breakdown', epRows),
+    '<details style="margin-top:18px;"><summary>Raw JSON (truncated)</summary>',
+    '<pre class="mono" style="white-space:pre-wrap;">', esc(JSON.stringify({ acc: acc, options: data && data.options }, null, 2)), '</pre>',
+    '</details>',
+    '</body></html>'
+  ].join('');
+
+  // Console text
+  var text = [
+    '=== Enhanced summary active ===',
+    'Features: ' + Object.keys(acc.byFeature || {}).length,
+    'Endpoints: ' + Object.keys(acc.byEndpoint || {}).length
+  ].join('\n');
+
+  return {
+    stdout: text,
+    'perf/k6/reports/summary.html': html,
+    'perf/k6/reports/summary.json': JSON.stringify(data || {}, null, 2)
+  };
+}
