@@ -2,108 +2,85 @@
 import http from "k6/http";
 import { sleep, check, Trend, Counter } from "k6";
 import features from "../sources/endpoints.byFeature.js";
-export { handleSummary } from "../vendor/handleSummary.js"; // write summary.html/json
+export { handleSummary } from "../vendor/handleSummary.js";   // just import — do NOT paste function
 
-/* ------------ env parsing ------------- */
-const RAW = {
-  FEATURES: String(__ENV.FEATURES || "").trim(),
-  VUS: __ENV.VUS,
-  ITERS: __ENV.ITERS ?? __ENV.ITER,
-  DURATION: __ENV.DURATION,
-};
-const VUS = Number(RAW.VUS || "1");
-const ITERS = Number(RAW.ITERS || "0");
-const DURATION = String(RAW.DURATION || "30s");
+// -------- env parsing (k6 0.46 safe) --------
+var FEAT_RAW = (__ENV.FEATURES || "").toString().trim();
+var VUS      = Number(__ENV.VUS || "1");
+var ITERS    = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
+var DURATION = (__ENV.DURATION || "30s").toString();
 
-const SELECTED = RAW.FEATURES
-  ? RAW.FEATURES.split(",").map(s => s.trim()).filter(Boolean)
+var SELECTED = FEAT_RAW
+  ? FEAT_RAW.split(",").map(function(s){return s.trim();}).filter(function(s){return s.length;})
   : [];
 
-console.log(`RAW env -> ${JSON.stringify(RAW)}`);
-console.log(`parsed  -> vus=${VUS}, iters=${ITERS}, duration=${DURATION}, features=${SELECTED.length?SELECTED.join("|"):"(all)"}`);
+console.log("parsed -> vus=" + VUS + ", iters=" + ITERS + ", duration=" + DURATION +
+            ", features=" + (SELECTED.length ? SELECTED.join("|") : "(all)"));
 
-export const options = ITERS > 0 ? {
-  scenarios: {
-    by_iter: {
-      executor: "per-vu-iterations",
-      vus: VUS,
-      iterations: ITERS,
-      maxDuration: "10m",
-    },
-  },
+// -------- executor selection --------
+export var options = ITERS > 0 ? {
+  scenarios: { by_iter: { executor:"per-vu-iterations", vus:VUS, iterations:ITERS, maxDuration:"10m" } }
 } : {
-  scenarios: {
-    by_time: {
-      executor: "constant-vus",
-      vus: VUS,
-      duration: DURATION,
-      gracefulStop: "3s",
-    },
-  },
+  scenarios: { by_time: { executor:"constant-vus", vus:VUS, duration:DURATION, gracefulStop:"3s" } }
 };
-console.log(`executor chosen -> ${ITERS > 0 ? "per-vu-iterations" : "constant-vus"}`);
+console.log("executor chosen -> " + (ITERS > 0 ? "per-vu-iterations" : "constant-vus"));
 
-/* ------------ normalize features -> endpoints ------------- */
-function isPO(x){ return x && typeof x === "object" && !Array.isArray(x); }
-const ENDPOINTS = [];
-
-if (!isPO(features)) {
-  console.error("features export is not an object. Check ../sources/endpoints.byFeature.js (default export).");
-} else {
-  const names = SELECTED.length ? SELECTED : Object.keys(features);
-  console.log(`features_loaded: ${JSON.stringify(names)}`);
-  for (const fname of names) {
-    const list = features[fname];
-    if (!Array.isArray(list)) { console.warn(`Feature "${fname}" has no endpoint array; skipping.`); continue; }
-    for (const ep of list) {
-      if (!isPO(ep)) continue;
-      const method = String(ep.method || "GET").toUpperCase();
-      const url = String(ep.url || "");
-      if (!url) continue;
-      const expect = isPO(ep.expect) ? ep.expect : {};
+// -------- normalize features -> endpoints --------
+function isPO(x){ return x && typeof x==="object" && !Array.isArray(x); }
+var ENDPOINTS=[];
+if(!isPO(features)){ console.error("features export invalid."); }
+else{
+  var names=SELECTED.length?SELECTED:Object.keys(features);
+  console.log("features_loaded: "+JSON.stringify(names));
+  for(var i=0;i<names.length;i++){
+    var fname=names[i], list=features[fname];
+    if(!Array.isArray(list)){console.warn("Feature "+fname+" has no endpoints.");continue;}
+    for(var j=0;j<list.length;j++){
+      var ep=list[j]; if(!isPO(ep))continue;
+      var method=(ep.method||"GET").toUpperCase();
+      var url=String(ep.url||""); if(!url)continue;
+      var expect=isPO(ep.expect)?ep.expect:{};
       ENDPOINTS.push({
-        feature: fname,
-        name: String(ep.name || `${method} ${url}`),
-        method,
-        url,
-        expect: { status: Number(expect.status || 200), text: typeof expect.text === "string" ? expect.text : "" },
-        headers: isPO(ep.headers) ? ep.headers : undefined,
-        auth: ep.auth || null,
+        feature:fname,
+        name:ep.name||(method+" "+url),
+        method:method,url:url,
+        expect:{status:Number(expect.status||200),text:typeof expect.text==="string"?expect.text:""},
+        headers:isPO(ep.headers)?ep.headers:undefined,
+        auth:ep.auth||null
       });
     }
   }
 }
 
-const latency_ep = new Trend("latency_ep");
-const reqs_ep = new Counter("reqs_ep");
+// -------- custom metrics --------
+var latency_ep=new Trend("latency_ep");
+var reqs_ep=new Counter("reqs_ep");
 
-/* ------------ main ----------- */
-export default function () {
-  if (!ENDPOINTS.length) { sleep(0.2); return; }
-  const ep = ENDPOINTS[(__ITER || 0) % ENDPOINTS.length];
-
-  const tags = { feature: ep.feature, endpoint: ep.name };
-  const params = { tags };
-  if (ep.headers) params.headers = ep.headers;
-  if (ep.auth) params.headers = Object.assign({}, params.headers, { authorization: String(ep.auth) });
-
-  let res;
-  switch (ep.method) {
-    case "GET": res = http.get(ep.url, params); break;
-    default:    res = http.get(ep.url, params); break; // keep simple for now
+// -------- main test --------
+export default function(){
+  if(!ENDPOINTS.length){sleep(0.2);return;}
+  var idx=(typeof __ITER==="number"?__ITER:0)%ENDPOINTS.length;
+  var ep=ENDPOINTS[idx];
+  var tags={feature:ep.feature,endpoint:ep.name};
+  var params={tags:tags};
+  if(ep.headers)params.headers=ep.headers;
+  if(ep.auth){
+    var h=params.headers||{};
+    h.authorization=String(ep.auth);
+    params.headers=h;
   }
 
-  check(res, {
-    "status ok": (r) => r && r.status === ep.expect.status,
-    "body has text": (r) => {
-      if (!ep.expect.text) return true;
-      const s = typeof r.body === "string" ? r.body : JSON.stringify(r.body);
-      return s.indexOf(ep.expect.text) !== -1;
-    },
+  var res=http.get(ep.url,params);   // extend later for POST etc.
+  check(res,{
+    "status ok":function(r){return r&&r.status===ep.expect.status;},
+    "body has text":function(r){
+      if(!ep.expect.text)return true;
+      var s=typeof r.body==="string"?r.body:JSON.stringify(r.body);
+      return s.indexOf(ep.expect.text)!==-1;
+    }
   });
 
-  latency_ep.add(res.timings.duration, tags);
-  reqs_ep.add(1, tags);
-
+  latency_ep.add(res.timings.duration,tags);
+  reqs_ep.add(1,tags);
   sleep(0.2);
 }
