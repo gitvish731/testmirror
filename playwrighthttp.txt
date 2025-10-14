@@ -1,4 +1,4 @@
-// perf/k6/scenarios/from-playwright.http.js
+//--- perf/k6/scenarios/from-playwright.http.js 
 import http from "k6/http";
 import { sleep, check, Trend, Counter } from "k6";
 import features from "../sources/endpoints.byFeature.js";
