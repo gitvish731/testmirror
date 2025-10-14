@@ -6,11 +6,11 @@ const { check, sleep } = require('k6');
 const { Counter, Trend } = require('k6/metrics');
 
 /** HTML report hook (keep path relative to THIS file) */
-const { handleSummary } = require('../vendor/handleSummary.js');
+const hs = require('../vendor/handleSummary.js');
 
 /* ---------- Env config ---------- */
 const ENV = (__ENV.ENV || 'dev').toLowerCase();
-const FEATURES_RAW = (__ENV.FEATURES || '').trim();           // "Feature A, Feature B"
+const FEATURES_RAW = (__ENV.FEATURES || '').trim();           // "FeatureA,FeatureB"
 const ENDPOINT_FILTER = (__ENV.ENDPOINT_FILTER || '').trim();  // substring/regex
 const DURATION = __ENV.DURATION || '30s';
 const RPS = Number(__ENV.RPS || 1);
@@ -29,34 +29,47 @@ const ENDPOINTS_BY_FEATURE = loadMap();
 /* ---------- Select features ---------- */
 const ALL_FEATURES = Object.keys(ENDPOINTS_BY_FEATURE || {});
 const SELECTED_FEATURES = FEATURES_RAW
-  ? FEATURES_RAW.split(',').map(s => s.trim()).filter(Boolean)
+  ? FEATURES_RAW.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return !!s; })
   : ALL_FEATURES;
 
 /* ---------- Optional endpoint filter ---------- */
-const FILTER_RE = ENDPOINT_FILTER ? new RegExp(ENDPOINT_FILTER, 'i') : null;
+var FILTER_RE = null;
+if (ENDPOINT_FILTER) {
+  try { FILTER_RE = new RegExp(ENDPOINT_FILTER, 'i'); } catch (e) { FILTER_RE = null; }
+}
 
 /* ---------- Flatten selection ---------- */
-const ENDPOINTS = [];
-for (const feat of SELECTED_FEATURES) {
-  const list = ENDPOINTS_BY_FEATURE[feat];
-  if (!Array.isArray(list)) continue; // safe: real loop continue here is fine
+var ENDPOINTS = [];
+for (var i = 0; i < SELECTED_FEATURES.length; i++) {
+  var feat = SELECTED_FEATURES[i];
+  var list = ENDPOINTS_BY_FEATURE[feat];
+  if (!list || !list.length) { continue; }
 
-  for (const ep of list) {
-    const nameStr = String(ep.name || '');
-    const matches = FILTER_RE ? FILTER_RE.test(nameStr) : true;
+  for (var j = 0; j < list.length; j++) {
+    var ep = list[j];
+    var nstr = String(ep.name || '');
+    var matches = FILTER_RE ? FILTER_RE.test(nstr) : true;
     if (matches) {
-      ENDPOINTS.push({ feature: feat, url: ep.url, method: ep.method || 'GET', body: ep.body, expectStatus: ep.expectStatus, expectBodyContains: ep.expectBodyContains, name: ep.name });
+      ENDPOINTS.push({
+        feature: feat,
+        url: ep.url,
+        method: ep.method || 'GET',
+        body: ep.body,
+        expectStatus: ep.expectStatus,
+        expectBodyContains: ep.expectBodyContains,
+        name: ep.name
+      });
     }
   }
 }
 
 /* ---------- Log selection ---------- */
 console.log(
-  `[k6] Selected ${ENDPOINTS.length} endpoint(s) across FEATURES=[${SELECTED_FEATURES.join(', ')}], ` +
-  `FILTER=${ENDPOINT_FILTER || 'none'}`
+  '[k6] Selected ' + ENDPOINTS.length + ' endpoint(s) across FEATURES=[' + SELECTED_FEATURES.join(', ') + '], ' +
+  'FILTER=' + (ENDPOINT_FILTER || 'none')
 );
 if (ENDPOINTS.length === 0) {
-  console.error('[k6] No endpoints selected. Available features:', ALL_FEATURES.join(', '));
+  console.error('[k6] No endpoints selected. Available features: ' + ALL_FEATURES.join(', '));
 }
 
 /* ---------- k6 options ---------- */
@@ -85,16 +98,16 @@ const checks_ep = new Counter('checks_ep');
 
 /* ---------- Helpers ---------- */
 function buildHeaders(method) {
-  const h = { Accept: 'application/json' };
-  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
+  var h = { Accept: 'application/json' };
+  if (TOKEN) h.Authorization = 'Bearer ' + TOKEN;
   return h;
 }
 
 function resolveUrl(sourceUrl) {
   if (!BASE_URL_OVERRIDE) return sourceUrl;
   try {
-    const src = new URL(sourceUrl);
-    const base = new URL(BASE_URL_OVERRIDE);
+    var src = new URL(sourceUrl);
+    var base = new URL(BASE_URL_OVERRIDE);
     base.pathname = src.pathname;
     base.search = src.search;
     return base.toString();
@@ -104,7 +117,7 @@ function resolveUrl(sourceUrl) {
 }
 
 /* Round-robin iterator */
-let idx = 0;
+var rr = 0;
 
 /* ---------- Main iteration ---------- */
 export default function () {
@@ -113,59 +126,49 @@ export default function () {
     return;
   }
 
-  const ep = ENDPOINTS[idx++ % ENDPOINTS.length];
-  const tags = { feature: ep.feature, endpoint: String(ep.name || 'unknown') };
+  var ep = ENDPOINTS[rr++ % ENDPOINTS.length];
+  var tags = { feature: ep.feature, endpoint: String(ep.name || 'unknown') };
 
-  const url = resolveUrl(ep.url);
-  const headers = buildHeaders(ep.method);
+  var url = resolveUrl(ep.url);
+  var headers = buildHeaders(ep.method);
 
-  let res;
+  var res;
   try {
-    switch (String(ep.method || 'GET').toUpperCase()) {
-      case 'GET':
-        res = http.get(url, { headers, tags });
-        break;
-      case 'POST':
-        res = http.post(url, ep.body || null, { headers, tags });
-        break;
-      case 'PUT':
-        res = http.put(url, ep.body || null, { headers, tags });
-        break;
-      case 'PATCH':
-        res = http.patch(url, ep.body || null, { headers, tags });
-        break;
-      case 'DELETE':
-        res = http.del(url, null, { headers, tags });
-        break;
-      default:
-        res = http.get(url, { headers, tags });
-        break;
-    }
+    var m = String(ep.method || 'GET').toUpperCase();
+    if (m === 'GET') res = http.get(url, { headers: headers, tags: tags });
+    else if (m === 'POST') res = http.post(url, ep.body || null, { headers: headers, tags: tags });
+    else if (m === 'PUT') res = http.put(url, ep.body || null, { headers: headers, tags: tags });
+    else if (m === 'PATCH') res = http.patch(url, ep.body || null, { headers: headers, tags: tags });
+    else if (m === 'DELETE') res = http.del(url, null, { headers: headers, tags: tags });
+    else res = http.get(url, { headers: headers, tags: tags });
   } catch (e) {
     reqs_ep.add(1, tags);
     latency_ep.add(0, tags);
     checks_ep.add(0, tags);
-    console.error(`[k6] Request error for ${tags.feature} / ${tags.endpoint}: ${e && e.message}`);
+    console.error('[k6] Request error for ' + tags.feature + ' / ' + tags.endpoint + ': ' + (e && e.message));
     sleep(0.2);
     return;
   }
 
   // per-request metrics
   reqs_ep.add(1, tags);
-  latency_ep.add(res.timings.duration || 0, tags);
+  latency_ep.add(res.timings && res.timings.duration ? res.timings.duration : 0, tags);
 
-  const expectStatus = Number(ep.expectStatus || 200);
-  const expectBody = ep.expectBodyContains || null;
+  var expectStatus = Number(ep.expectStatus || 200);
+  var expectBody = ep.expectBodyContains || null;
 
-  const ok = check(
-    res,
-    {
-      'status ok': (r) => r.status === expectStatus,
-      ...(expectBody ? { 'body has text': (r) => String(r.body || '').indexOf(expectBody) !== -1 } : {}),
-    },
-    tags
-  );
+  // build checks object without object spread (Goja-safe)
+  var checksObj = {
+    'status ok': function (r) { return r.status === expectStatus; }
+  };
+  if (expectBody) {
+    checksObj['body has text'] = function (r) {
+      var b = String(r.body || '');
+      return b.indexOf(expectBody) !== -1;
+    };
+  }
 
+  var ok = check(res, checksObj, tags);
   checks_ep.add(ok ? 1 : 0, tags);
 
   sleep(0.2);
@@ -173,5 +176,9 @@ export default function () {
 
 /* ---------- HTML summary ---------- */
 export function handleSummary(data) {
-  return handleSummary(data);
+  // support both: module.exports = fn   OR   exports.handleSummary = fn
+  var fn = hs && (hs.handleSummary || (typeof hs === 'function' ? hs : null));
+  if (fn) return fn(data);
+  // fallback: nothing
+  return {};
 }
