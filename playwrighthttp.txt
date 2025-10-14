@@ -1,229 +1,68 @@
-// perf/k6/scenarios/from-playwright.http.js
-// ✅ k6 v0.46 compatible (no spread syntax, ESM-safe, with handleSummary fix)
+// perf/k6/vendor/handleSummary.js
+// Works on k6 v0.46 (no remote imports, no spread, no optional chaining)
 
-import http from "k6/http";
-import { sleep, check } from "k6";
-import { Trend, Counter } from "k6/metrics";
-import features from "../sources/endpoints.byFeature.js"; // your feature map
+function secs(n) {
+  n = Math.round(n);
+  return n + "s";
+}
 
-// --- summary wiring (robust to default or named exports) ---
-import summaryMod from "../vendor/handleSummary.js";
-export function handleSummary(data) {
-  var fn = null;
-  if (typeof summaryMod === "function") {
-    fn = summaryMod; // default export is a function
-  } else if (summaryMod && typeof summaryMod.handleSummary === "function") {
-    fn = summaryMod.handleSummary; // named export { handleSummary }
+function number(n) {
+  if (typeof n !== "number" || isNaN(n)) return String(n);
+  return String(Math.round(n * 100) / 100);
+}
+
+// very small, local "text summary" so we don’t need jslib.k6.io
+function tinyTextSummary(data) {
+  var lines = [];
+  lines.push("checks............. " + data.metrics.checks.values.passes + " / " + (data.metrics.checks.values.passes + data.metrics.checks.values.fails));
+  lines.push("http_reqs.......... " + (data.metrics.http_reqs ? data.metrics.http_reqs.values.count : 0));
+  var dur = (data.state && typeof data.state.testRunDurationMs === "number") ? data.state.testRunDurationMs / 1000 : 0;
+  lines.push("duration........... " + secs(dur));
+  if (data.metrics["http_req_duration"]) {
+    var v = data.metrics["http_req_duration"].values;
+    lines.push("http_req_duration.. avg " + number(v.avg) + " ms | p(95) " + number(v["p(95)"]) + " ms");
   }
-
-  if (fn) return fn(data);
-  console.error("handleSummary module is not a function; skipping custom summary");
-  return {};
+  return lines.join("\n");
 }
 
-/**********************
- * ENV / CLI switches *
- **********************
- * -e FEATURES='ReportingAPI Alpha1,SomethingElse'
- * -e VUS=2
- * -e ITERS=2
- * -e DURATION=30s
- * -e ONE=1
- * -e TIER=dev|uat
- */
+export default function handleSummary(data) {
+  // prove we got called (you’ll see this in the k6 console)
+  console.log("[handleSummary] received metrics keys:", Object.keys(data.metrics || {}).length);
 
-const RAW_FEATURES = (__ENV.FEATURES || "").trim();
-const VUS = toInt(__ENV.VUS, 1);
-const ITERS = toInt(__ENV.ITERS, 0);
-const ONE = toInt(__ENV.ONE, 0);
-const DURATION = (__ENV.DURATION || "").trim();
+  // 1) plain text for stdout
+  var text = tinyTextSummary(data);
 
-const usePerVuIters = ONE === 1 || (ITERS > 0 && !DURATION);
-const perVuIters = ONE === 1 ? 1 : Math.max(ITERS, 1);
+  // 2) minimal HTML report
+  var checks = data.metrics.checks ? data.metrics.checks.values : { passes: 0, fails: 0 };
+  var httpReqs = data.metrics.http_reqs ? data.metrics.http_reqs.values.count : 0;
+  var lat = data.metrics["http_req_duration"] ? data.metrics["http_req_duration"].values : {};
+  var durMs = (data.state && typeof data.state.testRunDurationMs === "number") ? data.state.testRunDurationMs : 0;
 
-export let options = usePerVuIters
-  ? {
-      scenarios: {
-        by_iter: {
-          executor: "per-vu-iterations",
-          vus: Math.max(VUS, 1),
-          iterations: perVuIters,
-          maxDuration: "120s",
-        },
-      },
-      thresholds: {
-        http_req_failed: ["rate<0.05"],
-      },
-    }
-  : {
-      scenarios: {
-        by_time: {
-          executor: "constant-vus",
-          vus: Math.max(VUS, 1),
-          duration: DURATION || "30s",
-          gracefulStop: "3s",
-        },
-      },
-      thresholds: {
-        http_req_failed: ["rate<0.05"],
-      },
-    };
+  var html = ""
+    + "<!doctype html><html><head><meta charset='utf-8'/>"
+    + "<title>SDLC Auto Gov Load Test</title>"
+    + "<style>body{font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px}"
+    + "table{border-collapse:collapse;margin:10px 0}td,th{border:1px solid #ddd;padding:6px 10px}</style>"
+    + "</head><body>"
+    + "<h1>SDLC Auto Gov Load Test — " + new Date().toISOString().slice(0,19).replace("T"," ") + "</h1>"
+    + "<table>"
+    + "<tr><th>Checks (pass/fail)</th><td>" + checks.passes + " / " + checks.fails + "</td></tr>"
+    + "<tr><th>Requests</th><td>" + httpReqs + " total</td></tr>"
+    + "<tr><th>Latency p(95)</th><td>" + number(lat["p(95)"]) + " ms</td></tr>"
+    + "<tr><th>Latency avg / min / max</th><td>" + number(lat.avg) + " ms / " + number(lat.min) + " ms / " + number(lat.max) + " ms</td></tr>"
+    + "<tr><th>Duration</th><td>" + secs(durMs/1000) + "</td></tr>"
+    + "</table>"
+    + "<h2>Raw JSON (truncated)</h2>"
+    + "<pre style='white-space:pre-wrap'>" + JSON.stringify({ metrics:Object.keys(data.metrics||{}).slice(0,10), state:data.state }, null, 2) + "</pre>"
+    + "</body></html>";
 
-/************************************
- * Custom per-endpoint metrics (tagged)
- ************************************/
-const reqs_ep = new Counter("reqs_ep"); // counts requests per feature/endpoint
-const latency_ep = new Trend("latency_ep", true); // ms per feature/endpoint
-
-/************************************
- * Build the endpoint execution list *
- ************************************/
-const REQUESTED = RAW_FEATURES
-  ? RAW_FEATURES.split(",")
-      .map(function (s) {
-        return s.trim();
-      })
-      .filter(function (v) {
-        return v;
-      })
-  : Object.keys(features);
-
-const SELECTED = REQUESTED.filter(function (n) {
-  return Object.prototype.hasOwnProperty.call(features, n);
-});
-const MISSING = REQUESTED.filter(function (n) {
-  return SELECTED.indexOf(n) === -1;
-});
-if (MISSING.length) {
-  console.error("Unknown feature(s) ignored:", MISSING);
-}
-
-const ENDPOINTS = [];
-for (var i = 0; i < SELECTED.length; i++) {
-  var fname = SELECTED[i];
-  var eps = features[fname];
-  if (!eps || Object.prototype.toString.call(eps) !== "[object Array]") {
-    console.error("Feature does not map to an array of endpoints:", fname, eps);
-    continue;
-  }
-  for (var j = 0; j < eps.length; j++) {
-    var ep = eps[j] || {};
-    if (!ep.url || !ep.method) {
-      console.error("Bad endpoint definition under", fname, ep);
-      continue;
-    }
-    ENDPOINTS.push({
-      feature: fname,
-      name: ep.name || ep.url,
-      method: String(ep.method || "GET").toUpperCase(),
-      url: ep.url,
-      headers: ep.headers || {},
-      auth: ep.auth || null,
-      expect: ep.expect || { status: 200, text: null },
-      body: ep.body || null,
-    });
-  }
-}
-
-if (!ENDPOINTS.length) {
-  throw new Error(
-    'No endpoints selected. FEATURES="' +
-      RAW_FEATURES +
-      '" | available=' +
-      Object.keys(features).join(", ")
-  );
-}
-
-console.log("features loaded:", JSON.stringify(SELECTED));
-
-/*****************
- * Main iteration *
- *****************/
-export default function () {
-  var idx = __ITER % ENDPOINTS.length;
-  var ep = ENDPOINTS[idx];
-
-  var tags = { feature: ep.feature, endpoint: ep.name };
-  var params = {
-    tags: tags, // critical: puts feature/endpoint tags on built-in metrics
-    headers: buildHeaders(ep.headers, ep.auth),
+  // 3) write files (strings only; no content_type wrapper on k6 v0.46)
+  return {
+    stdout: text,
+    "perf/k6/reports/summary.html": html,
+    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2)
   };
-
-  var res;
-  try {
-    switch (ep.method) {
-      case "GET":
-        res = http.get(ep.url, params);
-        break;
-      case "POST":
-        res = http.post(ep.url, ep.body || "", params);
-        break;
-      case "PATCH":
-        res = http.patch(ep.url, ep.body || "", params);
-        break;
-      case "PUT":
-        res = http.put(ep.url, ep.body || "", params);
-        break;
-      case "DELETE":
-        res = http.del(ep.url, null, params);
-        break;
-      default:
-        throw new Error("Unsupported method: " + ep.method);
-    }
-  } catch (e) {
-    reqs_ep.add(1, tags);
-    console.error("request error for", ep.name, e && (e.message || e));
-    sleep(0.2);
-    return;
-  }
-
-  // Emit custom metrics with tags
-  reqs_ep.add(1, tags);
-  if (res && res.timings && typeof res.timings.duration === "number") {
-    latency_ep.add(res.timings.duration, tags);
-  }
-
-  // ---- v0.46-safe checks ----
-  var expect = ep.expect || {};
-  var checksObj = {};
-  checksObj["status ok"] = function (r) {
-    return r && r.status === (expect.status || 200);
-  };
-  if (expect.text) {
-    checksObj["body has text"] = function (r) {
-      var b = r && r.body ? String(r.body) : "";
-      return b.indexOf(expect.text) !== -1;
-    };
-  }
-  var ok = check(res, checksObj);
-  if (!ok) {
-    console.warn("check(s) failed for", ep.name, "status=", res && res.status);
-  }
-
-  sleep(0.2);
 }
 
-/**************
- * Utilities  *
- **************/
-function toInt(v, defVal) {
-  var n = parseInt(v, 10);
-  return isNaN(n) ? defVal : n;
-}
-
-function buildHeaders(h, auth) {
-  var hdrs = {};
-  for (var k in h || {}) {
-    if (Object.prototype.hasOwnProperty.call(h, k)) hdrs[k] = h[k];
-  }
-  if (hdrs["Content-Type"] && !hdrs["content-type"]) {
-    hdrs["content-type"] = hdrs["Content-Type"];
-  }
-  if (auth && typeof auth === "string") {
-    var parts = auth.trim().split(/\s+/, 2);
-    if (parts.length === 2 && /^bearer$/i.test(parts[0])) {
-      hdrs["Authorization"] = "Bearer " + parts[1];
-    }
-  }
-  return hdrs;
-}
+// If you ever need the named export form instead:
+// export { handleSummary };
