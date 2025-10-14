@@ -1,68 +1,160 @@
-// perf/k6/vendor/handleSummary.js
-// Works on k6 v0.46 (no remote imports, no spread, no optional chaining)
+// perf/k6/scenarios/from-playwright.http.js
+// k6 v0.46-compatible runner with iteration/duration switch and per-endpoint metrics
 
-function secs(n) {
-  n = Math.round(n);
-  return n + "s";
+import http from "k6/http";
+import { sleep, check, Trend, Counter } from "k6";
+import features from "../sources/endpoints.byFeature.js"; // <- default export (ESM)
+
+const VUS = Number(__ENV.VUS || 1);
+const ITERS = Number(__ENV.ITERS || 0);
+const DURATION = String(__ENV.DURATION || ""); // used only when ITERS==0
+const FEATURES_RAW = String(__ENV.FEATURES || ""); // e.g. "ReportingAPI Alpha1,Another Feature"
+const ENV = String(__ENV.ENV || __ENV.ENVIRONMENT || ""); // if you later need it
+
+// -------- executor selection (rule: ITERS>0 => per-vu-iterations) --------
+export const options = {
+  scenarios: {
+    default:
+      ITERS > 0
+        ? {
+            executor: "per-vu-iterations",
+            vus: VUS,
+            iterations: ITERS,
+            // generous cap so per-vu-iterations doesn't time out
+            maxDuration: "1h",
+          }
+        : {
+            executor: "constant-vus",
+            vus: VUS,
+            duration: DURATION || "30s",
+          },
+  },
+};
+
+// -------- build selected endpoint list from the features map --------
+const ALL_FEATURE_NAMES = [];
+for (const k in features) {
+  if (Object.prototype.hasOwnProperty.call(features, k)) ALL_FEATURE_NAMES.push(k);
 }
 
-function number(n) {
-  if (typeof n !== "number" || isNaN(n)) return String(n);
-  return String(Math.round(n * 100) / 100);
-}
+const SELECTED_FEATURES =
+  FEATURES_RAW.trim().length > 0
+    ? FEATURES_RAW.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+    : ALL_FEATURE_NAMES.slice();
 
-// very small, local "text summary" so we don’t need jslib.k6.io
-function tinyTextSummary(data) {
-  var lines = [];
-  lines.push("checks............. " + data.metrics.checks.values.passes + " / " + (data.metrics.checks.values.passes + data.metrics.checks.values.fails));
-  lines.push("http_reqs.......... " + (data.metrics.http_reqs ? data.metrics.http_reqs.values.count : 0));
-  var dur = (data.state && typeof data.state.testRunDurationMs === "number") ? data.state.testRunDurationMs / 1000 : 0;
-  lines.push("duration........... " + secs(dur));
-  if (data.metrics["http_req_duration"]) {
-    var v = data.metrics["http_req_duration"].values;
-    lines.push("http_req_duration.. avg " + number(v.avg) + " ms | p(95) " + number(v["p(95)"]) + " ms");
+const ENDPOINTS = [];
+for (let i = 0; i < SELECTED_FEATURES.length; i++) {
+  const fname = SELECTED_FEATURES[i];
+  const eps = features[fname];
+  if (!eps || !Array.isArray(eps)) continue;
+  for (let j = 0; j < eps.length; j++) {
+    // keep only allowed fields the runner uses
+    const { name, method, url, expect, headers, auth } = eps[j];
+    ENDPOINTS.push({
+      feature: fname,
+      name: String(name || ("ep_" + j)),
+      method: String(method || "GET").toUpperCase(),
+      url: String(url || ""),
+      expect: expect || { status: 200 },
+      headers: headers || null,
+      auth: auth || null,
+    });
   }
-  return lines.join("\n");
 }
 
-export default function handleSummary(data) {
-  // prove we got called (you’ll see this in the k6 console)
-  console.log("[handleSummary] received metrics keys:", Object.keys(data.metrics || {}).length);
+if (ENDPOINTS.length === 0) {
+  throw new Error(
+    "No endpoints selected. FEATURES='" +
+      FEATURES_RAW +
+      "' did not match any of: " +
+      ALL_FEATURE_NAMES.join(", ")
+  );
+}
 
-  // 1) plain text for stdout
-  var text = tinyTextSummary(data);
+// -------- per-endpoint custom metrics so they show in summary.json (k6 v0.46) --------
+const EP_METRICS = {}; // key -> { t: Trend, c: Counter }
+function metricKey(feature, endpoint) {
+  const clean = (s) => String(s).replace(/[^A-Za-z0-9_]/g, "_").slice(0, 60);
+  return "ep_" + clean(feature) + "__" + clean(endpoint);
+}
+function getEpMetrics(feature, endpoint) {
+  const key = metricKey(feature, endpoint);
+  if (!EP_METRICS[key]) {
+    EP_METRICS[key] = {
+      t: new Trend(key + "_latency_ms"),
+      c: new Counter(key + "_reqs"),
+    };
+  }
+  return EP_METRICS[key];
+}
 
-  // 2) minimal HTML report
-  var checks = data.metrics.checks ? data.metrics.checks.values : { passes: 0, fails: 0 };
-  var httpReqs = data.metrics.http_reqs ? data.metrics.http_reqs.values.count : 0;
-  var lat = data.metrics["http_req_duration"] ? data.metrics["http_req_duration"].values : {};
-  var durMs = (data.state && typeof data.state.testRunDurationMs === "number") ? data.state.testRunDurationMs : 0;
+// -------- simple round-robin pick for each iteration --------
+function pickEndpoint() {
+  // __ITER and __VU are provided by k6
+  const idx = (__ITER || 0) % ENDPOINTS.length;
+  return ENDPOINTS[idx];
+}
 
-  var html = ""
-    + "<!doctype html><html><head><meta charset='utf-8'/>"
-    + "<title>SDLC Auto Gov Load Test</title>"
-    + "<style>body{font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px}"
-    + "table{border-collapse:collapse;margin:10px 0}td,th{border:1px solid #ddd;padding:6px 10px}</style>"
-    + "</head><body>"
-    + "<h1>SDLC Auto Gov Load Test — " + new Date().toISOString().slice(0,19).replace("T"," ") + "</h1>"
-    + "<table>"
-    + "<tr><th>Checks (pass/fail)</th><td>" + checks.passes + " / " + checks.fails + "</td></tr>"
-    + "<tr><th>Requests</th><td>" + httpReqs + " total</td></tr>"
-    + "<tr><th>Latency p(95)</th><td>" + number(lat["p(95)"]) + " ms</td></tr>"
-    + "<tr><th>Latency avg / min / max</th><td>" + number(lat.avg) + " ms / " + number(lat.min) + " ms / " + number(lat.max) + " ms</td></tr>"
-    + "<tr><th>Duration</th><td>" + secs(durMs/1000) + "</td></tr>"
-    + "</table>"
-    + "<h2>Raw JSON (truncated)</h2>"
-    + "<pre style='white-space:pre-wrap'>" + JSON.stringify({ metrics:Object.keys(data.metrics||{}).slice(0,10), state:data.state }, null, 2) + "</pre>"
-    + "</body></html>";
+// -------- main iteration --------
+export default function () {
+  const ep = pickEndpoint();
 
-  // 3) write files (strings only; no content_type wrapper on k6 v0.46)
-  return {
-    stdout: text,
-    "perf/k6/reports/summary.html": html,
-    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2)
+  const reqParams = {
+    tags: {
+      feature: ep.feature,
+      endpoint: ep.name,
+    },
+    headers: Object.assign({}, ep.headers || {}),
   };
-}
 
-// If you ever need the named export form instead:
-// export { handleSummary };
+  // very basic bearer token support if you ever pass one in your feature map
+  if (ep.auth && ep.auth.type === "bearer" && ep.auth.token) {
+    reqParams.headers.Authorization = "Bearer " + ep.auth.token;
+  }
+
+  let res;
+  if (ep.method === "GET") {
+    res = http.get(ep.url, reqParams);
+  } else if (ep.method === "POST") {
+    const body = ep.body || "";
+    // default content-type if not specified
+    if (!reqParams.headers["Content-Type"] && !reqParams.headers["content-type"]) {
+      reqParams.headers["Content-Type"] = "application/json";
+    }
+    res = http.post(ep.url, body, reqParams);
+  } else if (ep.method === "PATCH") {
+    const body = ep.body || "";
+    if (!reqParams.headers["Content-Type"] && !reqParams.headers["content-type"]) {
+      reqParams.headers["Content-Type"] = "application/json";
+    }
+    res = http.patch(ep.url, body, reqParams);
+  } else if (ep.method === "DELETE") {
+    res = http.del(ep.url, null, reqParams);
+  } else if (ep.method === "PUT") {
+    const body = ep.body || "";
+    if (!reqParams.headers["Content-Type"] && !reqParams.headers["content-type"]) {
+      reqParams.headers["Content-Type"] = "application/json";
+    }
+    res = http.put(ep.url, body, reqParams);
+  } else {
+    throw new Error("Unsupported method: " + ep.method);
+  }
+
+  // record per-endpoint metrics (these appear in summary.json on v0.46)
+  const m = getEpMetrics(ep.feature, ep.name);
+  m.c.add(1);
+  m.t.add(res && res.timings ? res.timings.duration : 0);
+
+  // basic checks
+  const expectedStatus = ep.expect && ep.expect.status ? ep.expect.status : 200;
+  const expectedText = ep.expect && ep.expect.text ? String(ep.expect.text) : null;
+
+  const ok = check(res, {
+    "status ok": (r) => r && r.status === expectedStatus,
+    "body has text": (r) =>
+      expectedText ? String(r && r.body ? r.body : "").indexOf(expectedText) !== -1 : true,
+  });
+
+  // a short think time so per-vu-iterations runs look tidy
+  sleep(0.2);
+}
