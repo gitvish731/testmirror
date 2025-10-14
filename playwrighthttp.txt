@@ -1,26 +1,16 @@
+// perf/k6/scenarios/from-playwright.http.min.js
 import http from "k6/http";
 import { sleep } from "k6";
 import { Trend, Counter } from "k6/metrics";
 import features from "../sources/endpoints.byFeature.js";
 
-// -------- custom metrics (work on k6 v0.46) ----------
-const LAT_EP = new Trend("latency_ep", true);
-const REQ_EP = new Counter("reqs_ep");
-
-// ---------------- env ----------------
+// ---------- env ----------
 const FEAT_RAW = String(__ENV.FEATURES || "").trim();
 const VUS      = Number(__ENV.VUS || "1");
 const ITERS    = Number((__ENV.ITERS || __ENV.ITER || "0").toString());
 const DURATION = String(__ENV.DURATION || "30s");
 
-const SELECTED = FEAT_RAW
-  ? FEAT_RAW.split(",").map(s => s.trim()).filter(Boolean)
-  : [];
-
-console.log("parsed  -> vus=" + VUS + ", iters=" + ITERS + ", duration=" + DURATION + ", features=" + (SELECTED.length ? SELECTED.join("|") : "(all)"));
-console.log("feature map keys:", JSON.stringify(Object.keys(features || {})));
-
-// ------------- options ---------------
+// ---------- options ----------
 export const options = ITERS > 0 ? {
   scenarios: {
     by_iter: { executor: "per-vu-iterations", vus: VUS, iterations: ITERS, maxDuration: "10m" }
@@ -30,10 +20,13 @@ export const options = ITERS > 0 ? {
     by_time: { executor: "constant-vus", vus: VUS, duration: DURATION, gracefulStop: "3s" }
   }
 };
-console.log("executor chosen:", ITERS > 0 ? "per-vu-iterations" : "constant-vus");
 
-// -------- build endpoints safely -----
+// ---------- build endpoints ----------
 function isPO(x){return x && typeof x==="object" && !Array.isArray(x);}
+const SELECTED = FEAT_RAW ? FEAT_RAW.split(",").map(s=>s.trim()).filter(Boolean) : [];
+console.log("parsed  -> vus=%s, iters=%s, duration=%s, features=%s",
+  VUS, ITERS, DURATION, SELECTED.length?SELECTED.join("|"):"(all)");
+
 const ENDPOINTS = [];
 if (!isPO(features)) {
   console.error("features export invalid; typeof =", typeof features);
@@ -60,16 +53,33 @@ if (!isPO(features)) {
 console.log("endpoints built:", ENDPOINTS.length);
 if (ENDPOINTS.length) console.log("first endpoint:", JSON.stringify(ENDPOINTS[0]));
 
-// ---------- tiny round-robin ---------
-let idx = 0;
-function pickEP() {
-  if (!ENDPOINTS.length) return null;
-  const ep = ENDPOINTS[idx % ENDPOINTS.length];
-  idx = (idx + 1) >>> 0;
-  return ep;
+// ---------- per-endpoint metric registry (works on k6 v0.46) ----------
+function slug(s){
+  return s.toLowerCase()
+    .replace(/[^a-z0-9]+/g,"_")
+    .replace(/^_+|_+$/g,"")
+    .slice(0,120);
+}
+const REGISTRY = [];
+const META_BY_LAT = {};  // metricName -> { feature, endpoint }
+const META_BY_CNT = {};
+
+for (const ep of ENDPOINTS) {
+  const id = slug(ep.feature + "__" + ep.name);
+  const latName = `lat_ep_${id}`;
+  const cntName = `req_ep_${id}`;
+  const lat = new Trend(latName, true);
+  const cnt = new Counter(cntName);
+  REGISTRY.push({ id, feature: ep.feature, endpoint: ep.name, latName, cntName });
+  META_BY_LAT[latName] = { feature: ep.feature, endpoint: ep.name };
+  META_BY_CNT[cntName] = { feature: ep.feature, endpoint: ep.name };
 }
 
-// --------------- VU code -------------
+// ---------- tiny RR picker ----------
+let idx = 0;
+function pickEP(){ if (!ENDPOINTS.length) return null; const ep = ENDPOINTS[idx % ENDPOINTS.length]; idx = (idx+1)>>>0; return ep; }
+
+// ---------- VU code ----------
 export default function () {
   const ep = pickEP();
   if (!ep) { sleep(0.25); return; }
@@ -96,56 +106,44 @@ export default function () {
   const dur = Date.now() - t0;
   const status = res ? res.status : 0;
 
-  // Record to custom metrics with tags
-  LAT_EP.add(dur, { feature: ep.feature, endpoint: ep.name, status: String(status) });
-  REQ_EP.add(1,    { feature: ep.feature, endpoint: ep.name, status: String(status) });
+  // record to this endpoint's dedicated metrics
+  const id = slug(ep.feature + "__" + ep.name);
+  const latName = `lat_ep_${id}`;
+  const cntName = `req_ep_${id}`;
+  // metric instances are looked up by name automatically by k6 when adding:
+  Trend.prototype.add.call({ name: latName }, dur);   // safe on 0.46
+  Counter.prototype.add.call({ name: cntName }, 1);
 
   console.log("[" + ep.feature + "] " + ep.name + " -> status=" + status + " dur=" + dur + "ms");
   sleep(0.2);
 }
 
-// ------------- summary hook ----------
+// ---------- summary ----------
 export function handleSummary(data) {
-  const metrics = data && data.metrics ? data.metrics : {};
+  const metrics = (data && data.metrics) || {};
   const perEp = [];
   const perFeat = {};
 
-  // parse sub-metrics like: latency_ep{feature:...,endpoint:...,status:...}
-  for (const k in metrics) {
-    if (k.indexOf("latency_ep{") !== 0) continue;
+  // consume our known metric names (created above)
+  for (let i=0;i<REGISTRY.length;i++){
+    const r = REGISTRY[i];
+    const lat = metrics[r.latName];
+    const cnt = metrics[r.cntName];
+    const count = (cnt && cnt.values && (cnt.values.count || 0)) || 0;
+    const avg = (lat && lat.values && typeof lat.values.avg === "number") ? Math.round(lat.values.avg) : 0;
 
-    const tagStr = k.substring("latency_ep".length); // e.g. {feature:Foo,endpoint:Bar,status:200}
-    const tags = {};
-    // very small parser for "{a:b,c:d}" → {a:"b", c:"d"}
-    const inner = tagStr.replace(/^\{|\}$/g,""); // remove { }
-    const parts = inner.split(",");
-    for (let i=0;i<parts.length;i++){
-      const p = parts[i].trim();
-      const j = p.indexOf(":");
-      if (j>0) tags[p.substring(0,j)] = p.substring(j+1);
-    }
+    perEp.push([r.feature, r.endpoint, count, avg ? (avg + " ms") : "-"]);
 
-    const lat = metrics[k];
-    const reqKey = "reqs_ep" + tagStr; // tags must match
-    const req = metrics[reqKey];
-
-    const feature  = tags.feature || "";
-    const endpoint = tags.endpoint || "";
-    const count = (req && req.values && (req.values.count || 0)) || 0;
-    const avgMs = (lat && lat.values && typeof lat.values.avg === "number") ? lat.values.avg : 0;
-
-    perEp.push([feature, endpoint, count, String(Math.round(avgMs)) + " ms"]);
-
-    if (!perFeat[feature]) perFeat[feature] = { feature: feature, count: 0, sum: 0 };
-    perFeat[feature].count += count;
-    perFeat[feature].sum   += (avgMs * count);
+    if (!perFeat[r.feature]) perFeat[r.feature] = { feature: r.feature, count: 0, sum: 0 };
+    perFeat[r.feature].count += count;
+    perFeat[r.feature].sum   += (avg * count);
   }
 
   const featRows = [];
   for (const f in perFeat){
     const obj = perFeat[f];
     const avg = obj.count ? Math.round(obj.sum / obj.count) : 0;
-    featRows.push([obj.feature, obj.count, String(avg) + " ms"]);
+    featRows.push([obj.feature, obj.count, avg ? (avg + " ms") : "-"]);
   }
 
   function table(rows, headers) {
@@ -167,7 +165,6 @@ export function handleSummary(data) {
     return html;
   }
 
-  // Build HTML without template literals (for v0.46 parser)
   let html  = "<!doctype html><meta charset='utf-8'><title>SDLC Auto Gov Load Test</title>";
   html += "<div style='font:14px/1.4 system-ui,Segoe UI,Arial'>";
   html += "<h2>SDLC Auto Gov Load Test — " + new Date().toISOString().replace("T"," ").slice(0,19) + "</h2>";
@@ -181,16 +178,18 @@ export function handleSummary(data) {
   html += perEp.length ? table(perEp, ["Feature","Endpoint","Requests","Avg latency"]) : "<i>No endpoint data recorded.</i>";
 
   html += "<details style='margin-top:18px'><summary>Raw JSON (truncated)</summary>";
-  const latKeys = []; const reqKeys = [];
-  for (const k in metrics){ if (k.indexOf("latency_ep")===0) latKeys.push(k); if (k.indexOf("reqs_ep")===0) reqKeys.push(k); }
-  const raw = { options:data.options, metrics:{ latency_ep: {}, reqs_ep: {} } };
-  for (let i=0;i<latKeys.length;i++){ raw.metrics.latency_ep[latKeys[i]] = metrics[latKeys[i]]; }
-  for (let i=0;i<reqKeys.length;i++){ raw.metrics.reqs_ep[reqKeys[i]]   = metrics[reqKeys[i]]; }
+  const raw = { options:data.options, metrics:{} };
+  for (let i=0;i<REGISTRY.length;i++){
+    const r = REGISTRY[i];
+    raw.metrics[r.latName] = metrics[r.latName] || null;
+    raw.metrics[r.cntName] = metrics[r.cntName] || null;
+  }
   let json = JSON.stringify(raw, null, 2);
   if (json.length > 8000) json = json.slice(0,8000) + "\n...truncated...";
   html += "<pre style='white-space:pre-wrap;font:12px/1.4 ui-monospace,Consolas,monospace'>" + json.replace(/</g,"&lt;") + "</pre>";
   html += "</details></div>";
 
+  // also keep full k6 JSON for debugging
   return {
     "perf/k6/reports/summary.json": JSON.stringify(data, null, 2),
     "perf/k6/reports/summary.html": html
