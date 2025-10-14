@@ -28,7 +28,7 @@ function pick(obj, key, dflt) {
   return (obj && Object.prototype.hasOwnProperty.call(obj, key)) ? obj[key] : dflt;
 }
 
-export default function handleSummary(data) {
+export function handleSummary(data) {
   // Always also write JSON so we can quickly inspect what k6 actually produced
   const files = {
     'perf/k6/reports/last.json': JSON.stringify(data, null, 2),
@@ -145,7 +145,7 @@ export default function handleSummary(data) {
     options: data.options || {},
     state: data.state || {},
     metrics: Object.fromEntries(
-      Object.entries(metrics).slice(0, 30) // not to blow up the page
+      Object.entries(metrics).slice(0, 30)
     ),
   }, null, 2);
 
