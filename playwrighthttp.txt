@@ -1,199 +1,118 @@
-/* perf/k6/vendor/handleSummary.js
- *
- * Renders a richer HTML summary for k6 runs.
- * Works with:
- *  - tagged metrics (reqs_ep / latency_ep) when k6 exposes tag submetrics in the summary
- *  - concrete per-endpoint metrics (ep_reqs_* / ep_lat_*) as a fallback (always present)
- */
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Trend, Counter } from 'k6/metrics';
+import { SharedArray } from 'k6/data';
 
-function esc(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
+// ------------- config (simple & flexible) -------------
+const ONE = Number(__ENV.ONE || 0);         // set to 1 to do a single GET and exit
+const VUS = Number(__ENV.VUS || 2);         // concurrent users
+const DURATION = __ENV.DURATION || '';      // e.g. "10s" (if set, run duration-mode)
+const ITER = Number(__ENV.ITER || 0);       // iterations per VU (if >0 and no DURATION)
 
-function n(v, d) {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : (d || 0);
-}
-function fmtInt(v) { return n(v).toLocaleString(); }
-function fmtMs(v) { return `${Math.round(n(v))} ms`; }
+// what features to include; comma separated; default: everything in the source file
+const FEATURES_RAW = (__ENV.FEATURES || '').trim();
 
-function metricVals(m) {
-  // defensive: metric or values may be missing on some builds
-  const v = (m && m.values) ? m.values : {};
-  return {
-    avg: n(v.avg),
-    min: n(v.min),
-    med: n(v.med),
-    max: n(v.max),
-    p95: n(v['p(95)']),
-    count: n(v.count),
-    rate: n(v.rate)
-  };
-}
+// ----------------- load endpoints ---------------------
+const ENDPOINTS_BY_FEATURE = new SharedArray('eps', () => {
+  // IMPORTANT: this must point to your real file
+  // (path is relative to *this* runner file)
+  // eslint-disable-next-line import/no-unresolved
+  return require('../sources/endpoints.byFeature.js');  // CommonJS style is fine under extended mode
+});
 
-/* ---------------- tagged sub-metrics (ideal path) ----------------
-   Only some k6 builds expose submetrics in the end-of-test JSON.
-   If present, read them here. If not, we’ll fall back to concrete metrics. */
-function extractTaggedRows(metrics) {
-  const rows = [];
-  const reqM = metrics['reqs_ep'];
-  const latM = metrics['latency_ep'];
+// ----------------- sanitizers & helpers ----------------
+const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 
-  // k6 may encode sub-metrics differently across versions. The safest thing here
-  // is to scan the top-level “metrics” object for synthetic keys created by k6
-  // for tagged sub-metrics. Many builds will *not* include them; if we can’t
-  // find any, return [] and let the concrete fallback handle it.
-  // (Leaving this as a placeholder hook; returns [] in most environments.)
-  void reqM; void latM;
-  return rows;
-}
-
-/* -------- concrete per-endpoint metrics (fallback – always works) --------
-   Our runner creates:
-     Counter  ep_reqs_<feature>__<endpoint>
-     Trend    ep_lat_<feature>__<endpoint>
-   These always appear in the JSON summary; use them to build the table. */
-function scanConcreteRows(metrics) {
-  const rows = [];
-  const keys = Object.keys(metrics || {});
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i];
-    if (k.indexOf('ep_reqs_') === 0) {
-      const base = k.slice('ep_reqs_'.length); // "<f>__<e>"
-      const latKey = 'ep_lat_' + base;
-      const req = metricVals(metrics[k]);
-      const lat = metricVals(metrics[latKey]);
-      // derive display feature/endpoint from the slug parts
-      const parts = base.split('__');
-      const f = parts[0] || '';
-      const e = parts[1] || '';
-      rows.push({
-        feature: f.replace(/_/g, ' '),
-        endpoint: e.replace(/_/g, ' '),
-        count: req.count,
-        avg: lat.avg,
-        p95: lat.p95,
-        max: lat.max
-      });
-    }
+function listEndpointsToHit() {
+  // choose features
+  let wanted = Object.keys(ENDPOINTS_BY_FEATURE);
+  if (FEATURES_RAW) {
+    const wantSet = new Set(FEATURES_RAW.split(',').map(x => x.trim()).filter(Boolean));
+    wanted = wanted.filter((f) => wantSet.has(f));
   }
-  // sort by slowest p95 first
-  rows.sort((a, b) => (b.p95 - a.p95) || (b.max - a.max) || (b.count - a.count));
-  return rows;
+  // flatten feature -> endpoint[]
+  const out = [];
+  for (const feature of wanted) {
+    const arr = ENDPOINTS_BY_FEATURE[feature] || [];
+    for (const ep of arr) out.push({ feature, ep });
+  }
+  return out;
 }
 
-/* ---------------- HTML helpers ---------------- */
-function barRow(label, value, maxValue) {
-  const w = maxValue > 0 ? Math.min(100, Math.round((value / maxValue) * 100)) : 0;
-  return (
-    '<div style="margin:6px 0;">' +
-      `<div style="font:12px/16px system-ui,Segoe UI,Roboto,Arial">${esc(label)}&nbsp;&nbsp;` +
-      `<span style="color:#555">${fmtMs(value)}</span></div>` +
-      `<div style="height:10px;background:#eee;border-radius:6px;overflow:hidden">` +
-        `<div style="height:10px;width:${w}%;background:#3b82f6"></div>` +
-      `</div>` +
-    `</div>`
-  );
+// ----------------- concrete ep metrics -----------------
+const epReqs = new Map(); // slug -> Counter
+const epLat  = new Map(); // slug -> Trend
+function addEpMetrics(feature, endpoint, durationMs) {
+  const slug = `${slugify(feature)}__${slugify(endpoint)}`;
+  if (!epReqs.has(slug)) epReqs.set(slug, new Counter(`ep_reqs_${slug}`));
+  if (!epLat.has(slug))  epLat.set(slug,  new Trend(  `ep_lat_${slug}`));
+  epReqs.get(slug).add(1);
+  epLat.get(slug).add(durationMs);
 }
 
-function renderFeatureTable(rows) {
-  if (!rows || rows.length === 0) {
-    return '<p style="color:#666">No per-feature data (did the runner emit endpoint metrics?).</p>';
+// ----------------- k6 options -----------------
+export const options = (() => {
+  if (ONE) {
+    // do exactly one iteration, one VU
+    return { vus: 1, iterations: 1, thresholds: {} };
   }
-  let html = '<table style="border-collapse:collapse;width:100%;margin-top:8px">';
-  html += '<thead><tr>' +
-    cell('Feature', true) + cell('Endpoint', true) + cell('Requests', true, 'right') +
-    cell('avg', true, 'right') + cell('p(95)', true, 'right') + cell('max', true, 'right') +
-    '</tr></thead><tbody>';
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    html += '<tr>' +
-      cell(r.feature) +
-      cell(r.endpoint) +
-      cell(fmtInt(r.count), false, 'right') +
-      cell(fmtMs(r.avg), false, 'right') +
-      cell(fmtMs(r.p95), false, 'right') +
-      cell(fmtMs(r.max), false, 'right') +
-      '</tr>';
+  if (DURATION) {
+    return { vus: VUS, duration: DURATION, thresholds: {} };
   }
-  html += '</tbody></table>';
-  return html;
-
-  function cell(text, th, align) {
-    const pad = '8px 10px';
-    const b = '1px solid #eee';
-    const style = `padding:${pad};border-bottom:${b};${align ? 'text-align:'+align+';' : ''}` +
-                  (th ? 'font-weight:600;background:#fafafa' : '');
-    const t = esc(text);
-    return th ? `<th style="${style}">${t}</th>` : `<td style="${style}">${t}</td>`;
+  if (ITER > 0) {
+    return { vus: VUS, iterations: VUS * ITER, thresholds: {} };
   }
-}
+  // default: tiny smoke
+  return { vus: 1, iterations: 1, thresholds: {} };
+})();
 
-/* ---------------- main renderer ---------------- */
-export default function handleSummary(data) {
-  const m = data.metrics || {};
-
-  // totals
-  const httpDur = metricVals(m['http_req_duration']);
-  const checks = metricVals(m['checks']);
-  const httpReqs = metricVals(m['http_reqs']);
-  const iterations = metricVals(m['iterations']);
-  const vusMax = metricVals(m['vus_max']); // gauge
-
-  // per-feature rows (tagged first, fallback to concrete)
-  let rows = extractTaggedRows(m);
-  if (!rows || rows.length === 0) {
-    rows = scanConcreteRows(m);
+// ----------------- main -----------------
+export default function () {
+  const items = listEndpointsToHit();
+  if (!items.length) {
+    console.warn('No endpoints selected for FEATURES=', FEATURES_RAW || '(all)');
+    sleep(0.2);
+    return;
   }
 
-  const maxForBars = Math.max(httpDur.max || 0, httpDur.p95 || 0, httpDur.avg || 0);
+  // simple round-robin across endpoints
+  const idx = (__ITER || 0) % items.length;
+  const { feature, ep } = items[idx];
 
-  const title = `SDLC Auto Gov Load Test — ${new Date().toISOString().replace('T', ' ').slice(0,19)}`;
+  const tags = { feature, endpoint: ep.name };
+  const url = ep.url;
+  const method = (ep.method || 'GET').toUpperCase();
+  const headers = Object.assign({ 'user-agent': 'k6:auto-runner' }, ep.headers || {});
+  const body = ep.body || null;
 
-  const head =
-`<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<title>${esc(title)}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-</head>
-<body style="margin:20px;font:14px/1.4 system-ui,Segoe UI,Roboto,Arial">
-<h1 style="margin:0 0 16px 0;font-size:26px">${esc(title)}</h1>
+  let res;
+  if (method === 'GET') {
+    res = http.get(url, { headers, tags });
+  } else if (method === 'POST') {
+    res = http.post(url, body, { headers, tags });
+  } else if (method === 'PATCH') {
+    res = http.patch(url, body, { headers, tags });
+  } else if (method === 'DELETE') {
+    res = http.del(url, null, { headers, tags });
+  } else {
+    res = http.request(method, url, body, { headers, tags });
+  }
 
-<table style="border-collapse:collapse;min-width:520px">
-  <tr><th style="${th()}">Checks (pass/fail)</th><td style="${td()}">${fmtInt(checks.count)} / 0</td></tr>
-  <tr><th style="${th()}">Requests</th><td style="${td()}">${fmtInt(httpReqs.count)} total</td></tr>
-  <tr><th style="${th()}">Latency p(95)</th><td style="${td()}">${fmtMs(httpDur.p95)}</td></tr>
-  <tr><th style="${th()}">Latency avg / min / max</th><td style="${td()}">${fmtMs(httpDur.avg)} / ${fmtMs(httpDur.min)} / ${fmtMs(httpDur.max)}</td></tr>
-  <tr><th style="${th()}">Iterations</th><td style="${td()}">${fmtInt(iterations.count)}</td></tr>
-  <tr><th style="${th()}">VUs max</th><td style="${td()}">${fmtInt(vusMax.value || vusMax.max || 0)}</td></tr>
-</table>
+  // checks (always) – status and optional text
+  const want = ep.expect || {};
+  const mustStatus = Number(want.status || 200);
+  const mustContain = (want.text || '').trim();
 
-<div style="height:10px"></div>
-<div style="max-width:700px">
-  ${barRow('avg',  httpDur.avg, maxForBars)}
-  ${barRow('p(95)', httpDur.p95, maxForBars)}
-  ${barRow('max',  httpDur.max, maxForBars)}
-</div>
+  check(res, {
+    'status ok': (r) => r.status === mustStatus,
+    ...(mustContain
+      ? { 'body has text': (r) => String(r.body || '').indexOf(mustContain) !== -1 }
+      : {}),
+  }, tags);
 
-<h2 style="margin-top:20px">Feature / Endpoint breakdown</h2>
-${renderFeatureTable(rows)}
+  // push our concrete per-endpoint metrics
+  addEpMetrics(feature, ep.name, res.timings.duration);
 
-<h3 style="margin-top:20px">Raw JSON (truncated)</h3>
-<pre style="white-space:pre-wrap;background:#f6f8fa;border:1px solid #eee;border-radius:6px;padding:10px;max-height:360px;overflow:auto;">${
-  esc(JSON.stringify(data, null, 2).slice(0, 20000))
-}</pre>
-
-</body></html>`;
-
-  function th(){return 'text-align:left;padding:6px 10px;border:1px solid #eee;background:#fafafa'}
-  function td(){return 'padding:6px 10px;border:1px solid #eee'}
-
-  // Write to the same location you’ve been using
-  const outPath = 'perf/k6/reports/summary.html';
-  return { [outPath]: head };
+  // be nice if running iterations
+  sleep(0.1);
 }
