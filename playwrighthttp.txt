@@ -1,194 +1,199 @@
 // perf/k6/vendor/handleSummary.js
-//
-// Minimal, robust HTML reporter with Feature/Endpoint table.
-// Looks for custom metrics named either like:
-//   reqs_ep{feature=Foo,endpoint=Bar}
-//   latency_ep{feature=Foo,endpoint=Bar}
-// or flattened variants like:
-//   reqs_ep_Foo_Bar
-//   latency_ep_Foo_Bar
-//
-// It’s deliberately “plain JS strings only” to avoid template parse errors.
+// ASCII-only, plain JS strings, no template literals.
+// Generates summary.html + last.json and includes a Feature/Endpoint table.
+// Looks for custom metrics named like:
+//   reqs_ep{feature=Foo,endpoint=Bar}   or   reqs_ep_Foo_Bar
+//   latency_ep{feature=Foo,endpoint=Bar} or latency_ep_Foo_Bar
 
-function fmtInt(n) { return typeof n === 'number' ? Math.round(n).toString() : '0'; }
-function fmtMs(n)  { return typeof n === 'number' ? `${Math.round(n)} ms` : '0 ms'; }
+function fmtInt(n) { return (typeof n === "number" && isFinite(n)) ? String(Math.round(n)) : "0"; }
+function fmtMs(n)  { return (typeof n === "number" && isFinite(n)) ? String(Math.round(n)) + " ms" : "0 ms"; }
+
 function esc(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  var t = String(s == null ? "" : s);
+  t = t.replace(/&/g, "&amp;");
+  t = t.replace(/</g, "&lt;");
+  t = t.replace(/>/g, "&gt;");
+  t = t.replace(/"/g, "&quot;");
+  t = t.replace(/'/g, "&#39;");
+  return t;
 }
 
-// Pull a single trend value safely
 function trendValue(metric, key) {
   if (!metric || !metric.values) return null;
-  const v = metric.values[key];
-  return (typeof v === 'number' && isFinite(v)) ? v : null;
+  var v = metric.values[key];
+  return (typeof v === "number" && isFinite(v)) ? v : null;
 }
 
-// Try to read global latency (http_req_duration preferred)
 function globalLatency(data) {
-  const m = data.metrics['http_req_duration'] || data.metrics['http_req_duration{expected_response:true}'] || null;
+  var m = (data.metrics && data.metrics["http_req_duration"]) ||
+          (data.metrics && data.metrics["http_req_duration{expected_response:true}"]) ||
+          null;
   return {
-    avg: trendValue(m, 'avg'),
-    p95: trendValue(m, 'p(95)'),
-    max: trendValue(m, 'max'),
-    min: trendValue(m, 'min'),
-    med: trendValue(m, 'med'),
+    avg: trendValue(m, "avg"),
+    p95: trendValue(m, "p(95)"),
+    max: trendValue(m, "max"),
+    min: trendValue(m, "min"),
+    med: trendValue(m, "med")
   };
 }
 
-// Parse metric name to {feature, endpoint}
 function parseFeatEp(name) {
-  // Prom-style: reqs_ep{feature=Foo,endpoint=Bar}
-  const brace = name.indexOf('{');
-  if (brace !== -1) {
-    const inside = name.slice(brace + 1, name.lastIndexOf('}'));
-    const tags = {};
-    inside.split(',').forEach(pair => {
-      const i = pair.indexOf('=');
-      if (i > 0) tags[pair.slice(0, i).trim()] = pair.slice(i + 1).trim().replace(/^"|"$/g, '');
-    });
-    return { feature: tags.feature || 'unknown', endpoint: tags.endpoint || 'unknown' };
+  var i = name.indexOf("{");
+  if (i !== -1) {
+    var inside = name.slice(i + 1, name.lastIndexOf("}"));
+    var parts = inside.split(",");
+    var tags = {};
+    for (var k = 0; k < parts.length; k++) {
+      var pair = parts[k];
+      var j = pair.indexOf("=");
+      if (j > 0) {
+        var key = pair.slice(0, j).trim();
+        var val = pair.slice(j + 1).trim();
+        if (val.length >= 2 && ((val.charAt(0) === "\"" && val.charAt(val.length - 1) === "\"") ||
+                                (val.charAt(0) === "'" && val.charAt(val.length - 1) === "'"))) {
+          val = val.slice(1, -1);
+        }
+        tags[key] = val;
+      }
+    }
+    return { feature: tags.feature || "unknown", endpoint: tags.endpoint || "unknown" };
   }
-  // Flat: reqs_ep_Feature_Endpoint (last two parts)
-  const parts = name.split('_');
-  if (parts.length >= 3) {
-    return { feature: parts[parts.length - 2], endpoint: parts[parts.length - 1] };
+  var flat = name.split("_");
+  if (flat.length >= 3) {
+    return { feature: flat[flat.length - 2], endpoint: flat[flat.length - 1] };
   }
   return null;
 }
 
-// Build Feature/Endpoint aggregation from custom metrics
 function collectFeatureTable(data) {
-  const table = new Map(); // key `${feature}|${endpoint}` -> {feature,endpoint,reqs,avg,p95,max}
-  const metrics = data.metrics || {};
-
-  for (const [name, m] of Object.entries(metrics)) {
-    if (!name.startsWith('reqs_ep') && !name.startsWith('latency_ep')) continue;
-    const parsed = parseFeatEp(name);
+  var table = {}; // key "feature|endpoint" -> row
+  var metrics = data.metrics || {};
+  var names = Object.keys(metrics);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (!(name.indexOf("reqs_ep") === 0 || name.indexOf("latency_ep") === 0)) continue;
+    var parsed = parseFeatEp(name);
     if (!parsed) continue;
-    const key = `${parsed.feature}|${parsed.endpoint}`;
-    const row = table.get(key) || { feature: parsed.feature, endpoint: parsed.endpoint, reqs: 0, avg: null, p95: null, max: null };
+    var key = parsed.feature + "|" + parsed.endpoint;
+    var row = table[key] || { feature: parsed.feature, endpoint: parsed.endpoint, reqs: 0, avg: null, p95: null, max: null };
+    var m = metrics[name];
 
-    if (name.startsWith('reqs_ep')) {
-      const c = m && m.values && typeof m.values.count === 'number' ? m.values.count : 0;
+    if (name.indexOf("reqs_ep") === 0) {
+      var c = (m && m.values && typeof m.values.count === "number") ? m.values.count : 0;
       row.reqs += c;
-    } else if (name.startsWith('latency_ep')) {
-      row.avg = trendValue(m, 'avg') ?? row.avg;
-      row.p95 = trendValue(m, 'p(95)') ?? row.p95;
-      row.max = trendValue(m, 'max') ?? row.max;
+    } else {
+      var a = trendValue(m, "avg");
+      var p = trendValue(m, "p(95)");
+      var x = trendValue(m, "max");
+      if (a != null) row.avg = a;
+      if (p != null) row.p95 = p;
+      if (x != null) row.max = x;
     }
-    table.set(key, row);
+    table[key] = row;
   }
-
-  return Array.from(table.values()).sort((a, b) => (b.p95 ?? 0) - (a.p95 ?? 0));
+  var out = [];
+  var keys = Object.keys(table);
+  for (var j = 0; j < keys.length; j++) out.push(table[keys[j]]);
+  out.sort(function(a, b) { return (b.p95 || 0) - (a.p95 || 0); });
+  return out;
 }
 
 function bar(widthPx, ratio) {
-  const w = Math.max(0, Math.min(1, Number(ratio))) * widthPx;
-  return '<div style="background:#e9eef6; height:10px; width:'+widthPx+'px; border-radius:4px; overflow:hidden;">'
-       + '<div style="background:#3b82f6; height:10px; width:'+w+'px;"></div>'
-       + '</div>';
+  var r = Number(ratio);
+  if (!isFinite(r) || r < 0) r = 0;
+  if (r > 1) r = 1;
+  var w = Math.round(r * widthPx);
+  return "<div style=\"background:#e9eef6;height:10px;width:" + widthPx + "px;border-radius:4px;overflow:hidden;\">" +
+         "<div style=\"background:#3b82f6;height:10px;width:" + w + "px;\"></div></div>";
 }
 
 export function handleSummary(data) {
-  // Top stats
-  const checks = data.metrics && data.metrics.checks && data.metrics.checks.values
-    ? data.metrics.checks.values : { passes: 0, fails: 0 };
-  const http_reqs = data.metrics && data.metrics.http_reqs && data.metrics.http_reqs.values
-    ? data.metrics.http_reqs.values : { count: 0 };
-  const iters = data.metrics && data.metrics.iterations && data.metrics.iterations.values
-    ? data.metrics.iterations.values : { count: 0 };
-  const vus_max = data.metrics && data.metrics.vus_max && data.metrics.vus_max.values
-    ? data.metrics.vus_max.values : { value: 0 };
+  var checks = (data.metrics && data.metrics.checks && data.metrics.checks.values) ? data.metrics.checks.values : { passes: 0, fails: 0 };
+  var http_reqs = (data.metrics && data.metrics.http_reqs && data.metrics.http_reqs.values) ? data.metrics.http_reqs.values : { count: 0 };
+  var iters = (data.metrics && data.metrics.iterations && data.metrics.iterations.values) ? data.metrics.iterations.values : { count: 0 };
+  var vus_max = (data.metrics && data.metrics.vus_max && data.metrics.vus_max.values) ? data.metrics.vus_max.values : { value: 0 };
 
-  const gl = globalLatency(data);
+  var gl = globalLatency(data);
+  var featRows = collectFeatureTable(data);
+  var hasFeat = featRows.length > 0;
+  var maxForBars = Math.max(gl.max || 0, gl.p95 || 0, gl.avg || 0, 1);
 
-  // Feature table
-  const featRows = collectFeatureTable(data);
-  const hasFeat = featRows.length > 0;
+  var when = new Date().toISOString().replace("T", " ").replace(/\..+/, "");
 
-  // For the little bars, normalize against max we have
-  const maxForBars = Math.max(gl.max || 0, gl.p95 || 0, gl.avg || 0, 1);
+  var html = "";
+  html += "<!doctype html><html><head><meta charset=\"utf-8\"><title>SDLC Auto Gov Load Test</title>";
+  html += "<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;color:#111}" +
+          "h1{font-size:22px;margin:0 0 16px}" +
+          "table{border-collapse:collapse;margin:12px 0;width:720px;max-width:100%}" +
+          "th,td{border:1px solid #e5e7eb;padding:8px;text-align:left;font-size:13px}" +
+          "th{background:#f8fafc;font-weight:600}" +
+          ".muted{color:#64748b;font-size:12px}" +
+          ".bars{margin:16px 0 8px;width:720px;max-width:100%}" +
+          ".mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap}" +
+          "</style></head><body>";
 
-  let html = '';
-  html += '<!doctype html><html><head><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>';
-  html += '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;color:#111}'
-       +  'h1{font-size:22px;margin:0 0 16px}'
-       +  'table{border-collapse:collapse;margin:12px 0;width:720px;max-width:100%}'
-       +  'th,td{border:1px solid #e5e7eb;padding:8px;text-align:left;font-size:13px}'
-       +  'th{background:#f8fafc;font-weight:600}'
-       +  '.muted{color:#64748b;font-size:12px}'
-       +  '.bars{margin:16px 0 8px; width:720px; max-width:100%}'
-       +  '.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap}'
-       +  '</style></head><body>';
+  html += "<h1>SDLC Auto Gov Load Test — " + esc(when) + "</h1>";
 
-  // Header
-  const when = new Date().toISOString().replace('T',' ').replace(/\..+/, '');
-  html += '<h1>SDLC Auto Gov Load Test — '+esc(when)+'</h1>';
+  html += "<table><tbody>";
+  html += "<tr><th>Checks (pass/fail)</th><td>" + fmtInt(checks.passes) + " / " + fmtInt(checks.fails) + "</td></tr>";
+  html += "<tr><th>Requests</th><td>" + fmtInt(http_reqs.count) + " total</td></tr>";
+  html += "<tr><th>Latency p(95)</th><td>" + (gl.p95 != null ? fmtMs(gl.p95) : "n/a") + "</td></tr>";
+  html += "<tr><th>Latency avg / min / max</th><td>" +
+          (gl.avg != null ? fmtMs(gl.avg) : "n/a") + " / " +
+          (gl.min != null ? fmtMs(gl.min) : "n/a") + " / " +
+          (gl.max != null ? fmtMs(gl.max) : "n/a") + "</td></tr>";
+  html += "<tr><th>Iterations</th><td>" + fmtInt(iters.count) + "</td></tr>";
+  html += "<tr><th>VUs max</th><td>" + fmtInt(vus_max.value) + "</td></tr>";
+  html += "</tbody></table>";
 
-  // Summary table
-  html += '<table><tbody>';
-  html += '<tr><th>Checks (pass/fail)</th><td>'+fmtInt(checks.passes)+' / '+fmtInt(checks.fails)+'</td></tr>';
-  html += '<tr><th>Requests</th><td>'+fmtInt(http_reqs.count)+' total</td></tr>';
-  html += '<tr><th>Latency p(95)</th><td>'+(gl.p95!=null?fmtMs(gl.p95):'n/a')+'</td></tr>';
-  html += '<tr><th>Latency avg / min / max</th><td>'
-       +  (gl.avg!=null?fmtMs(gl.avg):'n/a')+' / '
-       +  (gl.min!=null?fmtMs(gl.min):'n/a')+' / '
-       +  (gl.max!=null?fmtMs(gl.max):'n/a')+'</td></tr>';
-  html += '<tr><th>Iterations</th><td>'+fmtInt(iters.count)+'</td></tr>';
-  html += '<tr><th>VUs max</th><td>'+fmtInt(vus_max.value)+'</td></tr>';
-  html += '</tbody></table>';
+  html += "<div class=\"bars\">";
+  html += "<div style=\"display:flex;align-items:center;gap:12px;margin:6px 0;\">" +
+          "<div class=\"muted\" style=\"width:60px\">avg</div>" + bar(440, (gl.avg || 0) / maxForBars) +
+          "<div class=\"muted\">" + (gl.avg != null ? fmtMs(gl.avg) : "n/a") + "</div></div>";
+  html += "<div style=\"display:flex;align-items:center;gap:12px;margin:6px 0;\">" +
+          "<div class=\"muted\" style=\"width:60px\">p(95)</div>" + bar(440, (gl.p95 || 0) / maxForBars) +
+          "<div class=\"muted\">" + (gl.p95 != null ? fmtMs(gl.p95) : "n/a") + "</div></div>";
+  html += "<div style=\"display:flex;align-items:center;gap:12px;margin:6px 0;\">" +
+          "<div class=\"muted\" style=\"width:60px\">max</div>" + bar(440, (gl.max || 0) / maxForBars) +
+          "<div class=\"muted\">" + (gl.max != null ? fmtMs(gl.max) : "n/a") + "</div></div>";
+  html += "</div>";
 
-  // Latency bars
-  html += '<div class="bars">';
-  html += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0;">'
-       +  '<div class="muted" style="width:60px">avg</div>'+ bar(440, (gl.avg||0)/maxForBars)
-       +  '<div class="muted">'+(gl.avg!=null?fmtMs(gl.avg):'n/a')+'</div></div>';
-  html += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0;">'
-       +  '<div class="muted" style="width:60px">p(95)</div>'+ bar(440, (gl.p95||0)/maxForBars)
-       +  '<div class="muted">'+(gl.p95!=null?fmtMs(gl.p95):'n/a')+'</div></div>';
-  html += '<div style="display:flex;align-items:center;gap:12px;margin:6px 0;">'
-       +  '<div class="muted" style="width:60px">max</div>'+ bar(440, (gl.max||0)/maxForBars)
-       +  '<div class="muted">'+(gl.max!=null?fmtMs(gl.max):'n/a')+'</div></div>';
-  html += '</div>';
-
-  // Feature / Endpoint breakdown
-  html += '<h2 style="margin-top:20px">Feature / Endpoint breakdown</h2>';
+  html += "<h2 style=\"margin-top:20px\">Feature / Endpoint breakdown</h2>";
   if (!hasFeat) {
-    html += '<div class="muted">No per-feature data (did the runner emit endpoint metrics?).</div>';
+    html += "<div class=\"muted\">No per-feature data (did the runner emit endpoint metrics?).</div>";
   } else {
-    html += '<table><thead><tr>'
-         +  '<th style="width:22%">Feature</th>'
-         +  '<th style="width:38%">Endpoint</th>'
-         +  '<th style="width:10%">Reqs</th>'
-         +  '<th style="width:10%">avg</th>'
-         +  '<th style="width:10%">p(95)</th>'
-         +  '<th style="width:10%">max</th>'
-         +  '</tr></thead><tbody>';
-    for (const r of featRows) {
-      html += '<tr>'
-           +  '<td>'+esc(r.feature)+'</td>'
-           +  '<td class="mono">'+esc(r.endpoint)+'</td>'
-           +  '<td>'+fmtInt(r.reqs)+'</td>'
-           +  '<td>'+(r.avg!=null?fmtMs(r.avg):'n/a')+'</td>'
-           +  '<td>'+(r.p95!=null?fmtMs(r.p95):'n/a')+'</td>'
-           +  '<td>'+(r.max!=null?fmtMs(r.max):'n/a')+'</td>'
-           +  '</tr>';
+    html += "<table><thead><tr>" +
+            "<th style=\"width:22%\">Feature</th>" +
+            "<th style=\"width:38%\">Endpoint</th>" +
+            "<th style=\"width:10%\">Reqs</th>" +
+            "<th style=\"width:10%\">avg</th>" +
+            "<th style=\"width:10%\">p(95)</th>" +
+            "<th style=\"width:10%\">max</th>" +
+            "</tr></thead><tbody>";
+    for (var r = 0; r < featRows.length; r++) {
+      var row = featRows[r];
+      html += "<tr>" +
+              "<td>" + esc(row.feature) + "</td>" +
+              "<td class=\"mono\">" + esc(row.endpoint) + "</td>" +
+              "<td>" + fmtInt(row.reqs) + "</td>" +
+              "<td>" + (row.avg != null ? fmtMs(row.avg) : "n/a") + "</td>" +
+              "<td>" + (row.p95 != null ? fmtMs(row.p95) : "n/a") + "</td>" +
+              "<td>" + (row.max != null ? fmtMs(row.max) : "n/a") + "</td>" +
+              "</tr>";
     }
-    html += '</tbody></table>';
+    html += "</tbody></table>";
   }
 
-  // Small raw JSON section (truncated – just metrics keys to keep file small)
-  const metricKeys = Object.keys(data.metrics || {});
-  html += '<details style="margin-top:14px"><summary class="muted">Raw JSON (truncated)</summary>'
-       +  '<div class="mono">'+esc(JSON.stringify({ options: data.options, state: data.state, metricKeys }, null, 2))+'</div>'
-       +  '</details>';
+  var metricKeys = Object.keys(data.metrics || {});
+  var tiny = { options: data.options, state: data.state, metricKeys: metricKeys };
 
-  html += '</body></html>';
+  html += "<details style=\"margin-top:14px\"><summary class=\"muted\">Raw JSON (truncated)</summary>" +
+          "<div class=\"mono\">" + esc(JSON.stringify(tiny, null, 2)) + "</div></details>";
+
+  html += "</body></html>";
 
   return {
-    'perf/k6/reports/summary.html': { data: html, format: 'html' },
-    'perf/k6/reports/last.json': JSON.stringify(data, null, 2),
+    "perf/k6/reports/summary.html": { data: html, format: "html" },
+    "perf/k6/reports/last.json": JSON.stringify(data, null, 2)
   };
 }
