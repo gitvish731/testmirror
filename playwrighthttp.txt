@@ -1,86 +1,111 @@
-// perf/k6/vendor/handleSummary.js
-// k6 v0.46-safe (no template literals). Reads the shared ACC.
+// perf/k6/scenarios/from-playwright.http.min.js
+// Super-minimal runner for k6 v0.46 that records per-feature/endpoint stats
+// and re-exports handleSummary.
 
-import { ACC, finalize } from './acc.js';
+import http from 'k6/http';
+import { sleep, check } from 'k6';
+import featuresMap from '../sources/endpoints.byFeature.js';
+import { note } from '../vendor/acc.js';
+export { default as handleSummary } from '../vendor/handleSummary.js';
 
-function esc(s) {
-  if (s == null) return "";
-  s = String(s);
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+// ------- env / CLI -------
+const RAW_FEATURES = String(__ENV.FEATURES || '').trim();
+const SELECTED = RAW_FEATURES ? RAW_FEATURES.split(',').map(s => s.trim()).filter(Boolean) : Object.keys(featuresMap || {});
+const VUS = Number(__ENV.VUS || 1);
+const ITERS = Number(__ENV.ITERS || 0);
+const DURATION = String(__ENV.DURATION || '30s');
+
+// log what we see
+console.log('parsed -> vus=' + VUS + ', iters=' + ITERS + ', duration=' + DURATION + ', features=' + SELECTED.join('|'));
+
+// ------- options -------
+export const options = (function () {
+  if (ITERS > 0) {
+    return {
+      scenarios: {
+        by_iter: {
+          executor: 'per-vu-iterations',
+          vus: VUS,
+          iterations: ITERS,
+          gracefulStop: '3s',
+        },
+      },
+      thresholds: {},
+    };
+  } else {
+    return {
+      scenarios: {
+        by_time: {
+          executor: 'constant-vus',
+          vus: VUS,
+          duration: DURATION,
+          gracefulStop: '3s',
+        },
+      },
+      thresholds: {},
+    };
+  }
+})();
+
+// ------- tiny helpers -------
+function asHeaders(obj) {
+  var h = {};
+  if (!obj) return h;
+  for (var k in obj) { if (obj.hasOwnProperty(k)) h[k] = String(obj[k]); }
+  return h;
 }
 
-function asTable(title, rows) {
-  if (!rows || !rows.length) {
-    return [
-      '<h3 style="margin-top:14px;">', esc(title), '</h3>',
-      '<div class="mono">No ', esc(title.toLowerCase()), ' recorded.</div>'
-    ].join("");
+// ------- main -------
+export default function () {
+  for (var i = 0; i < SELECTED.length; i += 1) {
+    var feature = SELECTED[i];
+    var list = (featuresMap && featuresMap[feature]) ? featuresMap[feature] : [];
+    if (!list || !list.length) continue;
+
+    // keep it simple: run each declared endpoint once per VU iteration
+    for (var j = 0; j < list.length; j += 1) {
+      var ep = list[j] || {};
+      var name = ep.name || ('endpoint-' + j);
+
+      var params = { headers: asHeaders(ep.headers || {}) };
+      var res;
+
+      // only GET is needed for your current case; others kept for later
+      var started = Date.now();
+      try {
+        if ((ep.method || 'GET').toUpperCase() === 'GET') {
+          res = http.get(ep.url, params);
+        } else if (ep.method && ep.method.toUpperCase() === 'POST') {
+          res = http.post(ep.url, ep.body || null, params);
+        } else if (ep.method && ep.method.toUpperCase() === 'PATCH') {
+          res = http.patch(ep.url, ep.body || null, params);
+        } else if (ep.method && ep.method.toUpperCase() === 'DELETE') {
+          res = http.del(ep.url, null, params);
+        } else {
+          // fallback to GET
+          res = http.get(ep.url, params);
+        }
+      } catch (e) {
+        // network error — still record with 0 duration so we see the attempt
+        note(feature, name, 0);
+        console.log('WARN network error for ' + feature + ' / ' + name + ': ' + String(e && e.message));
+        continue;
+      }
+      var dur = res && res.timings && typeof res.timings.duration === 'number' ? res.timings.duration : (Date.now() - started);
+      note(feature, name, dur);
+
+      // minimal checks (optional)
+      var exp = ep.expect || {};
+      if (typeof exp.status === 'number') {
+        check(res, { 'status ok': (r) => r.status === exp.status });
+      }
+      if (typeof exp.text === 'string' && exp.text) {
+        var body = res && res.body ? String(res.body) : '';
+        check(res, { 'body has text': () => body.indexOf(String(exp.text)) !== -1 });
+      }
+    }
   }
-  var out = [];
-  out.push('<h3 style="margin-top:14px;">', esc(title), '</h3>');
-  out.push('<table style="border-collapse:collapse;width:100%;">');
-  out.push('<thead><tr>',
-           '<th style="text-align:left;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Name</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Requests</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Avg latency</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">p(95)</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">max</th>',
-           '</tr></thead><tbody>');
-  for (var i = 0; i < rows.length; i += 1) {
-    var r = rows[i];
-    out.push('<tr>',
-      '<td style="padding:6px 8px;border-bottom:1px solid #f1f1f1;">', esc(r.name), '</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', String(r.count || 0), '</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.avg || 0), ' ms</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.p95 || 0), ' ms</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.max || 0), ' ms</td>',
-    '</tr>');
-  }
-  out.push('</tbody></table>');
-  return out.join("");
-}
 
-export default function handleSummary(data) {
-  // Close out percentiles/averages right before rendering
-  var acc = finalize(); // works on shared ACC
-
-  // Build sorted rows
-  function rows(obj) {
-    var r = [];
-    for (var k in obj) { if (obj.hasOwnProperty(k)) r.push({ name: k,
-      count: obj[k].count || 0, avg: obj[k].avg || 0, p95: obj[k].p95 || 0, max: obj[k].max || 0 }); }
-    r.sort(function(a,b){ return (b.count||0)-(a.count||0); });
-    return r;
-  }
-  var featRows = rows(acc.byFeature || {});
-  var epRows   = rows(acc.byEndpoint || {});
-
-  var title = 'SDLC Auto Gov Load Test — ' + new Date().toISOString().replace('T',' ').slice(0,19) + ' (enhanced)';
-
-  var html = [
-    '<!doctype html><html><head><meta charset="utf-8"><title>', esc(title), '</title>',
-    '<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px;color:#111}',
-    'h2{margin:0 0 12px 0} h3{margin:18px 0 8px 0} .mono{font-family:ui-monospace,Consolas,Monaco,monospace;color:#555}</style>',
-    '</head><body>',
-    '<h2>', esc(title), '</h2>',
-    asTable('Feature breakdown', featRows),
-    asTable('Endpoint breakdown', epRows),
-    '<details style="margin-top:18px;"><summary>Raw JSON (truncated)</summary>',
-    '<pre class="mono" style="white-space:pre-wrap;">', esc(JSON.stringify({ acc: acc, options: data && data.options }, null, 2)), '</pre>',
-    '</details>',
-    '</body></html>'
-  ].join('');
-
-  var text = [
-    '=== Enhanced summary active ===',
-    'Features: ' + Object.keys(acc.byFeature || {}).length,
-    'Endpoints: ' + Object.keys(acc.byEndpoint || {}).length
-  ].join('\n');
-
-  return {
-    stdout: text,
-    'perf/k6/reports/summary.html': html,
-    'perf/k6/reports/summary.json': JSON.stringify(data || {}, null, 2)
-  };
+  // be a tiny bit nice to the server
+  sleep(0.2);
 }
