@@ -1,13 +1,13 @@
 // perf/k6/vendor/handleSummary.js
-// Compatible with K6 v0.46 (no optional chaining)
+// Compatible with K6 v0.46 – includes max latency in both tables
 
 function UNSLUG(s) {
   return String(s || '').replace(/__/g, ' :: ').replace(/_/g, ' ').trim();
 }
 
 export default function handleSummary(data) {
-  var metrics = (data && data.metrics) ? data.metrics : {};
-  var rows = []; // per-endpoint rows
+  var metrics = data && data.metrics ? data.metrics : {};
+  var rows = [];
 
   var keys = Object.keys(metrics);
   for (var i = 0; i < keys.length; i++) {
@@ -24,11 +24,11 @@ export default function handleSummary(data) {
 
     var avg = latVals && typeof latVals.avg === 'number' ? Math.round(latVals.avg) : 0;
     var p95 = latVals && typeof latVals['p(95)'] === 'number' ? Math.round(latVals['p(95)']) : 0;
-    var max = latVals && typeof latVals.max === 'number' ? Math.round(latVals.max) : 0; // 👈 NEW LINE
+    var max = latVals && typeof latVals.max === 'number' ? Math.round(latVals.max) : 0; // ✅ new
 
-    var split = tail.split('__');
-    var featSlug = split.shift() || '';
-    var epSlug = split.join('__');
+    var parts = tail.split('__');
+    var featSlug = parts.shift() || '';
+    var epSlug = parts.join('__');
 
     rows.push({
       feature: UNSLUG(featSlug),
@@ -36,7 +36,7 @@ export default function handleSummary(data) {
       requests: cnt,
       avg: avg,
       p95: p95,
-      max: max // 👈 NEW FIELD
+      max: max
     });
   }
 
@@ -49,24 +49,24 @@ export default function handleSummary(data) {
     byFeature[r.feature].avgSum += r.avg;
     byFeature[r.feature].endpoints += 1;
     if (r.p95 > byFeature[r.feature].p95Max) byFeature[r.feature].p95Max = r.p95;
-    if (r.max > byFeature[r.feature].maxMax) byFeature[r.feature].maxMax = r.max; // 👈 Aggregate max
+    if (r.max > byFeature[r.feature].maxMax) byFeature[r.feature].maxMax = r.max;
   }
 
   var featRows = [];
-  var fNames = Object.keys(byFeature);
-  for (var f = 0; f < fNames.length; f++) {
-    var fname = fNames[f];
+  var fKeys = Object.keys(byFeature);
+  for (var f = 0; f < fKeys.length; f++) {
+    var fname = fKeys[f];
     var agg = byFeature[fname];
     featRows.push({
       feature: fname,
       requests: agg.requests,
       avg: agg.endpoints ? Math.round(agg.avgSum / agg.endpoints) : 0,
       p95: agg.p95Max,
-      max: agg.maxMax // 👈 Include max latency
+      max: agg.maxMax
     });
   }
 
-  // HTML output
+  // HTML rendering
   var css = 'body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:24px}' +
             'h1{font-size:22px;margin:0 0 12px}' +
             'h2{font-size:16px;margin:24px 0 8px}' +
@@ -78,25 +78,24 @@ export default function handleSummary(data) {
 
   var now = new Date();
   var titleTime = now.toISOString().replace('T', ' ').slice(0, 19);
-
   var head = '<h1>SDLC Auto Gov Load Test — <span class="mono">' + titleTime + '</span></h1>' +
-             '<div class="muted">Enhanced Summary Active</div>';
+             '<div class="muted">Custom Summary Active (Enhanced)</div>';
 
-  var featTbl = (featRows.length
+  var featTbl = featRows.length
     ? '<table><thead><tr><th>Feature</th><th>Requests</th><th>Avg latency</th><th>p(95)</th><th>Max latency</th></tr></thead><tbody>' +
       featRows.map(function (r) {
         return '<tr><td>' + r.feature + '</td><td>' + r.requests + '</td><td>' + r.avg + ' ms</td><td>' + r.p95 + ' ms</td><td>' + r.max + ' ms</td></tr>';
       }).join('') +
       '</tbody></table>'
-    : '<div class="muted">No feature data recorded.</div>');
+    : '<div class="muted">No feature data recorded.</div>';
 
-  var epTbl = (rows.length
+  var epTbl = rows.length
     ? '<table><thead><tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg latency</th><th>p(95)</th><th>Max latency</th></tr></thead><tbody>' +
       rows.map(function (r) {
         return '<tr><td>' + r.feature + '</td><td>' + r.endpoint + '</td><td>' + r.requests + '</td><td>' + r.avg + ' ms</td><td>' + r.p95 + ' ms</td><td>' + r.max + ' ms</td></tr>';
       }).join('') +
       '</tbody></table>'
-    : '<div class="muted">No endpoint data recorded.</div>');
+    : '<div class="muted">No endpoint data recorded.</div>';
 
   var html = '<!doctype html><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>' +
              '<style>' + css + '</style><body>' + head +
@@ -104,15 +103,17 @@ export default function handleSummary(data) {
              '<h2>Endpoint breakdown</h2>' + epTbl +
              '</body>';
 
-  var jsonByFeature = {};
-  for (var x = 0; x < featRows.length; x++) {
-    var fr = featRows[x];
-    jsonByFeature[fr.feature] = { requests: fr.requests, avg: fr.avg, p95: fr.p95, max: fr.max };
-  }
-  var json = { byFeature: jsonByFeature, byEndpoint: rows };
+  // JSON export
+  var json = {
+    byFeature: featRows.reduce(function (acc, r) {
+      acc[r.feature] = { requests: r.requests, avg: r.avg, p95: r.p95, max: r.max };
+      return acc;
+    }, {}),
+    byEndpoint: rows
+  };
 
   return {
-    stdout: 'Enhanced summary active\n',
+    stdout: 'Enhanced summary active with Max latency\n',
     'perf/k6/reports/summary.html': html,
     'perf/k6/reports/summary.json': JSON.stringify(json, null, 2)
   };
