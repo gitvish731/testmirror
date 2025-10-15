@@ -1,0 +1,107 @@
+// ESM: default export is a function(data) -> outputs
+// Scans data.metrics for our per-endpoint metrics:
+//   Counter: reqs_ep__<feature__endpoint slug>
+//   Trend  : lat_ep__<feature__endpoint slug>
+
+const UNSLUG = (s) => String(s || '').replace(/__/g, ' :: ').replace(/_/g, ' ').trim();
+
+export default function handleSummary(data) {
+  // collect rows by matching metric names
+  const metrics = data && data.metrics ? data.metrics : {};
+  const rows = []; // {feature, endpoint, requests, avg, p95}
+
+  // find all reqs_ep__* counters and pair them with matching lat_ep__*
+  for (const k of Object.keys(metrics)) {
+    if (!k.startsWith('reqs_ep__')) continue;
+    const tail = k.slice('reqs_ep__'.length);
+    const cnt = metrics[k]?.values?.count || 0;
+
+    const latKey = `lat_ep__${tail}`;
+    const latVals = metrics[latKey]?.values || null;
+
+    const avg = latVals && typeof latVals.avg === 'number' ? Math.round(latVals.avg) : 0;
+    const p95 = latVals && typeof latVals['p(95)'] === 'number' ? Math.round(latVals['p(95)']) : 0;
+
+    // split back feature / endpoint for display
+    const [featSlug, ...rest] = tail.split('__');
+    const epSlug = rest.join('__');
+
+    rows.push({
+      feature: UNSLUG(featSlug),
+      endpoint: UNSLUG(epSlug),
+      requests: cnt,
+      avg,
+      p95,
+    });
+  }
+
+  // aggregate by feature
+  const byFeature = {};
+  for (const r of rows) {
+    if (!byFeature[r.feature]) byFeature[r.feature] = { requests: 0, avgSum: 0, p95Max: 0, endpoints: 0 };
+    byFeature[r.feature].requests += r.requests;
+    byFeature[r.feature].avgSum += r.avg;
+    byFeature[r.feature].endpoints += 1;
+    byFeature[r.feature].p95Max = Math.max(byFeature[r.feature].p95Max, r.p95);
+  }
+  const featRows = Object.entries(byFeature).map(([feature, agg]) => ({
+    feature,
+    requests: agg.requests,
+    avg: agg.endpoints ? Math.round(agg.avgSum / agg.endpoints) : 0,
+    p95: agg.p95Max,
+  }));
+
+  // ------------- HTML -------------
+  const css = `
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:24px}
+    h1{font-size:22px;margin:0 0 12px}
+    h2{font-size:16px;margin:24px 0 8px}
+    table{border-collapse:collapse;width:100%;max-width:960px}
+    th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left;font-size:13px}
+    th{background:#fafafa}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;color:#666}
+    .muted{color:#888}
+  `;
+
+  const head =
+    `<h1>SDLC Auto Gov Load Test — <span class="mono">${new Date().toISOString().replace('T',' ').slice(0,19)}</span></h1>` +
+    `<div class="muted">Custom summary active</div>`;
+
+  const featTbl = featRows.length
+    ? `<table><thead><tr><th>Feature</th><th>Requests</th><th>Avg latency</th><th>p(95)</th></tr></thead><tbody>` +
+      featRows.map(r => `<tr><td>${r.feature}</td><td>${r.requests}</td><td>${r.avg} ms</td><td>${r.p95} ms</td></tr>`).join('') +
+      `</tbody></table>`
+    : `<div class="muted">No feature data recorded.</div>`;
+
+  const epTbl = rows.length
+    ? `<table><thead><tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg latency</th><th>p(95)</th></tr></thead><tbody>` +
+      rows.map(r => `<tr><td>${r.feature}</td><td>${r.endpoint}</td><td>${r.requests}</td><td>${r.avg} ms</td><td>${r.p95} ms</td></tr>`).join('') +
+      `</tbody></table>`
+    : `<div class="muted">No endpoint data recorded.</div>`;
+
+  const html =
+    `<!doctype html><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>` +
+    `<style>${css}</style><body>${head}<h2>Feature breakdown</h2>${featTbl}<h2>Endpoint breakdown</h2>${epTbl}` +
+    `<details class="mono" style="margin-top:16px"><summary>Raw JSON (truncated)</summary><pre>${escapeHtml(JSON.stringify(prune(data), null, 2))}</pre></details></body>`;
+
+  // ------------- JSON -------------
+  const json = {
+    byFeature: Object.fromEntries(featRows.map(r => [r.feature, { requests: r.requests, avg: r.avg, p95: r.p95 }])),
+    byEndpoint: rows.map(r => ({ feature: r.feature, endpoint: r.endpoint, requests: r.requests, avg: r.avg, p95: r.p95 })),
+  };
+
+  return {
+    stdout: 'Custom summary active\n',
+    'perf/k6/reports/summary.html': html,
+    'perf/k6/reports/summary.json': JSON.stringify(json, null, 2),
+  };
+}
+
+// small helpers
+function prune(d) { try { return { options: d.options, metrics: pick(d.metrics) }; } catch { return {}; } }
+function pick(m) {
+  const out = {};
+  for (const k of Object.keys(m || {})) if (k.startsWith('reqs_ep__') || k.startsWith('lat_ep__')) out[k] = m[k];
+  return out;
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,(ch)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
