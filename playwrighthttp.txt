@@ -1,21 +1,155 @@
-// ES5/extended-safe: no backticks, no arrow functions
-// This returns a tiny page + the raw summary JSON.
-export default function handleSummary(data) {
-  var html =
-    '<!doctype html><html><head><meta charset="utf-8">' +
-    '<title>SDLC Auto Gov Load Test</title></head><body>' +
-    '<h2>Custom summary active</h2>' +
-    '<p>Checks: ' + (data && data.root_group && data.root_group.checks ? data.root_group.checks.length : 0) + '</p>' +
-    '</body></html>';
+// perf/k6/scenarios/from-playwright.http.min.js
+import http from 'k6/http';
+import { sleep, check } from 'k6';
+import featuresMap from '../sources/endpoints.byFeature.js';
+import { note } from '../vendor/acc.js';
 
-  var text = '=== Enhanced summary active ===\n';
+// ✅ make the summary module visible to k6 (named export!)
+import hs from '../vendor/handleSummary.js';
+export const handleSummary = hs;
 
-  return {
-    // pretty console line so you can see it was used
-    stdout: text,
+/* ========= ENV / CLI =========
+   -e VUS=2 -e ITERS=2          -> 2 VUs, 2 iterations each (per-vu-iterations)
+   -e VUS=2 -e DURATION=10s     -> 2 VUs running 10s (constant-vus)
+   -e FEATURES="ReportingAPI Alpha1,SomethingElse"
+*/
+const RAW_VUS      = String(__ENV.VUS || '1').trim();
+const RAW_ITERS    = String(__ENV.ITERS || '0').trim();
+const RAW_DURATION = String(__ENV.DURATION || '30s').trim();
+const RAW_FEATURES = String(__ENV.FEATURES || '').trim();
 
-    // write files
-    "perf/k6/reports/summary.html": html,
-    "perf/k6/reports/summary.json": JSON.stringify(data, null, 2)
-  };
+const VUS       = Number(RAW_VUS) || 1;
+const ITERS     = Number(RAW_ITERS) || 0;
+const DURATION  = RAW_DURATION || '30s';
+const SELECTED  = RAW_FEATURES ? RAW_FEATURES.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+console.log(`parsed => vus=${VUS}, iters=${ITERS}, duration=${DURATION}, features=${SELECTED.join('|') || '(all)'}`);
+
+/* ========= FEATURE -> ENDPOINTS =========
+   featuresMap must be: { "Feature Name": [ { name, method, url, headers?, auth?, expect:{status,text?} } ] }
+*/
+function buildEndpoints() {
+  const endpoints = [];
+  const featureNames = SELECTED.length ? SELECTED : Object.keys(featuresMap);
+
+  for (const fname of featureNames) {
+    const eps = (featuresMap && featuresMap[fname]) || [];
+    if (!Array.isArray(eps) || eps.length === 0) continue;
+
+    for (const ep of eps) {
+      // normalize minimal fields
+      const method = (ep.method || 'GET').toUpperCase();
+      const url = String(ep.url || '').trim();
+      if (!url) continue;
+
+      endpoints.push({
+        feature: fname,
+        name: ep.name || url,
+        method,
+        url,
+        headers: ep.headers || null,
+        auth: ep.auth || null,
+        expect: ep.expect || { status: 200 },
+      });
+    }
+  }
+  return endpoints;
+}
+
+const ENDPOINTS = buildEndpoints();
+console.log(`endpoints built: ${ENDPOINTS.length}`);
+if (ENDPOINTS.length > 0) {
+  const first = ENDPOINTS[0];
+  console.log(`first endpoint: ${JSON.stringify({ feature:first.feature, name:first.name, url:first.url, auth:first.auth })}`);
+}
+
+/* ========= SCENARIOS ========= */
+export const options = (function () {
+  if (ITERS > 0) {
+    return {
+      scenarios: {
+        by_iter: {
+          executor: 'per-vu-iterations',
+          vus: VUS,
+          iterations: ITERS,
+          maxDuration: '10m',
+          gracefulStop: '30s',
+        },
+      },
+      thresholds: {
+        'http_req_failed': ['rate<0.05'],
+      },
+      summaryTrendStats: ['avg','min','med','max','p(90)','p(95)'],
+    };
+  } else {
+    return {
+      scenarios: {
+        by_time: {
+          executor: 'constant-vus',
+          vus: VUS,
+          duration: DURATION,
+          gracefulStop: '30s',
+        },
+      },
+      thresholds: {
+        'http_req_failed': ['rate<0.05'],
+      },
+      summaryTrendStats: ['avg','min','med','max','p(90)','p(95)'],
+    };
+  }
+})();
+
+/* ========= TEST BODY ========= */
+export default function () {
+  // loop all declared endpoints once per iteration
+  for (const ep of ENDPOINTS) {
+    const tags = { feature: ep.feature, endpoint: ep.name };
+    const params = { tags };
+
+    // attach headers only if provided
+    if (ep.headers && typeof ep.headers === 'object') {
+      params.headers = ep.headers;
+    }
+    // very simple bearer auth (optional)
+    if (ep.auth && ep.auth.toLowerCase() === 'bearer' && __ENV.BEARER) {
+      params.headers = params.headers || {};
+      params.headers.Authorization = `Bearer ${__ENV.BEARER}`;
+    }
+
+    let res;
+    try {
+      switch (ep.method) {
+        case 'POST':   res = http.post(ep.url, ep.body || null, params); break;
+        case 'PUT':    res = http.put(ep.url, ep.body || null, params); break;
+        case 'PATCH':  res = http.patch(ep.url, ep.body || null, params); break;
+        case 'DELETE': res = http.del(ep.url, null, params); break;
+        default:       res = http.get(ep.url, params);
+      }
+    } catch (e) {
+      // network/runtime error — still emit a note so the summary counts it
+      note({ feature: ep.feature, endpoint: ep.name, status: 0, dur_ms: 0 });
+      console.error(`request error for [${ep.feature}] ${ep.name}:`, String(e && e.message || e));
+      continue;
+    }
+
+    // record into accumulator so the custom summary can show Feature/Endpoint tables
+    note({
+      feature: ep.feature,
+      endpoint: ep.name,
+      status: res.status | 0,
+      dur_ms: res.timings && typeof res.timings.duration === 'number' ? Math.round(res.timings.duration) : 0,
+    });
+
+    // basic checks (don’t fail the run; just record)
+    const want = ep.expect || {};
+    check(res, {
+      'status ok': (r) => !want.status || r.status === want.status,
+      'body has text': (r) =>
+        !want.text ||
+        (typeof r.body === 'string' ? r.body : String(r.body || '')).indexOf(want.text) !== -1,
+    });
+
+    // small pause to avoid hammering in per-iteration mode
+    sleep(0.1);
+  }
 }
