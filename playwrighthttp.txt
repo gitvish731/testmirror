@@ -1,152 +1,36 @@
-// perf/k6/scenarios/from-playwright.http.min.js
-import http from "k6/http";
-import { sleep, check } from "k6";
-import { Trend, Counter } from "k6/metrics";
-import featuresMap from "../sources/endpoints.byFeature.js";
-import hs from "../vendor/handleSummary.js";
-export const handleSummary = hs;
+// perf/k6/vendor/acc.js  (pure ESM, k6 v0.46-safe)
 
-// ─── ENV / CLI ──────────────────────────────────────────────
-const RAW_VUS = String(__ENV.VUS || "1");
-const RAW_ITERS = String(__ENV.ITERS || "0");
-const RAW_DURATION = String(__ENV.DURATION || "30s");
-const RAW_FEATURES = String(__ENV.FEATURES || "").trim();
+// Internal structure:
+// byFeature = { "<feature>": { count, sum, avg } }
+// byEndpoint = { "<feature>": { "<endpoint>": { count, sum, avg } } }
 
-const VUS = Number(RAW_VUS) || 1;
-const ITERS = Number(RAW_ITERS) || 0;
-const DURATION = RAW_DURATION || "30s";
-const SELECTED = RAW_FEATURES
-  ? RAW_FEATURES.split(",").map((s) => s.trim()).filter(Boolean)
-  : [];
+const byFeature = Object.create(null);
+const byEndpoint = Object.create(null);
 
-// ─── SAFE METRIC NAME SLUGIFIER ─────────────────────────────
-function slug(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
+function _ensureFeature(f) {
+  if (!byFeature[f]) byFeature[f] = { count: 0, sum: 0, avg: 0 };
+  if (!byEndpoint[f]) byEndpoint[f] = Object.create(null);
 }
 
-// ─── BUILD ENDPOINTS ────────────────────────────────────────
-function buildEndpoints() {
-  const endpoints = [];
-  const featureNames = SELECTED.length
-    ? SELECTED
-    : Object.keys(featuresMap || {});
-  for (const fname of featureNames) {
-    const eps = (featuresMap && featuresMap[fname]) || [];
-    if (!Array.isArray(eps) || eps.length === 0) continue;
-    for (const ep of eps) {
-      const method = (ep.method || "GET").toUpperCase();
-      const url = (ep.url || "").trim();
-      if (!url) continue;
-      endpoints.push({
-        feature: fname,
-        name: ep.name || url,
-        method,
-        url,
-        headers: ep.headers || null,
-        auth: ep.auth || null,
-        expect: ep.expect || { status: 200 },
-      });
-    }
-  }
-  return endpoints;
+export function add(feature, endpoint, latencyMs) {
+  _ensureFeature(feature);
+  const f = byFeature[feature];
+  f.count += 1;
+  f.sum += Number(latencyMs) || 0;
+  f.avg = f.count ? f.sum / f.count : 0;
+
+  const epMap = byEndpoint[feature];
+  if (!epMap[endpoint]) epMap[endpoint] = { count: 0, sum: 0, avg: 0 };
+  const e = epMap[endpoint];
+  e.count += 1;
+  e.sum += Number(latencyMs) || 0;
+  e.avg = e.count ? e.sum / e.count : 0;
 }
-const ENDPOINTS = buildEndpoints();
-console.log(`features available: ${Object.keys(featuresMap || {}).join(" | ")}`);
-console.log(`endpoints built: ${ENDPOINTS.length}`);
 
-// ─── SINGLE METRICS WITH TAGS (SAFE FOR K6 0.46) ─────────────
-const epCount = new Counter("ep_req_count");
-const epLatency = new Trend("ep_latency");
-
-// ─── SCENARIOS ──────────────────────────────────────────────
-export const options = (function () {
-  if (ITERS > 0) {
-    return {
-      scenarios: {
-        by_iter: {
-          executor: "per-vu-iterations",
-          vus: VUS,
-          iterations: ITERS,
-          maxDuration: "10m",
-          gracefulStop: "30s",
-        },
-      },
-      summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)"],
-    };
-  }
+export function snapshot() {
+  // simple serializable copy
   return {
-    scenarios: {
-      by_time: {
-        executor: "constant-vus",
-        vus: VUS,
-        duration: DURATION,
-        gracefulStop: "30s",
-      },
-    },
-    summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)"],
+    byFeature: JSON.parse(JSON.stringify(byFeature)),
+    byEndpoint: JSON.parse(JSON.stringify(byEndpoint)),
   };
-})();
-
-// ─── TEST BODY ──────────────────────────────────────────────
-export default function () {
-  for (const ep of ENDPOINTS) {
-    const tags = { feature: ep.feature, endpoint: ep.name };
-    const params = { tags };
-
-    if (ep.headers) params.headers = ep.headers;
-    if (ep.auth && ep.auth.toLowerCase() === "bearer" && __ENV.BEARER) {
-      params.headers = params.headers || {};
-      params.headers.Authorization = `Bearer ${__ENV.BEARER}`;
-    }
-
-    let res;
-    try {
-      switch (ep.method) {
-        case "POST":
-          res = http.post(ep.url, ep.body || null, params);
-          break;
-        case "PUT":
-          res = http.put(ep.url, ep.body || null, params);
-          break;
-        case "PATCH":
-          res = http.patch(ep.url, ep.body || null, params);
-          break;
-        case "DELETE":
-          res = http.del(ep.url, null, params);
-          break;
-        default:
-          res = http.get(ep.url, params);
-      }
-    } catch (e) {
-      epCount.add(1, tags);
-      console.error(
-        `request error [${ep.feature}] ${ep.name}: ${String(
-          (e && e.message) || e
-        )}`
-      );
-      continue;
-    }
-
-    epCount.add(1, tags);
-    if (res && res.timings && typeof res.timings.duration === "number") {
-      epLatency.add(res.timings.duration, tags);
-    }
-
-    const want = ep.expect || {};
-    check(res, {
-      "status ok": (r) => !want.status || r.status === want.status,
-      "body has text": (r) => {
-        if (!want.text) return true;
-        const b =
-          typeof r.body === "string" ? r.body : String(r.body || "");
-        return b.indexOf(want.text) !== -1;
-      },
-    });
-
-    sleep(0.05);
-  }
 }
