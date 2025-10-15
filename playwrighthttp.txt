@@ -1,144 +1,133 @@
-// perf/k6/scenarios/from-playwright.http.min.js
-import http from 'k6/http';
-import { sleep, check } from 'k6';
-import { Trend, Counter } from 'k6/metrics';
-import featuresMap from '../sources/endpoints.byFeature.js';
-import hs from '../vendor/handleSummary.js';
-export const handleSummary = hs;
+// perf/k6/vendor/handleSummary.js
+export default function handleSummary(data) {
+  // parse our per-endpoint custom metrics from data.metrics
+  var met = data && data.metrics ? data.metrics : {};
+  var byKey = {}; // sk -> { feature, endpoint, count, avg }
 
-// ---------- env / cli ----------
-const RAW_VUS      = String(__ENV.VUS || '1');
-const RAW_ITERS    = String(__ENV.ITERS || '0');
-const RAW_DURATION = String(__ENV.DURATION || '30s');
-const RAW_FEATURES = String(__ENV.FEATURES || '').trim();
+  function unslug(sk) {
+    // sk is slug of "f=<feature>::e=<endpoint>"
+    var parts = sk.split('__'); // slugging replaced separators; but we can use the metric name itself
+    return sk; // we’ll decode from metric names below
+  }
 
-const VUS       = Number(RAW_VUS) || 1;
-const ITERS     = Number(RAW_ITERS) || 0;
-const DURATION  = RAW_DURATION || '30s';
-const SELECTED  = RAW_FEATURES ? RAW_FEATURES.split(',').map(s => s.trim()).filter(s => s) : [];
+  // invert: metric name contains the slug (after our prefix)
+  for (var mName in met) {
+    if (!met.hasOwnProperty(mName)) continue;
 
-function slug(s) {
-  return String(s || '')
-    .replace(/[:|]/g, ' ')
-    .replace(/\s+/g, '_')
-    .replace(/[^\w\-]/g, '')
-    .slice(0, 120);
-}
-
-// ---------- build endpoints ----------
-function buildEndpoints() {
-  const endpoints = [];
-  const featureNames = SELECTED.length ? SELECTED : Object.keys(featuresMap || {});
-  for (const fname of featureNames) {
-    const eps = (featuresMap && featuresMap[fname]) || [];
-    if (!Array.isArray(eps) || eps.length === 0) continue;
-    for (const ep of eps) {
-      const method = (ep.method || 'GET').toUpperCase();
-      const url = (ep.url || '').trim();
-      if (!url) continue;
-      endpoints.push({
-        feature: fname,
-        name: ep.name || url,
-        method, url,
-        headers: ep.headers || null,
-        auth: ep.auth || null,
-        expect: ep.expect || { status: 200 }
-      });
+    if (mName.indexOf('ep_req_count::') === 0) {
+      var sk1 = mName.substring('ep_req_count::'.length);
+      var cnt = met[mName] && met[mName].values && met[mName].values.count ? met[mName].values.count : 0;
+      byKey[sk1] = byKey[sk1] || { count: 0, avg: 0 };
+      byKey[sk1].count = cnt;
+    }
+    if (mName.indexOf('ep_lat_ms::') === 0) {
+      var sk2 = mName.substring('ep_lat_ms::'.length);
+      var avg = met[mName] && met[mName].values && typeof met[mName].values.avg === 'number' ? met[mName].values.avg : 0;
+      byKey[sk2] = byKey[sk2] || { count: 0, avg: 0 };
+      byKey[sk2].avg = avg;
     }
   }
-  return endpoints;
-}
-const ENDPOINTS = buildEndpoints();
-console.log(`features available: ${Object.keys(featuresMap || {}).join(' | ')}`);
-console.log(`endpoints built: ${ENDPOINTS.length}`);
 
-// ---------- declare per-endpoint metrics (init context) ----------
-const REQ_COUNT = {};
-const LAT_MS = {};
-for (const ep of ENDPOINTS) {
-  const key = `f=${ep.feature}::e=${ep.name}`;
-  const sk = slug(key);
-  REQ_COUNT[sk] = new Counter(`ep_req_count::${sk}`);
-  LAT_MS[sk]    = new Trend  (`ep_lat_ms::${sk}`);
-  // helpful when reading summary later
-  // (handleSummary can reverse-slug back with the metric key itself)
-}
-
-// ---------- scenarios ----------
-export const options = (function () {
-  if (ITERS > 0) {
-    return {
-      scenarios: {
-        by_iter: {
-          executor: 'per-vu-iterations',
-          vus: VUS,
-          iterations: ITERS,
-          maxDuration: '10m',
-          gracefulStop: '30s',
-        },
-      },
-      summaryTrendStats: ['avg','min','med','max','p(90)','p(95)'],
-    };
+  // pretty split back to feature/endpoint using the metric names we embedded
+  function splitFE(sk) {
+    // original was slug of "f=<feature>::e=<endpoint>"
+    // recover by replacing underscores with spaces just for readability
+    var s = sk.replace(/_/g, ' ');
+    var i = s.indexOf('f='); var j = s.indexOf('::e=');
+    if (i === -1 || j === -1) return { feature: sk, endpoint: '' };
+    var f = s.substring(i + 2, j).trim();
+    var e = s.substring(j + 4).trim();
+    return { feature: f, endpoint: e };
   }
-  return {
-    scenarios: {
-      by_time: {
-        executor: 'constant-vus',
-        vus: VUS,
-        duration: DURATION,
-        gracefulStop: '30s',
-      },
-    },
-    summaryTrendStats: ['avg','min','med','max','p(90)','p(95)'],
+
+  // group by feature
+  var byFeature = {}; // feature -> totals
+  var rows = [];      // flat rows for endpoint table
+
+  for (var sk in byKey) {
+    if (!byKey.hasOwnProperty(sk)) continue;
+    var fe = splitFE(sk);
+    var cnt = byKey[sk].count || 0;
+    var avg = byKey[sk].avg || 0;
+
+    if (!byFeature[fe.feature]) byFeature[fe.feature] = { requests: 0, avgSum: 0, n: 0 };
+    byFeature[fe.feature].requests += cnt;
+    if (avg > 0) { byFeature[fe.feature].avgSum += avg; byFeature[fe.feature].n += 1; }
+
+    rows.push({ feature: fe.feature, endpoint: fe.endpoint, requests: cnt, avg: Math.round(avg) });
+  }
+
+  // build HTML
+  var html = '';
+  html += '<!doctype html><html><head><meta charset="utf-8">';
+  html += '<title>SDLC Auto Gov Load Test</title>';
+  html += '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px}';
+  html += '.mono{color:#666;font-family:ui-monospace,Menlo,Consolas,monospace}';
+  html += 'table{border-collapse:collapse;margin:12px 0;width:100%}th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left}';
+  html += 'th{background:#fafafa}</style></head><body>';
+  html += '<h2>SDLC Auto Gov Load Test — <span class="mono">' + new Date().toISOString().replace('T',' ').slice(0,19) + '</span></h2>';
+
+  // scenarios summary
+  var scen = data && data.options && data.options.scenarios ? data.options.scenarios : {};
+  html += '<div>Scenarios:</div><ul class="mono">';
+  for (var k in scen) {
+    if (!scen.hasOwnProperty(k)) continue;
+    var sc = scen[k];
+    if (sc.executor === 'per-vu-iterations') {
+      html += '<li>' + k + ': ' + sc.vus + ' VUs × ' + sc.iterations + ' iters (maxDuration: ' + (sc.maxDuration || 'n/a') + ')</li>';
+    } else if (sc.executor === 'constant-vus') {
+      html += '<li>' + k + ': ' + sc.vus + ' VUs for ' + sc.duration + '</li>';
+    } else {
+      html += '<li>' + k + ' (' + sc.executor + ')</li>';
+    }
+  }
+  html += '</ul>';
+
+  // feature breakdown
+  html += '<h3>Feature breakdown</h3>';
+  if (!Object.keys(byFeature).length) {
+    html += '<div class="mono">No feature data recorded.</div>';
+  } else {
+    html += '<table><thead><tr><th>Feature</th><th>Requests</th><th>Avg latency</th></tr></thead><tbody>';
+    for (var f in byFeature) {
+      if (!byFeature.hasOwnProperty(f)) continue;
+      var bf = byFeature[f];
+      var favg = bf.n > 0 ? Math.round(bf.avgSum / bf.n) : 0;
+      html += '<tr><td>' + f + '</td><td>' + bf.requests + '</td><td>' + favg + ' ms</td></tr>';
+    }
+    html += '</tbody></table>';
+  }
+
+  // endpoint breakdown
+  html += '<h3>Endpoint breakdown</h3>';
+  if (!rows.length) {
+    html += '<div class="mono">No endpoint data recorded.</div>';
+  } else {
+    html += '<table><thead><tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg latency</th></tr></thead><tbody>';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      html += '<tr><td>' + r.feature + '</td><td>' + r.endpoint + '</td><td>' + r.requests + '</td><td>' + r.avg + ' ms</td></tr>';
+    }
+    html += '</tbody></table>';
+  }
+
+  // Raw JSON (short)
+  html += '<details><summary>Raw JSON (truncated)</summary><pre class="mono">';
+  var slim = { options: data && data.options ? data.options : {}, metrics: {} };
+  html += String(JSON.stringify(slim)).slice(0, 1200);
+  html += '</pre></details>';
+
+  html += '</body></html>';
+
+  // Also write JSON for automation (keep small)
+  var out = {
+    byFeature: byFeature,
+    byEndpoint: rows
   };
-})();
 
-// ---------- test body ----------
-export default function () {
-  for (const ep of ENDPOINTS) {
-    const tags = { feature: ep.feature, endpoint: ep.name };
-    const params = { tags };
-
-    if (ep.headers) params.headers = ep.headers;
-    if (ep.auth && ep.auth.toLowerCase() === 'bearer' && __ENV.BEARER) {
-      params.headers = params.headers || {};
-      params.headers.Authorization = `Bearer ${__ENV.BEARER}`;
-    }
-
-    let res;
-    try {
-      switch (ep.method) {
-        case 'POST':   res = http.post(ep.url, ep.body || null, params); break;
-        case 'PUT':    res = http.put(ep.url, ep.body || null, params); break;
-        case 'PATCH':  res = http.patch(ep.url, ep.body || null, params); break;
-        case 'DELETE': res = http.del(ep.url, null, params); break;
-        default:       res = http.get(ep.url, params);
-      }
-    } catch (e) {
-      // still increment the count for visibility
-      const sk = slug(`f=${ep.feature}::e=${ep.name}`);
-      if (REQ_COUNT[sk]) REQ_COUNT[sk].add(1);
-      console.error(`request error [${ep.feature}] ${ep.name}: ${String(e && e.message || e)}`);
-      continue;
-    }
-
-    const sk = slug(`f=${ep.feature}::e=${ep.name}`);
-    if (REQ_COUNT[sk]) REQ_COUNT[sk].add(1);
-    if (LAT_MS[sk]) {
-      const d = (res && res.timings && typeof res.timings.duration === 'number') ? res.timings.duration : 0;
-      LAT_MS[sk].add(d);
-    }
-
-    const want = ep.expect || {};
-    check(res, {
-      'status ok': (r) => !want.status || r.status === want.status,
-      'body has text': (r) => {
-        if (!want.text) return true;
-        const b = (typeof r.body === 'string') ? r.body : String(r.body || '');
-        return b.indexOf(want.text) !== -1;
-      },
-    });
-
-    sleep(0.05);
-  }
+  return {
+    'stdout': 'Custom summary active',
+    'perf/k6/reports/summary.json': JSON.stringify(out, null, 2),
+    'perf/k6/reports/summary.html': html
+  };
 }
