@@ -1,154 +1,149 @@
-// perf/k6/scenarios/from-playwright.http.min.js
-import http from "k6/http";
-import { sleep, check } from "k6";
-import { Trend, Counter } from "k6/metrics";
-import featuresMap from "../sources/endpoints.byFeature.js";
-import hs from "../vendor/handleSummary.js";
-import { add as accAdd } from "../vendor/acc.js";   // <-- NEW
+// ESM entry (k6 v0.46 OK)
+// Emits per-endpoint metrics that handleSummary.js will read.
+
+import http from 'k6/http';
+import { sleep, check, Trend, Counter } from 'k6';
+import featuresMap from '../sources/endpoints.byFeature.js';
+import hs from '../vendor/handleSummary.js';
+
+// === k6 picks up this named export ===
 export const handleSummary = hs;
 
-// ─── ENV / CLI ──────────────────────────────────────────────
-const RAW_VUS = String(__ENV.VUS || "1");
-const RAW_ITERS = String(__ENV.ITERS || "0");
-const RAW_DURATION = String(__ENV.DURATION || "30s");
-const RAW_FEATURES = String(__ENV.FEATURES || "").trim();
+// ---- CLI env parsing (VUS / ITERS / DURATION / FEATURES) ----
+const RAW_VUS       = String(__ENV.VUS || '1');
+const RAW_ITERS     = String(__ENV.ITERS || '1');
+const RAW_DURATION  = String(__ENV.DURATION || '0s');   // "0s" -> per-vu-iterations
+const RAW_FEATURES  = String(__ENV.FEATURES || '').trim();
 
-const VUS = Number(RAW_VUS) || 1;
-const ITERS = Number(RAW_ITERS) || 0;
-const DURATION = RAW_DURATION || "30s";
-const SELECTED = RAW_FEATURES
-  ? RAW_FEATURES.split(",").map((s) => s.trim()).filter(Boolean)
-  : [];
+const VUS       = Number(RAW_VUS) || 1;
+const ITERS     = Number(RAW_ITERS) || 1;
+const DURATION  = RAW_DURATION;
+const FEATURES  = RAW_FEATURES ? RAW_FEATURES.split(',').map(s => s.trim()).filter(Boolean) : Object.keys(featuresMap);
 
-// ─── SAFE METRIC NAME SLUGIFIER (kept; harmless) ────────────
-function slug(s) {
-  return String(s || "")
+// ---- choose executor based on presence of duration ----
+const USE_DURATION = /^(\d+)(ms|s|m|h)$/.test(DURATION) && !/^0s$/.test(DURATION);
+
+// ---- small helpers ----
+const slug = (s) =>
+  String(s || '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
+    .normalize('NFKD')
+    .replace(/[^\w\s-]/g, '')     // strip non-word
+    .replace(/\s+/g, '_')         // spaces -> underscore
+    .replace(/_+/g, '_')
+    .slice(0, 80) || 'unnamed';
+
+const metricCache = new Map();
+function pairFor(featureName, epName) {
+  const epSlug = slug(`${featureName}__${epName}`);
+  if (!metricCache.has(epSlug)) {
+    // Create once per endpoint; names must be ASCII and unique
+    metricCache.set(epSlug, {
+      cnt: new Counter(`reqs_ep__${epSlug}`),
+      lat: new Trend(`lat_ep__${epSlug}`),
+    });
+  }
+  return metricCache.get(epSlug);
 }
 
-// ─── BUILD ENDPOINTS ────────────────────────────────────────
+// ---- build endpoint list from selected features ----
 function buildEndpoints() {
-  const endpoints = [];
-  const featureNames = SELECTED.length
-    ? SELECTED
-    : Object.keys(featuresMap || {});
-  for (const fname of featureNames) {
-    const eps = (featuresMap && featuresMap[fname]) || [];
-    if (!Array.isArray(eps) || eps.length === 0) continue;
-    for (const ep of eps) {
-      const method = (ep.method || "GET").toUpperCase();
-      const url = (ep.url || "").trim();
-      if (!url) continue;
-      endpoints.push({
+  const selected = [];
+  for (const fname of FEATURES) {
+    const group = featuresMap[fname];
+    if (!Array.isArray(group)) continue;
+    for (const ep of group) {
+      // minimal shape: { name, method, url, expect:{status?, text?}, headers?, auth? }
+      const item = {
         feature: fname,
-        name: ep.name || url,
-        method,
-        url,
+        name: ep.name || ep.url,
+        method: (ep.method || 'GET').toUpperCase(),
+        url: ep.url,
+        expect: ep.expect || {},
         headers: ep.headers || null,
         auth: ep.auth || null,
-        expect: ep.expect || { status: 200 },
-      });
+      };
+      selected.push(item);
     }
   }
-  return endpoints;
+  return selected;
 }
+
 const ENDPOINTS = buildEndpoints();
-console.log(`features available: ${Object.keys(featuresMap || {}).join(" | ")}`);
+console.log(`features available: ${JSON.stringify(FEATURES)}`);
 console.log(`endpoints built: ${ENDPOINTS.length}`);
 
-// ─── SINGLE METRICS WITH TAGS (SAFE FOR K6 0.46) ─────────────
-const epCount = new Counter("ep_req_count");
-const epLatency = new Trend("ep_latency");
-
-// ─── SCENARIOS ──────────────────────────────────────────────
-export const options = (function () {
-  if (ITERS > 0) {
-    return {
+// ---- k6 options ----
+export const options = USE_DURATION
+  ? {
       scenarios: {
-        by_iter: {
-          executor: "per-vu-iterations",
+        by_time: {
+          executor: 'constant-vus',
           vus: VUS,
-          iterations: ITERS,
-          maxDuration: "10m",
-          gracefulStop: "30s",
+          duration: DURATION,
+          gracefulStop: '3s',
         },
       },
-      summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)"],
-    };
-  }
-  return {
-    scenarios: {
-      by_time: {
-        executor: "constant-vus",
-        vus: VUS,
-        duration: DURATION,
-        gracefulStop: "30s",
+    }
+  : {
+      scenarios: {
+        by_iter: {
+          executor: 'per-vu-iterations',
+          vus: VUS,
+          iterations: ITERS,          // per VU
+          maxDuration: '10m',
+          gracefulStop: '30s',
+        },
       },
-    },
-    summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)"],
-  };
-})();
+    };
 
-// ─── TEST BODY ──────────────────────────────────────────────
+// ---- test loop ----
 export default function () {
   for (const ep of ENDPOINTS) {
-    const tags = { feature: ep.feature, endpoint: ep.name };
-    const params = { tags };
-
-    if (ep.headers) params.headers = ep.headers;
-    if (ep.auth && ep.auth.toLowerCase() === "bearer" && __ENV.BEARER) {
+    const params = { headers: ep.headers || {} };
+    // trivial bearer support if provided as ep.auth = 'bearer <token>'
+    if (ep.auth && /^bearer\s+/i.test(ep.auth)) {
       params.headers = params.headers || {};
-      params.headers.Authorization = `Bearer ${__ENV.BEARER}`;
+      params.headers.Authorization = ep.auth;
     }
 
+    const t0 = Date.now();
     let res;
+
     try {
       switch (ep.method) {
-        case "POST":
-          res = http.post(ep.url, ep.body || null, params);
-          break;
-        case "PUT":
-          res = http.put(ep.url, ep.body || null, params);
-          break;
-        case "PATCH":
-          res = http.patch(ep.url, ep.body || null, params);
-          break;
-        case "DELETE":
-          res = http.del(ep.url, null, params);
-          break;
-        default:
-          res = http.get(ep.url, params);
+        case 'POST':   res = http.post(ep.url, ep.body || null, params); break;
+        case 'PUT':    res = http.put(ep.url, ep.body || null, params);  break;
+        case 'PATCH':  res = http.patch(ep.url, ep.body || null, params);break;
+        case 'DELETE': res = http.del(ep.url, null, params);             break;
+        default:       res = http.get(ep.url, params);
       }
     } catch (e) {
-      epCount.add(1, tags);
-      console.error(
-        `request error [${ep.feature}] ${ep.name}: ${String(
-          (e && e.message) || e
-        )}`
-      );
+      // network exception; still record as failed with a dummy latency
+      const m = pairFor(ep.feature, ep.name);
+      m.cnt.add(1);
+      m.lat.add(0);
+      console.error(`net error: ${ep.method} ${ep.url} :: ${String(e)}`);
       continue;
     }
 
-    epCount.add(1, tags);
-    if (res && res.timings && typeof res.timings.duration === "number") {
-      epLatency.add(res.timings.duration, tags);
-      accAdd(ep.feature, ep.name, res.timings.duration); // <-- NEW: feed ACC
-    }
+    const ms = Date.now() - t0;
+    const expect = ep.expect || {};
+    const ok =
+      (expect.status ? res.status === expect.status : res.status >= 200 && res.status < 400) &&
+      (expect.text ? String(res.body || '').indexOf(expect.text) !== -1 : true);
 
-    const want = ep.expect || {};
+    // normal k6 checks (optional)
     check(res, {
-      "status ok": (r) => !want.status || r.status === want.status,
-      "body has text": (r) => {
-        if (!want.text) return true;
-        const b =
-          typeof r.body === "string" ? r.body : String(r.body || "");
-        return b.indexOf(want.text) !== -1;
-      },
+      'status ok': (r) => (expect.status ? r.status === expect.status : r.status >= 200 && r.status < 400),
+      'body has text': (r) => (expect.text ? String(r.body || '').indexOf(expect.text) !== -1 : true),
     });
 
-    sleep(0.05);
+    // emit custom per-endpoint metrics that the summary will read
+    const m = pairFor(ep.feature, ep.name);
+    m.cnt.add(1);
+    m.lat.add(ms);
+
+    sleep(0.1);
   }
 }
