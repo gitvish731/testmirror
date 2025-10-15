@@ -1,92 +1,154 @@
-// perf/k6/vendor/handleSummary.js  (pure ESM, k6 v0.46-safe)
-import { snapshot } from "./acc.js";
+// perf/k6/scenarios/from-playwright.http.min.js
+import http from "k6/http";
+import { sleep, check } from "k6";
+import { Trend, Counter } from "k6/metrics";
+import featuresMap from "../sources/endpoints.byFeature.js";
+import hs from "../vendor/handleSummary.js";
+import { add as accAdd } from "../vendor/acc.js";   // <-- NEW
+export const handleSummary = hs;
 
-function fmtMs(n) {
-  const v = Math.round(Number(n) || 0);
-  return v + " ms";
+// ─── ENV / CLI ──────────────────────────────────────────────
+const RAW_VUS = String(__ENV.VUS || "1");
+const RAW_ITERS = String(__ENV.ITERS || "0");
+const RAW_DURATION = String(__ENV.DURATION || "30s");
+const RAW_FEATURES = String(__ENV.FEATURES || "").trim();
+
+const VUS = Number(RAW_VUS) || 1;
+const ITERS = Number(RAW_ITERS) || 0;
+const DURATION = RAW_DURATION || "30s";
+const SELECTED = RAW_FEATURES
+  ? RAW_FEATURES.split(",").map((s) => s.trim()).filter(Boolean)
+  : [];
+
+// ─── SAFE METRIC NAME SLUGIFIER (kept; harmless) ────────────
+function slug(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
 }
 
-function table(rows) {
-  // rows: array of arrays of strings
-  const cells = rows
-    .map(
-      (r) =>
-        "<tr>" +
-        r.map((c) => `<td style="padding:6px;border:1px solid #e5e7eb;">${c}</td>`).join("") +
-        "</tr>"
-    )
-    .join("");
-  return `<table style="border-collapse:collapse;font-family:system-ui,Segoe UI,Arial;font-size:14px;">${cells}</table>`;
-}
-
-function sectionTitle(txt) {
-  return `<h3 style="margin:24px 0 8px 0;font-family:system-ui,Segoe UI,Arial;">${txt}</h3>`;
-}
-
-export default function handleSummary(data) {
-  const acc = snapshot(); // { byFeature, byEndpoint }
-
-  // Top banner so you can see the custom summary ran
-  let html = `
-<!doctype html><meta charset="utf-8">
-<title>SDLC Auto Gov Load Test</title>
-<div style="font-family:system-ui,Segoe UI,Arial;padding:16px 20px;">
-  <h1 style="margin:0 0 8px 0;">SDLC Auto Gov Load Test — ${new Date().toISOString().replace('T',' ').slice(0,19)}</h1>
-  <div style="color:#374151;margin-bottom:16px;">Custom summary active</div>
-`;
-
-  // Feature breakdown
-  html += sectionTitle("Feature breakdown");
-  const fRows = [["Feature", "Requests", "Avg latency"]];
-  const fKeys = Object.keys(acc.byFeature || {});
-  if (fKeys.length === 0) {
-    html += `<div style="color:#6b7280">No feature data recorded.</div>`;
-  } else {
-    for (const f of fKeys) {
-      const v = acc.byFeature[f];
-      fRows.push([f, String(v.count), fmtMs(v.avg)]);
-    }
-    html += table(fRows);
-  }
-
-  // Endpoint breakdown
-  html += sectionTitle("Endpoint breakdown");
-  const eKeys = Object.keys(acc.byEndpoint || {});
-  if (eKeys.length === 0) {
-    html += `<div style="color:#6b7280">No endpoint data recorded.</div>`;
-  } else {
-    // one table per feature for readability
-    for (const f of eKeys) {
-      html += `<h4 style="margin:16px 0 6px 0;">${f}</h4>`;
-      const epMap = acc.byEndpoint[f] || {};
-      const epRows = [["Endpoint", "Requests", "Avg latency"]];
-      for (const epName of Object.keys(epMap)) {
-        const v = epMap[epName];
-        epRows.push([epName, String(v.count), fmtMs(v.avg)]);
-      }
-      html += table(epRows);
+// ─── BUILD ENDPOINTS ────────────────────────────────────────
+function buildEndpoints() {
+  const endpoints = [];
+  const featureNames = SELECTED.length
+    ? SELECTED
+    : Object.keys(featuresMap || {});
+  for (const fname of featureNames) {
+    const eps = (featuresMap && featuresMap[fname]) || [];
+    if (!Array.isArray(eps) || eps.length === 0) continue;
+    for (const ep of eps) {
+      const method = (ep.method || "GET").toUpperCase();
+      const url = (ep.url || "").trim();
+      if (!url) continue;
+      endpoints.push({
+        feature: fname,
+        name: ep.name || url,
+        method,
+        url,
+        headers: ep.headers || null,
+        auth: ep.auth || null,
+        expect: ep.expect || { status: 200 },
+      });
     }
   }
+  return endpoints;
+}
+const ENDPOINTS = buildEndpoints();
+console.log(`features available: ${Object.keys(featuresMap || {}).join(" | ")}`);
+console.log(`endpoints built: ${ENDPOINTS.length}`);
 
-  // Raw JSON (truncated here to just the ACC to keep file small)
-  html += sectionTitle("Raw ACC (truncated)");
-  html += `<pre style="background:#f9fafb;border:1px solid #e5e7eb;padding:8px;border-radius:6px;white-space:pre-wrap;">${JSON.stringify(
-    acc,
-    null,
-    2
-  )}</pre>`;
+// ─── SINGLE METRICS WITH TAGS (SAFE FOR K6 0.46) ─────────────
+const epCount = new Counter("ep_req_count");
+const epLatency = new Trend("ep_latency");
 
-  html += "</div>";
-
-  // Also emit a compact JSON bundle your pipelines can consume
-  const outJson = {
-    acc,
-    options: data && data.options ? data.options : {},
-  };
-
+// ─── SCENARIOS ──────────────────────────────────────────────
+export const options = (function () {
+  if (ITERS > 0) {
+    return {
+      scenarios: {
+        by_iter: {
+          executor: "per-vu-iterations",
+          vus: VUS,
+          iterations: ITERS,
+          maxDuration: "10m",
+          gracefulStop: "30s",
+        },
+      },
+      summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)"],
+    };
+  }
   return {
-    stdout: "Custom summary active\n",
-    "perf/k6/reports/summary.html": html,
-    "perf/k6/reports/summary.json": JSON.stringify(outJson, null, 2),
+    scenarios: {
+      by_time: {
+        executor: "constant-vus",
+        vus: VUS,
+        duration: DURATION,
+        gracefulStop: "30s",
+      },
+    },
+    summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)"],
   };
+})();
+
+// ─── TEST BODY ──────────────────────────────────────────────
+export default function () {
+  for (const ep of ENDPOINTS) {
+    const tags = { feature: ep.feature, endpoint: ep.name };
+    const params = { tags };
+
+    if (ep.headers) params.headers = ep.headers;
+    if (ep.auth && ep.auth.toLowerCase() === "bearer" && __ENV.BEARER) {
+      params.headers = params.headers || {};
+      params.headers.Authorization = `Bearer ${__ENV.BEARER}`;
+    }
+
+    let res;
+    try {
+      switch (ep.method) {
+        case "POST":
+          res = http.post(ep.url, ep.body || null, params);
+          break;
+        case "PUT":
+          res = http.put(ep.url, ep.body || null, params);
+          break;
+        case "PATCH":
+          res = http.patch(ep.url, ep.body || null, params);
+          break;
+        case "DELETE":
+          res = http.del(ep.url, null, params);
+          break;
+        default:
+          res = http.get(ep.url, params);
+      }
+    } catch (e) {
+      epCount.add(1, tags);
+      console.error(
+        `request error [${ep.feature}] ${ep.name}: ${String(
+          (e && e.message) || e
+        )}`
+      );
+      continue;
+    }
+
+    epCount.add(1, tags);
+    if (res && res.timings && typeof res.timings.duration === "number") {
+      epLatency.add(res.timings.duration, tags);
+      accAdd(ep.feature, ep.name, res.timings.duration); // <-- NEW: feed ACC
+    }
+
+    const want = ep.expect || {};
+    check(res, {
+      "status ok": (r) => !want.status || r.status === want.status,
+      "body has text": (r) => {
+        if (!want.text) return true;
+        const b =
+          typeof r.body === "string" ? r.body : String(r.body || "");
+        return b.indexOf(want.text) !== -1;
+      },
+    });
+
+    sleep(0.05);
+  }
 }
