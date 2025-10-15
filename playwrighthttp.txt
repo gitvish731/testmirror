@@ -1,116 +1,37 @@
-// perf/k6/vendor/handleSummary.js
-// k6 v0.46-safe summary writer (no template literals, no JSX-like strings)
+// perf/k6/vendor/acc.js
+// Simple in-memory accumulator shared by the runner and the summary.
 
-function esc(s) {
-  if (s == null) return "";
-  s = String(s);
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+export const ACC = { byFeature: {}, byEndpoint: {} };
+
+export function note(feature, endpoint, ms) {
+  if (!feature) feature = "(unknown feature)";
+  if (!endpoint) endpoint = "(unknown endpoint)";
+
+  var f = ACC.byFeature[feature] || (ACC.byFeature[feature] = { count: 0, sum: 0, max: 0, vals: [] });
+  var e = ACC.byEndpoint[endpoint] || (ACC.byEndpoint[endpoint] = { count: 0, sum: 0, max: 0, vals: [] });
+
+  function add(o) {
+    o.count += 1;
+    o.sum += ms || 0;
+    if ((ms || 0) > o.max) o.max = ms || 0;
+    o.vals.push(ms || 0);
+  }
+  add(f); add(e);
 }
 
-function asTable(title, rows) {
-  if (!rows || !rows.length) {
-    return [
-      '<h3 style="margin-top:14px;">', esc(title), '</h3>',
-      '<div class="mono">No ', esc(title.toLowerCase()), ' recorded.</div>'
-    ].join("");
-  }
-  var out = [];
-  out.push('<h3 style="margin-top:14px;">', esc(title), '</h3>');
-  out.push('<table style="border-collapse:collapse;width:100%;">');
-  out.push('<thead><tr>',
-           '<th style="text-align:left;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Name</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Requests</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">Avg latency</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">p(95)</th>',
-           '<th style="text-align:right;border-bottom:1px solid #e5e5e5;padding:6px 8px;">max</th>',
-           '</tr></thead><tbody>');
-  for (var i = 0; i < rows.length; i += 1) {
-    var r = rows[i];
-    out.push('<tr>',
-      '<td style="padding:6px 8px;border-bottom:1px solid #f1f1f1;">', esc(r.name), '</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', String(r.count || 0), '</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.avg || 0), ' ms</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.p95 || 0), ' ms</td>',
-      '<td style="padding:6px 8px;text-align:right;border-bottom:1px solid #f1f1f1;">', esc(r.max || 0), ' ms</td>',
-    '</tr>');
-  }
-  out.push('</tbody></table>');
-  return out.join("");
-}
-
-export default function handleSummary(data) {
-  // We’ll read pre-aggregated accumulators if your runner provided them.
-  // Expecting shape: data.acc.byFeature[featureName] = { count, avg, p95, max }
-  // and data.acc.byEndpoint[endpointName] = { count, avg, p95, max }
-  var acc = (data && data.acc) ? data.acc : { byFeature: {}, byEndpoint: {} };
-
-  // Build rows
-  var featRows = [];
-  if (acc.byFeature) {
-    for (var f in acc.byFeature) {
-      if (!acc.byFeature.hasOwnProperty(f)) continue;
-      var v = acc.byFeature[f] || {};
-      featRows.push({
-        name: f,
-        count: v.count || 0,
-        avg: Math.round((v.avg || 0) * 100) / 100,
-        p95: Math.round((v.p95 || 0) * 100) / 100,
-        max: Math.round((v.max || 0) * 100) / 100
-      });
+export function finalize() {
+  function finish(o) {
+    o.avg = o.count ? Math.round((o.sum / o.count) * 100) / 100 : 0;
+    if (o.vals.length) {
+      o.vals.sort(function(a, b) { return a - b; });
+      var idx = Math.floor(0.95 * (o.vals.length - 1));
+      o.p95 = Math.round(o.vals[idx] * 100) / 100;
+    } else {
+      o.p95 = 0;
     }
+    delete o.sum; delete o.vals;
   }
-  var epRows = [];
-  if (acc.byEndpoint) {
-    for (var e in acc.byEndpoint) {
-      if (!acc.byEndpoint.hasOwnProperty(e)) continue;
-      var w = acc.byEndpoint[e] || {};
-      epRows.push({
-        name: e,
-        count: w.count || 0,
-        avg: Math.round((w.avg || 0) * 100) / 100,
-        p95: Math.round((w.p95 || 0) * 100) / 100,
-        max: Math.round((w.max || 0) * 100) / 100
-      });
-    }
-  }
-
-  // Sort by count desc
-  featRows.sort(function (a, b) { return (b.count || 0) - (a.count || 0); });
-  epRows.sort(function (a, b) { return (b.count || 0) - (a.count || 0); });
-
-  // Minimal header
-  var title = 'SDLC Auto Gov Load Test — ' + new Date().toISOString().replace('T', ' ').slice(0, 19);
-
-  var html = [
-    '<!doctype html><html><head><meta charset="utf-8">',
-    '<title>', esc(title), ' (ENHANCED)</title>',
-    '<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px;color:#111} ',
-    'h2{margin:0 0 12px 0} h3{margin:18px 0 8px 0} .mono{font-family:ui-monospace,Consolas,Monaco,monospace;color:#555}</style>',
-    '</head><body>',
-    '<h2>', esc(title), ' <span class="mono">(enhanced summary)</span></h2>',
-    asTable('Feature breakdown', featRows),
-    asTable('Endpoint breakdown', epRows),
-    '<details style="margin-top:18px;"><summary>Raw JSON (truncated)</summary>',
-    '<pre class="mono" style="white-space:pre-wrap;">', esc(JSON.stringify({ acc: acc, options: data && data.options }, null, 2)), '</pre>',
-    '</details>',
-    '</body></html>'
-  ].join('');
-
-  // Console text
-  var text = [
-    '=== Enhanced summary active ===',
-    'Features: ' + Object.keys(acc.byFeature || {}).length,
-    'Endpoints: ' + Object.keys(acc.byEndpoint || {}).length
-  ].join('\n');
-
-  return {
-    stdout: text,
-    'perf/k6/reports/summary.html': html,
-    'perf/k6/reports/summary.json': JSON.stringify(data || {}, null, 2)
-  };
+  for (var k in ACC.byFeature) { if (ACC.byFeature.hasOwnProperty(k)) finish(ACC.byFeature[k]); }
+  for (var j in ACC.byEndpoint) { if (ACC.byEndpoint.hasOwnProperty(j)) finish(ACC.byEndpoint[j]); }
+  return ACC;
 }
