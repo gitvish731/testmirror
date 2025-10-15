@@ -1,5 +1,5 @@
 // perf/k6/vendor/handleSummary.js
-// Compatible with K6 v0.46 – includes max latency in both tables
+// Displays avg / p(95) / max latency for each Feature and Endpoint
 
 function UNSLUG(s) {
   return String(s || '').replace(/__/g, ' :: ').replace(/_/g, ' ').trim();
@@ -9,47 +9,43 @@ export default function handleSummary(data) {
   var metrics = data && data.metrics ? data.metrics : {};
   var rows = [];
 
+  // --- Collect endpoint metrics ---
   var keys = Object.keys(metrics);
   for (var i = 0; i < keys.length; i++) {
     var k = keys[i];
     if (k.indexOf('reqs_ep__') !== 0) continue;
 
     var tail = k.slice('reqs_ep__'.length);
-    var cntVals = metrics[k] && metrics[k].values ? metrics[k].values : null;
-    var cnt = cntVals && typeof cntVals.count === 'number' ? cntVals.count : 0;
+    var cntVals = metrics[k] && metrics[k].values ? metrics[k].values : {};
+    var cnt = typeof cntVals.count === 'number' ? cntVals.count : 0;
 
     var latKey = 'lat_ep__' + tail;
     var latMetric = metrics[latKey];
-    var latVals = latMetric && latMetric.values ? latMetric.values : null;
+    var latVals = latMetric && latMetric.values ? latMetric.values : {};
 
-    var avg = latVals && typeof latVals.avg === 'number' ? Math.round(latVals.avg) : 0;
-    var p95 = latVals && typeof latVals['p(95)'] === 'number' ? Math.round(latVals['p(95)']) : 0;
-    var max = latVals && typeof latVals.max === 'number' ? Math.round(latVals.max) : 0; // ✅ new
+    var avg = typeof latVals.avg === 'number' ? Math.round(latVals.avg) : 0;
+    var p95 = typeof latVals['p(95)'] === 'number' ? Math.round(latVals['p(95)']) : 0;
+    var max = typeof latVals.max === 'number' ? Math.round(latVals.max) : 0; // ✅ we’ll show this
 
     var parts = tail.split('__');
-    var featSlug = parts.shift() || '';
-    var epSlug = parts.join('__');
+    var feat = UNSLUG(parts.shift() || '');
+    var ep = UNSLUG(parts.join('__'));
 
-    rows.push({
-      feature: UNSLUG(featSlug),
-      endpoint: UNSLUG(epSlug),
-      requests: cnt,
-      avg: avg,
-      p95: p95,
-      max: max
-    });
+    rows.push({ feature: feat, endpoint: ep, requests: cnt, avg: avg, p95: p95, max: max });
   }
 
-  // Aggregate by feature
+  // --- Aggregate by feature ---
   var byFeature = {};
   for (var j = 0; j < rows.length; j++) {
     var r = rows[j];
-    if (!byFeature[r.feature]) byFeature[r.feature] = { requests: 0, avgSum: 0, endpoints: 0, p95Max: 0, maxMax: 0 };
-    byFeature[r.feature].requests += r.requests;
-    byFeature[r.feature].avgSum += r.avg;
-    byFeature[r.feature].endpoints += 1;
-    if (r.p95 > byFeature[r.feature].p95Max) byFeature[r.feature].p95Max = r.p95;
-    if (r.max > byFeature[r.feature].maxMax) byFeature[r.feature].maxMax = r.max;
+    if (!byFeature[r.feature])
+      byFeature[r.feature] = { requests: 0, avgSum: 0, endpoints: 0, p95Max: 0, maxMax: 0 };
+    var agg = byFeature[r.feature];
+    agg.requests += r.requests;
+    agg.avgSum += r.avg;
+    agg.endpoints++;
+    if (r.p95 > agg.p95Max) agg.p95Max = r.p95;
+    if (r.max > agg.maxMax) agg.maxMax = r.max;
   }
 
   var featRows = [];
@@ -66,44 +62,84 @@ export default function handleSummary(data) {
     });
   }
 
-  // HTML rendering
-  var css = 'body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:24px}' +
-            'h1{font-size:22px;margin:0 0 12px}' +
-            'h2{font-size:16px;margin:24px 0 8px}' +
-            'table{border-collapse:collapse;width:100%;max-width:960px}' +
-            'th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left;font-size:13px}' +
-            'th{background:#fafafa}' +
-            '.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;color:#666}' +
-            '.muted{color:#888}';
+  // --- HTML layout ---
+  var css =
+    'body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:24px}' +
+    'h1{font-size:22px;margin:0 0 12px}' +
+    'h2{font-size:16px;margin:24px 0 8px}' +
+    'table{border-collapse:collapse;width:100%;max-width:960px}' +
+    'th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left;font-size:13px}' +
+    'th{background:#fafafa}' +
+    '.mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;color:#666}' +
+    '.muted{color:#888}';
 
   var now = new Date();
   var titleTime = now.toISOString().replace('T', ' ').slice(0, 19);
-  var head = '<h1>SDLC Auto Gov Load Test — <span class="mono">' + titleTime + '</span></h1>' +
-             '<div class="muted">Custom Summary Active (Enhanced)</div>';
+  var head =
+    '<h1>SDLC Auto Gov Load Test — <span class="mono">' + titleTime + '</span></h1>' +
+    '<div class="muted">Custom Summary Active (Enhanced with Max latency)</div>';
 
-  var featTbl = featRows.length
-    ? '<table><thead><tr><th>Feature</th><th>Requests</th><th>Avg latency</th><th>p(95)</th><th>Max latency</th></tr></thead><tbody>' +
-      featRows.map(function (r) {
-        return '<tr><td>' + r.feature + '</td><td>' + r.requests + '</td><td>' + r.avg + ' ms</td><td>' + r.p95 + ' ms</td><td>' + r.max + ' ms</td></tr>';
-      }).join('') +
-      '</tbody></table>'
-    : '<div class="muted">No feature data recorded.</div>';
+  var featTbl =
+    featRows.length > 0
+      ? '<table><thead><tr><th>Feature</th><th>Requests</th><th>Avg latency</th><th>p(95)</th><th>Max latency</th></tr></thead><tbody>' +
+        featRows
+          .map(function (r) {
+            return (
+              '<tr><td>' +
+              r.feature +
+              '</td><td>' +
+              r.requests +
+              '</td><td>' +
+              r.avg +
+              ' ms</td><td>' +
+              r.p95 +
+              ' ms</td><td>' +
+              r.max +
+              ' ms</td></tr>'
+            );
+          })
+          .join('') +
+        '</tbody></table>'
+      : '<div class="muted">No feature data recorded.</div>';
 
-  var epTbl = rows.length
-    ? '<table><thead><tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg latency</th><th>p(95)</th><th>Max latency</th></tr></thead><tbody>' +
-      rows.map(function (r) {
-        return '<tr><td>' + r.feature + '</td><td>' + r.endpoint + '</td><td>' + r.requests + '</td><td>' + r.avg + ' ms</td><td>' + r.p95 + ' ms</td><td>' + r.max + ' ms</td></tr>';
-      }).join('') +
-      '</tbody></table>'
-    : '<div class="muted">No endpoint data recorded.</div>';
+  var epTbl =
+    rows.length > 0
+      ? '<table><thead><tr><th>Feature</th><th>Endpoint</th><th>Requests</th><th>Avg latency</th><th>p(95)</th><th>Max latency</th></tr></thead><tbody>' +
+        rows
+          .map(function (r) {
+            return (
+              '<tr><td>' +
+              r.feature +
+              '</td><td>' +
+              r.endpoint +
+              '</td><td>' +
+              r.requests +
+              '</td><td>' +
+              r.avg +
+              ' ms</td><td>' +
+              r.p95 +
+              ' ms</td><td>' +
+              r.max +
+              ' ms</td></tr>'
+            );
+          })
+          .join('') +
+        '</tbody></table>'
+      : '<div class="muted">No endpoint data recorded.</div>';
 
-  var html = '<!doctype html><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>' +
-             '<style>' + css + '</style><body>' + head +
-             '<h2>Feature breakdown</h2>' + featTbl +
-             '<h2>Endpoint breakdown</h2>' + epTbl +
-             '</body>';
+  var html =
+    '<!doctype html><meta charset="utf-8"><title>SDLC Auto Gov Load Test</title>' +
+    '<style>' +
+    css +
+    '</style><body>' +
+    head +
+    '<h2>Feature breakdown</h2>' +
+    featTbl +
+    '<h2>Endpoint breakdown</h2>' +
+    epTbl +
+    '</body>';
 
-  // JSON export
+  // --- JSON export ---
   var json = {
     byFeature: featRows.reduce(function (acc, r) {
       acc[r.feature] = { requests: r.requests, avg: r.avg, p95: r.p95, max: r.max };
