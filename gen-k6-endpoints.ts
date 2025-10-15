@@ -1,14 +1,23 @@
 /* eslint-disable no-console */
 // CommonJS, Node 16+/18+
-// Usage:
-//   node scripts/gen-k6-endpoints.js            # js + json + ts
-//   node scripts/gen-k6-endpoints.js --js-only  # js only
+//
+// Default: writes ONLY perf/k6/sources/endpoints.byFeature.js
+// Opt-in flags:
+//   --with-json   also write endpoints.byFeature.json
+//   --with-ts     also write endpoints.byFeature.ts
+//   --all         same as both flags
+//
+// Run:
+//   node scripts/gen-k6-endpoints.js
+//   node scripts/gen-k6-endpoints.js --all
 
 const fs = require('fs/promises');
 const fssync = require('fs');
 const path = require('path');
 
-// ---------- tiny utils (no external deps) ----------
+const WANT_JSON = process.argv.includes('--with-json') || process.argv.includes('--all');
+const WANT_TS   = process.argv.includes('--with-ts')   || process.argv.includes('--all');
+
 async function walk(dir) {
   const out = [];
   const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -24,72 +33,56 @@ function ensureDirSync(p) {
   if (!fssync.existsSync(dir)) fssync.mkdirSync(dir, { recursive: true });
 }
 function toFeatureName(filePath) {
-  return path.basename(filePath, '.ts')
-    .replace(/\.specs?$/i, '')
-    .trim();
+  return path.basename(filePath, '.ts').replace(/\.specs?$/i, '').trim();
 }
 function cleanBodyString(s) {
   if (!s) return undefined;
-  const trimmed = s.trim();
-  return trimmed.replace(/\s+/g, ' '); // cosmetic
+  return s.trim().replace(/\s+/g, ' ');
 }
 function findMatchingParen(src, openIdx) {
   let depth = 0;
   for (let i = openIdx; i < src.length; i++) {
     const ch = src[i];
     if (ch === '(') depth++;
-    else if (ch === ')') {
-      depth--;
-      if (depth === 0) return i;
-    }
+    else if (ch === ')') { depth--; if (depth === 0) return i; }
   }
   return -1;
 }
 
-// ---------- core extraction per file ----------
 async function parseFile(file) {
   const src = await fs.readFile(file, 'utf8');
 
-  // Collect all test titles from BOTH it(...) and test(...)
-  const TITLE_ALL = [];
+  // capture titles from it(...) and test(...)
+  const TITLES = [];
   const TITLE_RE = /\b(?:it|test)\(\s*["'`](.+?)["'`]\s*,/g;
-  let tm;
-  while ((tm = TITLE_RE.exec(src)) !== null) {
-    TITLE_ALL.push({ name: tm[1], index: tm.index });
-  }
-  function nearestTitle(startIndex) {
-    let name;
-    for (let i = TITLE_ALL.length - 1; i >= 0; i--) {
-      if (TITLE_ALL[i].index <= startIndex) { name = TITLE_ALL[i].name; break; }
-    }
-    return name;
-  }
+  let t;
+  while ((t = TITLE_RE.exec(src)) !== null) TITLES.push({ name: t[1], index: t.index });
+  const nearestTitle = (idx) => {
+    for (let i = TITLES.length - 1; i >= 0; i--) if (TITLES[i].index <= idx) return TITLES[i].name;
+    return undefined;
+  };
 
   const endpoints = [];
 
-  // Pattern A: request.METHOD("url", [opts?])
+  // A) request.METHOD('url', [opts])
   const CALL_RE = /\brequest\.(get|post|put|patch|delete)\s*\(\s*(['"`])([^"'`]+)\2/gi;
   let m;
   while ((m = CALL_RE.exec(src)) !== null) {
     const method = m[1].toUpperCase();
     const url = m[3];
 
-    // attempt to capture the options object (headers/data) if present (2nd arg)
-    let headers = {};
-    let body = null;
-    let auth = undefined;
-    let status = undefined;
-    let text = undefined;
-
-    // Find full call to parse options: start at the "(" that begins the argument list
     const openIdx = src.indexOf('(', m.index + m[0].indexOf('('));
     const closeIdx = findMatchingParen(src, openIdx);
-    const argList = src.slice(openIdx + 1, closeIdx); // inside (...)
+    const argList = src.slice(openIdx + 1, closeIdx);
 
-    // crude parse: if second argument is an object (starts with "{")
+    let headers = {};
+    let body = null;
+    let auth;
+    let status, text;
+
     const afterUrl = argList.replace(/^\s*(["'`].+?["'`])\s*,?/, '').trim();
     if (afterUrl.startsWith('{')) {
-      // find the top-level object bounds (naive)
+      // capture top-level opts object
       let depth = 0, end = -1;
       for (let i = 0; i < afterUrl.length; i++) {
         const ch = afterUrl[i];
@@ -98,35 +91,28 @@ async function parseFile(file) {
       }
       const opts = afterUrl.slice(0, end);
 
-      // headers
       const HDR_RE = /headers\s*:\s*\{([\s\S]*?)\}/i;
       const hm = HDR_RE.exec(opts);
       if (hm) {
         const hdrBlock = hm[1];
-        // content-type
         const CT_RE = /['"]content-type['"]\s*:\s*['"]([^'"]+)['"]/i;
         const ctm = CT_RE.exec(hdrBlock);
         if (ctm) headers['Content-Type'] = ctm[1];
-        // bearer-ish
         const AUTH_RE = /['"]authorization['"]\s*:\s*['"]Bearer\s+([^'"]+)['"]/i;
-        const am = AUTH_RE.exec(hdrBlock);
-        if (am) auth = 'bearer';
+        if (AUTH_RE.test(hdrBlock)) auth = 'bearer';
       }
 
-      // data/body (look for data: or body:)
       const DATA_RE = /\b(?:data|body)\s*:\s*([^\n}]+|\{[\s\S]*?\}|\[[\s\S]*?\])/i;
       const dm = DATA_RE.exec(opts);
       if (dm) body = cleanBodyString(dm[1]);
     }
 
-    // nearest expected status / text right after this call
-    const TAIL_SLICE = src.slice(closeIdx, closeIdx + 600); // small window
+    const tail = src.slice(closeIdx, closeIdx + 600);
     const STATUS_RE = /expect\s*\(\s*response\s*\.\s*status\s*\)\s*\.toBe\s*\(\s*(\d{3})\s*\)/i;
-    const TEXT_RE = /expect\s*\(\s*text\s*\)\s*\.toContain\s*\(\s*['"]([^'"]+)['"]\s*\)/i;
-
-    const sm = STATUS_RE.exec(TAIL_SLICE);
+    const TEXT_RE   = /expect\s*\(\s*text\s*\)\s*\.toContain\s*\(\s*['"]([^'"]+)['"]\s*\)/i;
+    const sm = STATUS_RE.exec(tail);
+    const xm = TEXT_RE.exec(tail);
     if (sm) status = Number(sm[1]);
-    const xm = TEXT_RE.exec(TAIL_SLICE);
     if (xm) text = xm[1];
 
     let name = nearestTitle(m.index);
@@ -134,52 +120,45 @@ async function parseFile(file) {
 
     endpoints.push({
       name, method, url,
-      ...(headers && Object.keys(headers).length ? { headers } : {}),
+      ...(Object.keys(headers).length ? { headers } : {}),
       ...(auth ? { auth } : {}),
-      expect: {
-        ...(typeof status === 'number' ? { status } : {}),
-        ...(typeof text === 'string' ? { text } : {}),
-      },
+      expect: { ...(status ? { status } : {}), ...(text ? { text } : {}) },
       ...(body ? { body } : {}),
     });
   }
 
-  // Pattern B: request.fetch("url", { method: 'POST', ... })
+  // B) request.fetch('url', { method, ... })
   const FETCH_RE = /\brequest\.fetch\s*\(\s*(['"`])([^"'`]+)\1\s*,\s*\{([\s\S]*?)\}\s*\)/gi;
   let f;
   while ((f = FETCH_RE.exec(src)) !== null) {
     const url = f[2];
     const opts = f[3];
 
-    // method (default GET)
     let method = 'GET';
     const METH_RE = /\bmethod\s*:\s*['"]([A-Za-z]+)['"]/i;
     const mm = METH_RE.exec(opts);
     if (mm) method = mm[1].toUpperCase();
 
-    // headers
     const headers = {};
     const CT_RE = /['"]content-type['"]\s*:\s*['"]([^'"]+)['"]/i;
     const ctm = CT_RE.exec(opts);
     if (ctm) headers['Content-Type'] = ctm[1];
 
-    let auth = undefined;
+    let auth;
     const AUTH_RE = /['"]authorization['"]\s*:\s*['"]Bearer\s+([^'"]+)['"]/i;
-    const am = AUTH_RE.exec(opts);
-    if (am) auth = 'bearer';
+    if (AUTH_RE.exec(opts)) auth = 'bearer';
 
-    // body/data
     let body = null;
     const BODY_RE = /\b(?:data|body)\s*:\s*([^\n}]+|\{[\s\S]*?\}|\[[\s\S]*?\])/i;
     const bm = BODY_RE.exec(opts);
     if (bm) body = cleanBodyString(bm[1]);
 
-    // look forward for expectations
-    const TAIL_SLICE = src.slice(f.index + f[0].length, f.index + f[0].length + 600);
+    const tail = src.slice(f.index + f[0].length, f.index + f[0].length + 600);
     const STATUS_RE = /expect\s*\(\s*response\s*\.\s*status\s*\)\s*\.toBe\s*\(\s*(\d{3})\s*\)/i;
-    const TEXT_RE = /expect\s*\(\s*text\s*\)\s*\.toContain\s*\(\s*['"]([^'"]+)['"]\s*\)/i;
-    const sm = STATUS_RE.exec(TAIL_SLICE);
-    const xm = TEXT_RE.exec(TAIL_SLICE);
+    const TEXT_RE   = /expect\s*\(\s*text\s*\)\s*\.toContain\s*\(\s*['"]([^'"]+)['"]\s*\)/i;
+
+    const sm = STATUS_RE.exec(tail);
+    const xm = TEXT_RE.exec(tail);
 
     let name = nearestTitle(f.index);
     if (!name) name = `${method} ${url}`;
@@ -188,10 +167,7 @@ async function parseFile(file) {
       name, method, url,
       ...(Object.keys(headers).length ? { headers } : {}),
       ...(auth ? { auth } : {}),
-      expect: {
-        ...(sm ? { status: Number(sm[1]) } : {}),
-        ...(xm ? { text: xm[1] } : {}),
-      },
+      expect: { ...(sm ? { status: Number(sm[1]) } : {}), ...(xm ? { text: xm[1] } : {}) },
       ...(body ? { body } : {}),
     });
   }
@@ -201,7 +177,6 @@ async function parseFile(file) {
 
 (async function main() {
   try {
-    const JS_ONLY = process.argv.includes('--js-only');
     const ROOT = process.cwd();
     const TEST_ROOT = path.join(ROOT, 'tests', 'endpoint-tests');
 
@@ -211,8 +186,7 @@ async function parseFile(file) {
       process.exit(0);
     }
 
-    const byFeature = {}; // { featureName: Endpoint[] }
-
+    const byFeature = {};
     for (const file of files) {
       const feature = toFeatureName(file);
       const eps = await parseFile(file);
@@ -224,17 +198,28 @@ async function parseFile(file) {
     const OUT_DIR = path.join(ROOT, 'perf', 'k6', 'sources');
     ensureDirSync(OUT_DIR);
 
-    // 1) Write .json (unless --js-only)
-    const jsonPath = path.join(OUT_DIR, 'endpoints.byfeature.json');
-    if (!JS_ONLY) {
+    const BASE = 'endpoints.byFeature'; // <<< Capital F everywhere
+
+    // .js (always)
+    const jsPath = path.join(OUT_DIR, `${BASE}.js`);
+    const js = [
+      '// AUTO-GENERATED — K6 ESM compatible (JS-only mode)',
+      'const features = ' + JSON.stringify(byFeature, null, 2) + ';',
+      '',
+      'export default features;',
+      '',
+    ].join('\n');
+    await fs.writeFile(jsPath, js, 'utf8');
+
+    // optional extras
+    if (WANT_JSON) {
+      const jsonPath = path.join(OUT_DIR, `${BASE}.json`);
       await fs.writeFile(jsonPath, JSON.stringify(byFeature, null, 2), 'utf8');
     }
-
-    // 2) Write .ts (unless --js-only) — keep what your runner liked before
-    const tsPath = path.join(OUT_DIR, 'endpoints.byfeature.ts');
-    if (!JS_ONLY) {
+    if (WANT_TS) {
+      const tsPath = path.join(OUT_DIR, `${BASE}.ts`);
       const ts = [
-        '// AUTO-GENERATED from Playwright specs — keep null/URL bodies as-is',
+        '// AUTO-GENERATED from Playwright specs',
         'export type Method = \'GET\' | \'POST\' | \'PUT\' | \'PATCH\' | \'DELETE\';',
         'export type Endpoint = {',
         '  name: string;',
@@ -252,24 +237,13 @@ async function parseFile(file) {
       await fs.writeFile(tsPath, ts, 'utf8');
     }
 
-    // 3) Write .js (always) — ESM default export your runner needs
-    const jsPath = path.join(OUT_DIR, 'endpoints.byfeature.js');
-    const js = [
-      '// AUTO-GENERATED — K6 ESM compatible',
-      'const features = ' + JSON.stringify(byFeature, null, 2) + ';',
-      '',
-      'export default features;',
-      '',
-    ].join('\n');
-    await fs.writeFile(jsPath, js, 'utf8');
+    const featCount = Object.keys(byFeature).length;
+    const epCount = Object.values(byFeature).reduce((a, v) => a + v.length, 0);
 
-    const countFeatures = Object.keys(byFeature).length;
-    const countEndpoints = Object.values(byFeature).reduce((a, v) => a + v.length, 0);
-
-    console.log(`✅ Generated ${countEndpoints} endpoints across ${countFeatures} features →`);
-    if (!JS_ONLY) console.log(`  - perf/k6/sources/endpoints.byfeature.json`);
-    if (!JS_ONLY) console.log(`  - perf/k6/sources/endpoints.byfeature.ts`);
-    console.log(`  - perf/k6/sources/endpoints.byfeature.js`);
+    console.log(`✅ Generated ${epCount} endpoints across ${featCount} features →`);
+    console.log(`  - perf/k6/sources/${BASE}.js`);
+    if (WANT_JSON) console.log(`  - perf/k6/sources/${BASE}.json`);
+    if (WANT_TS)   console.log(`  - perf/k6/sources/${BASE}.ts`);
   } catch (err) {
     console.error(err);
     process.exit(1);
