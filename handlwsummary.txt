@@ -86,7 +86,7 @@ export default function handleSummary(data) {
   var now = new Date();
   var titleTime = now.toISOString().replace("T", " ").slice(0, 19);
   var head =
-    '<h1>SDLC Auto Gov Load Test — <span class="mono">' +
+    '<h1>Load Test — <span class="mono">' +
     titleTime +
     "</span></h1>" +
     '<div class="muted">Enhanced Summary Active (Avg / p95 / Max / Min)</div>';
@@ -128,7 +128,7 @@ export default function handleSummary(data) {
   ]);
 
   var html =
-    "<!doctype html><meta charset='utf-8'><title>SDLC Auto Gov Load Test</title>" +
+    "<!doctype html><meta charset='utf-8'><title>Gov Load Test</title>" +
     "<style>" +
     css +
     "</style><body>" +
