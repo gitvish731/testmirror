@@ -1,90 +1,86 @@
-stages:
-  - k6_gen
-  - k6_run
+########################################################################
+# Global: Skip all default jobs unless they explicitly override rules
+########################################################################
+default:
+  rules:
+    - if: '$RUN_K6_ONLY == "1"'
+      when: never
+    - when: on_success
 
-# ---------------------------
-# Defaults / knobs you can override per-pipeline or per-job
-# ---------------------------
+
+########################################################################
+# ─── Existing config from your repo (keep as is) ─────────────────────
+########################################################################
+include:
+  - local: ".gitlab/ci/**/*.gitlab-ci.yml"
+
+image: golang:1.22
 variables:
-  # k6 compat (safer on 0.46)
-  K6_COMPATIBILITY_MODE: "extended"
-  # default execution knobs (override in CI/CD variables when you run the pipeline)
-  VUS: "1"
-  ITERS: "1"
-  DURATION: ""                       # e.g. "15s" (leave empty to use fixed-iterations mode)
-  FEATURES: ""                       # e.g. "ReportingAPI Alpha1,ReportingAPI Beta1" (empty = all)
-  # bearer token if your POST/PATCH/DELETE need it (optional)
-  TOKEN: ""
+  GOPROXY: "https://proxy.golang.org"
+  CGO_ENABLED: "0"
+  GOOS: "linux"
+  GOARCH: "amd64"
 
-# ---------------------------
-# Job: Generate endpoints.byFeature.js from Playwright specs
-# ---------------------------
+
+########################################################################
+# ─── Your existing stages (don't touch) ──────────────────────────────
+########################################################################
+stages:
+  - prepare_test
+  - test
+  - build
+  - k6_gen        # ✅ new
+  - k6_run        # ✅ new
+  - deploy
+
+
+########################################################################
+# ─── k6 GENERATE ENDPOINTS ───────────────────────────────────────────
+# Creates: perf/k6/sources/endpoints.byFeature.js
+########################################################################
 k6:gen:
   stage: k6_gen
   image: node:18-alpine
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
+    - if: '$RUN_K6_ONLY == "1"'
+      when: on_success
+    - when: manual     # <-- If pipeline runs normally (no RUN_K6_ONLY), this won't autotrigger
   before_script:
-    - node -v
-    - npm -v
+    - npm ci
   script:
-    # Ensure repo deps are present only if you need any for your generator;
-    # otherwise just run the generator directly.
-    # - npm ci
-    - node scripts/gen-k6-endpoints.js        # JS-only output (preferred)
-    # If you ever want JSON/TS as well, use:
-    # - node scripts/gen-k6-endpoints.js --all
+    - echo "--- GENERATING K6 ENDPOINTS FILE ---"
+    - node scripts/gen-k6-endpoints.js
   artifacts:
-    name: "k6-gen-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
-    when: always
-    expire_in: 2 weeks
     paths:
       - perf/k6/sources/endpoints.byFeature.js
-      # Uncomment if you output these too:
-      # - perf/k6/sources/endpoints.byFeature.json
-      # - perf/k6/sources/endpoints.byFeature.ts
-  cache:
-    key: "node-cache-$CI_PROJECT_ID"
-    paths:
-      - node_modules/
-    policy: pull-push
+    expire_in: 2 weeks
 
-# ---------------------------
-# Job: Run k6 with your internal image and publish HTML/JSON summary
-# ---------------------------
+
+########################################################################
+# ─── k6 RUN LOAD TEST ────────────────────────────────────────────────
+# Runs K6 performance test using generated .js file
+########################################################################
 k6:run:
   stage: k6_run
   image: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0
-  needs: ["k6:gen"]                  # ensure endpoints.byFeature.js exists
+  needs: ["k6:gen"]
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
+    - if: '$RUN_K6_ONLY == "1"'
+      when: on_success
+    - when: manual
   variables:
-    # pass through to k6 script via __ENV.* (your runner reads these)
-    VUS: $VUS
-    ITERS: $ITERS
-    DURATION: $DURATION
-    FEATURES: $FEATURES
-    TOKEN: $TOKEN
-    K6_COMPATIBILITY_MODE: $K6_COMPATIBILITY_MODE
-    # optional: include more trend stats in k6’s native summary
+    K6_COMPATIBILITY_MODE: "extended"
     K6_SUMMARY_TREND_STATS: "avg,min,med,p(90),p(95),max"
   script:
-    - k6 version
-    # Show what we’re about to run
-    - echo "VUS=$VUS ITERS=$ITERS DURATION='$DURATION' FEATURES='$FEATURES'"
-    # Run either fixed-iterations mode or duration mode based on $DURATION
+    - echo "--- STARTING K6 TEST ---"
     - |
       if [ -n "$DURATION" ]; then
-        echo "Running duration mode..."
         k6 run perf/k6/scenarios/from-playwright.http.js \
           -e VUS="$VUS" \
           -e DURATION="$DURATION" \
           -e FEATURES="$FEATURES" \
           -e TOKEN="$TOKEN"
       else
-        echo "Running fixed-iterations mode..."
         k6 run perf/k6/scenarios/from-playwright.http.js \
           -e VUS="$VUS" \
           -e ITERS="$ITERS" \
@@ -92,11 +88,19 @@ k6:run:
           -e TOKEN="$TOKEN"
       fi
   artifacts:
-    name: "k6-report-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
-    when: always
-    expire_in: 2 weeks
     paths:
       - perf/k6/reports/summary.html
       - perf/k6/reports/summary.json
-  # If you prefer to not fail the pipeline on k6 threshold failures, uncomment:
-  # allow_failure: true
+    expire_in: 2 weeks
+
+
+########################################################################
+# ─── (Optional) Override only specific old failing jobs ─────────────
+# If there are existing jobs that always fail (prepare_images, etc.)
+# Uncomment below to skip them only when RUN_K6_ONLY=1
+########################################################################
+# prepare_images:
+#   rules:
+#     - if: '$RUN_K6_ONLY == "1"'
+#       when: never
+#     - when: on_success
