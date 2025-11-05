@@ -166,3 +166,22 @@ workflow:
       variables:
         PIPELINE_NAME: test_playwright_prod
       when: always
+
+
+
+
+script:
+  - echo "🚀 Running K6..."
+  - cd perf/k6
+
+  # Build K6 command dynamically
+  - |
+    CMD="k6 run scenarios/from-playwright.http.js"
+    [ -n "$VUS" ] && CMD="$CMD -e VUS=$VUS"
+    [ -n "$ITERS" ] && CMD="$CMD -e ITERS=$ITERS"
+    [ -n "$DURATION" ] && CMD="$CMD -e DURATION=$DURATION"
+    [ -n "$FEATURES" ] && CMD="$CMD -e FEATURES=\"$FEATURES\""
+    [ -n "$ENDPOINTS" ] && CMD="$CMD -e ENDPOINTS=\"$ENDPOINTS\""
+
+    echo "🚀 Running K6 (features: ${FEATURES:-ALL}, endpoints: ${ENDPOINTS:-unset}, vus: ${VUS}, iters: ${ITERS}, duration: ${DURATION:-unset})"
+    $CMD
