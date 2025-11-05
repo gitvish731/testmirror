@@ -1,156 +1,102 @@
-// perf/k6/vendor/handleSummary.js
-// FINAL ONE-SHOT VERSION — shows Avg, p(95), Max (and Min if present)
+stages:
+  - k6_gen
+  - k6_run
 
-function UNSLUG(s) {
-  return String(s || "").replace(/__/g, " :: ").replace(/_/g, " ").trim();
-}
+# ---------------------------
+# Defaults / knobs you can override per-pipeline or per-job
+# ---------------------------
+variables:
+  # k6 compat (safer on 0.46)
+  K6_COMPATIBILITY_MODE: "extended"
+  # default execution knobs (override in CI/CD variables when you run the pipeline)
+  VUS: "1"
+  ITERS: "1"
+  DURATION: ""                       # e.g. "15s" (leave empty to use fixed-iterations mode)
+  FEATURES: ""                       # e.g. "ReportingAPI Alpha1,ReportingAPI Beta1" (empty = all)
+  # bearer token if your POST/PATCH/DELETE need it (optional)
+  TOKEN: ""
 
-export default function handleSummary(data) {
-  var metrics = data && data.metrics ? data.metrics : {};
-  var rows = [];
+# ---------------------------
+# Job: Generate endpoints.byFeature.js from Playwright specs
+# ---------------------------
+k6:gen:
+  stage: k6_gen
+  image: node:18-alpine
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  before_script:
+    - node -v
+    - npm -v
+  script:
+    # Ensure repo deps are present only if you need any for your generator;
+    # otherwise just run the generator directly.
+    # - npm ci
+    - node scripts/gen-k6-endpoints.js        # JS-only output (preferred)
+    # If you ever want JSON/TS as well, use:
+    # - node scripts/gen-k6-endpoints.js --all
+  artifacts:
+    name: "k6-gen-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 2 weeks
+    paths:
+      - perf/k6/sources/endpoints.byFeature.js
+      # Uncomment if you output these too:
+      # - perf/k6/sources/endpoints.byFeature.json
+      # - perf/k6/sources/endpoints.byFeature.ts
+  cache:
+    key: "node-cache-$CI_PROJECT_ID"
+    paths:
+      - node_modules/
+    policy: pull-push
 
-  // --- Extract endpoint-level metrics ---
-  var keys = Object.keys(metrics);
-  for (var i = 0; i < keys.length; i++) {
-    var k = keys[i];
-    if (k.indexOf("reqs_ep__") !== 0) continue;
-
-    var tail = k.slice("reqs_ep__".length);
-    var cntVals = metrics[k] && metrics[k].values ? metrics[k].values : {};
-    var cnt = typeof cntVals.count === "number" ? cntVals.count : 0;
-
-    var latKey = "lat_ep__" + tail;
-    var latVals = metrics[latKey] && metrics[latKey].values ? metrics[latKey].values : {};
-
-    var avg = typeof latVals.avg === "number" ? Math.round(latVals.avg) : 0;
-    var p95 = typeof latVals["p(95)"] === "number" ? Math.round(latVals["p(95)"]) : 0;
-    var max = typeof latVals.max === "number" ? Math.round(latVals.max) : 0;
-    var min = typeof latVals.min === "number" ? Math.round(latVals.min) : 0;
-
-    var parts = tail.split("__");
-    var feat = UNSLUG(parts.shift() || "");
-    var ep = UNSLUG(parts.join("__"));
-
-    rows.push({
-      feature: feat,
-      endpoint: ep,
-      requests: cnt,
-      avg: avg,
-      p95: p95,
-      max: max,
-      min: min,
-    });
-  }
-
-  // --- Aggregate per feature ---
-  var byFeature = {};
-  for (var j = 0; j < rows.length; j++) {
-    var r = rows[j];
-    if (!byFeature[r.feature])
-      byFeature[r.feature] = { requests: 0, avgSum: 0, endpoints: 0, p95Max: 0, maxMax: 0, minMin: 999999 };
-    var agg = byFeature[r.feature];
-    agg.requests += r.requests;
-    agg.avgSum += r.avg;
-    agg.endpoints++;
-    if (r.p95 > agg.p95Max) agg.p95Max = r.p95;
-    if (r.max > agg.maxMax) agg.maxMax = r.max;
-    if (r.min < agg.minMin) agg.minMin = r.min;
-  }
-
-  var featRows = [];
-  var fKeys = Object.keys(byFeature);
-  for (var f = 0; f < fKeys.length; f++) {
-    var fname = fKeys[f];
-    var agg = byFeature[fname];
-    featRows.push({
-      feature: fname,
-      requests: agg.requests,
-      avg: agg.endpoints ? Math.round(agg.avgSum / agg.endpoints) : 0,
-      p95: agg.p95Max,
-      max: agg.maxMax,
-      min: agg.minMin === 999999 ? 0 : agg.minMin,
-    });
-  }
-
-  // --- HTML output ---
-  var css =
-    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:24px}" +
-    "h1{font-size:22px;margin:0 0 12px}" +
-    "h2{font-size:16px;margin:24px 0 8px}" +
-    "table{border-collapse:collapse;width:100%;max-width:960px}" +
-    "th,td{border:1px solid #e0e0e0;padding:6px 8px;text-align:left;font-size:13px}" +
-    "th{background:#fafafa}" +
-    ".mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;color:#666}" +
-    ".muted{color:#888}";
-
-  var now = new Date();
-  var titleTime = now.toISOString().replace("T", " ").slice(0, 19);
-  var head =
-    '<h1>Load Test — <span class="mono">' +
-    titleTime +
-    "</span></h1>" +
-    '<div class="muted">Enhanced Summary Active (Avg / p95 / Max / Min)</div>';
-
-  function makeTable(rows, cols) {
-    if (!rows || !rows.length) return '<div class="muted">No data recorded.</div>';
-    var th = "<tr>" + cols.map(function (c) { return "<th>" + c.title + "</th>"; }).join("") + "</tr>";
-    var body = rows.map(function (r) {
-      return (
-        "<tr>" +
-        cols.map(function (c) {
-          var val = r[c.key];
-          if (typeof val === "number") return "<td>" + val + (c.unit || "") + "</td>";
-          return "<td>" + (val || "") + "</td>";
-        }).join("") +
-        "</tr>"
-      );
-    }).join("");
-    return "<table><thead>" + th + "</thead><tbody>" + body + "</tbody></table>";
-  }
-
-  var featTbl = makeTable(featRows, [
-    { title: "Feature", key: "feature" },
-    { title: "Requests", key: "requests" },
-    { title: "Avg latency", key: "avg", unit: " ms" },
-    { title: "p(95)", key: "p95", unit: " ms" },
-    { title: "Max latency", key: "max", unit: " ms" },
-    { title: "Min latency", key: "min", unit: " ms" },
-  ]);
-
-  var epTbl = makeTable(rows, [
-    { title: "Feature", key: "feature" },
-    { title: "Endpoint", key: "endpoint" },
-    { title: "Requests", key: "requests" },
-    { title: "Avg latency", key: "avg", unit: " ms" },
-    { title: "p(95)", key: "p95", unit: " ms" },
-    { title: "Max latency", key: "max", unit: " ms" },
-    { title: "Min latency", key: "min", unit: " ms" },
-  ]);
-
-  var html =
-    "<!doctype html><meta charset='utf-8'><title>Gov Load Test</title>" +
-    "<style>" +
-    css +
-    "</style><body>" +
-    head +
-    "<h2>Feature breakdown</h2>" +
-    featTbl +
-    "<h2>Endpoint breakdown</h2>" +
-    epTbl +
-    "</body>";
-
-  // --- JSON output ---
-  var json = {
-    byFeature: featRows.reduce(function (acc, r) {
-      acc[r.feature] = { requests: r.requests, avg: r.avg, p95: r.p95, max: r.max, min: r.min };
-      return acc;
-    }, {}),
-    byEndpoint: rows,
-  };
-
-  return {
-    stdout: "Enhanced summary active with Avg / p95 / Max / Min\n",
-    "perf/k6/reports/summary.html": html,
-    "perf/k6/reports/summary.json": JSON.stringify(json, null, 2),
-  };
-}
+# ---------------------------
+# Job: Run k6 with your internal image and publish HTML/JSON summary
+# ---------------------------
+k6:run:
+  stage: k6_run
+  image: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0
+  needs: ["k6:gen"]                  # ensure endpoints.byFeature.js exists
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  variables:
+    # pass through to k6 script via __ENV.* (your runner reads these)
+    VUS: $VUS
+    ITERS: $ITERS
+    DURATION: $DURATION
+    FEATURES: $FEATURES
+    TOKEN: $TOKEN
+    K6_COMPATIBILITY_MODE: $K6_COMPATIBILITY_MODE
+    # optional: include more trend stats in k6’s native summary
+    K6_SUMMARY_TREND_STATS: "avg,min,med,p(90),p(95),max"
+  script:
+    - k6 version
+    # Show what we’re about to run
+    - echo "VUS=$VUS ITERS=$ITERS DURATION='$DURATION' FEATURES='$FEATURES'"
+    # Run either fixed-iterations mode or duration mode based on $DURATION
+    - |
+      if [ -n "$DURATION" ]; then
+        echo "Running duration mode..."
+        k6 run perf/k6/scenarios/from-playwright.http.js \
+          -e VUS="$VUS" \
+          -e DURATION="$DURATION" \
+          -e FEATURES="$FEATURES" \
+          -e TOKEN="$TOKEN"
+      else
+        echo "Running fixed-iterations mode..."
+        k6 run perf/k6/scenarios/from-playwright.http.js \
+          -e VUS="$VUS" \
+          -e ITERS="$ITERS" \
+          -e FEATURES="$FEATURES" \
+          -e TOKEN="$TOKEN"
+      fi
+  artifacts:
+    name: "k6-report-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    when: always
+    expire_in: 2 weeks
+    paths:
+      - perf/k6/reports/summary.html
+      - perf/k6/reports/summary.json
+  # If you prefer to not fail the pipeline on k6 threshold failures, uncomment:
+  # allow_failure: true
