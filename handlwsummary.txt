@@ -1,3 +1,10 @@
+# from your repo root, run the ESM runner (assuming endpoints.byFeature.js exists)
+docker run --rm -v "$PWD/perf/k6:/work" -w /work \
+  container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0 \
+  k6 run scenarios/from-playwright.http.js -e VUS=1 -e ITERS=1 -e FEATURES="ReportingAPI Alpha1"
+
+
+
 # ==========================================================
 # ALWAYS KEEP THIS AT TOP
 # Workflow: controls when pipeline is allowed to run
