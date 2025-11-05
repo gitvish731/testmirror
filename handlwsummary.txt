@@ -1,10 +1,3 @@
-# from your repo root, run the ESM runner (assuming endpoints.byFeature.js exists)
-docker run --rm -v "$PWD/perf/k6:/work" -w /work \
-  container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0 \
-  k6 run scenarios/from-playwright.http.js -e VUS=1 -e ITERS=1 -e FEATURES="ReportingAPI Alpha1"
-
-
-
 # ==========================================================
 # ALWAYS KEEP THIS AT TOP
 # Workflow: controls when pipeline is allowed to run
@@ -136,7 +129,7 @@ k6_run:
   stage: k6_run
   image:
     name: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0
-    entrypoint: [""]        # use shell
+    entrypoint: [""]           # ensure we get a normal shell
   rules:
     - if: '$RUN_ONLY == "k6"'
       when: always
@@ -145,18 +138,22 @@ k6_run:
     - when: never
   needs: ["k6_gen"]
   script:
-    - echo "🚀 Running k6..."
+    - echo "🚀 Running K6…"
     - cd perf/k6
-    - |
-      CMD="k6 run scenarios/from-playwright.http.js"
-      [ -n "$VUS" ] && CMD="$CMD -e VUS=$VUS"
-      [ -n "$ITERS" ] && CMD="$CMD -e ITERS=$ITERS"
-      [ -n "$DURATION" ] && CMD="$CMD -e DURATION=$DURATION"
-      [ -n "$FEATURES" ] && CMD="$CMD -e FEATURES=\"$FEATURES\""
-      [ -n "$ENDPOINTS" ] && CMD="$CMD -e ENDPOINTS=\"$ENDPOINTS\""
+    - mkdir -p reports
 
-      echo "🚀 Running K6 (features: ${FEATURES:-ALL}, endpoints: ${ENDPOINTS:-unset}, vus: ${VUS}, iters: ${ITERS}, duration: ${DURATION:-unset})"
-      $CMD
+    # Export runtime knobs as ENV so k6 can read them via __ENV (no -e flags needed)
+    - export VUS="${VUS:-1}"
+    - export ITERS="${ITERS:-1}"
+    - if [ -n "${DURATION:-}"  ]; then export DURATION="$DURATION"; fi
+    - if [ -n "${FEATURES:-}"  ]; then export FEATURES="$FEATURES"; fi
+    - if [ -n "${ENDPOINTS:-}" ]; then export ENDPOINTS="$ENDPOINTS"; fi
+
+    # Run the test
+    - k6 run scenarios/from-playwright.http.js
+
+    # Show where the reports landed (helps debugging artifacts)
+    - ls -lah reports || true
   artifacts:
     when: always
     expire_in: 7 days
@@ -166,6 +163,7 @@ k6_run:
       - perf/k6/reports/summary.html
       - perf/k6/reports/summary.json
   allow_failure: false
+
 
 
 
