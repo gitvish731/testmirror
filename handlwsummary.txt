@@ -1,6 +1,26 @@
-# -------------------------------
+# ==========================================================
+# ALWAYS KEEP THIS AT TOP
+# Workflow: controls when pipeline is allowed to run
+# (Fix #1 — now ONLY ONE workflow block)
+# ==========================================================
+workflow:
+  name: $PIPELINE_NAME
+  rules:
+    # Block auto-pipelines from Git tags
+    - if: '$CI_PIPELINE_SOURCE == "tag"'
+      when: never
+
+    # Allow schedule or API trigger pipelines
+    - if: '$CI_PIPELINE_SOURCE == "trigger" && $SOURCE_PROJECT_ID != null && $SOURCE_PROJECT_ID != ""'
+      when: always
+
+    # Default — allow user "Run Pipeline" from UI
+    - when: always
+
+
+# ==========================================================
 # Existing includes (unchanged)
-# -------------------------------
+# ==========================================================
 include:
   - project: 'ubs-ag/gt/ise/devops-platforms/gitlab/devcloud-generic-templates/ci-templates'
     file:
@@ -10,25 +30,24 @@ include:
     file:
       - '/pipeline_templates/.sdlc.yml'
 
-# -------------------------------
-# Base image used by many of your existing jobs (unchanged)
-# -------------------------------
+
+# ==========================================================
+# Base image used by your existing pipeline (unchanged)
+# ==========================================================
 image: container-registry.ubs.net/golang:1.21
 
-# -------------------------------
-# Global variables (consolidated)
-# NOTE: Added SKIP_* + group/milestone vars here to avoid "unknown keys" errors
-#       Added K6_* knobs + run-time control.
-# -------------------------------
+
+# ==========================================================
+# ✅ Consolidated Global Variables (Fixes "unknown keys" errors)
+# ==========================================================
 variables:
-  # --- your existing environment / proxy / vault variables (from screenshot 1) ---
   GOPROXY: "https://nexus-tp.dev.sbsbank.com/repository/public-lib-golang_direct"
   GOSUMDB: "off"
   VAULT_SERVER_URL: "https://vault.eu.eva.ubsdev.net"
   VAULT_AUTH_ROLE: "dev_etl_05284"
   VAULT_NAMESPACE: "AT50284"
 
-  # env URLs (unchanged – keep yours as-is)
+  # Environment URLs
   ENV: "dev"
   DEV_URL: "grafeas.sdlcapis-dev.azpriv-cloud.ubs.net"
   UAT_URL: "grafeas.sdlcapis-test.azpriv-cloud.ubs.net"
@@ -37,71 +56,64 @@ variables:
   UAT_GRAFEAS_HOST: "grafeas.sdlcapis-test.azpriv-cloud.ubs.net:443"
   PROD_GRAFEAS_HOST: "grafeas.sdlcapis-prod.azpriv-cloud.ubs.net:443"
 
-  # SOAP (unchanged examples)
+  # SOAP
   GSNOW_SOAP_URL: "https://esnow.ubs.net/webservices/UBSChangeOperation.do?SOAP"
   GSNOW_SOAP_ACTION: "http://www.service-now.com/UBSChangeOperation/changeOperationRequest"
 
-  # --- K6 run-time knobs (user selects at "Run pipeline") ---
-  # If FEATURES and ENDPOINTS are both empty => runner executes ALL features.
-  FEATURES: ""         # e.g. 'ReportingAPI Alpha1,ReportingAPI Beta1'
-  ENDPOINTS: ""        # optional: run by endpoint names (CSV), otherwise by features
-  VUS: "1"             # virtual users
-  ITERS: "1"           # iterations per VU (ignored if DURATION is set)
-  DURATION: ""         # e.g. "30s" to run a duration-based test; overrides ITERS
-  RUN_ONLY: ""         # set to "k6" to focus this pipeline on K6-only sanity run
+  # ✅ K6 Run-time parameters (set by user from UI)
+  FEATURES: ""         # e.g. "ReportingAPI Alpha1,ReportingAPI Beta1"
+  ENDPOINTS: ""        # optional: run specific endpoints
+  VUS: "1"
+  ITERS: "1"
+  DURATION: ""
+  RUN_ONLY: ""         # Set to "k6" to bypass Playwright jobs
 
-  # Where reports land in the repo workspace
+  # K6 Reports location
   K6_REPORT_DIR: "perf/k6/reports"
 
-  # Make included Playwright/integration checks easy to skip during K6-only runs
+  # Required to avoid "unknown keys" CI validation errors
   SKIP_GITLAB_WEBHOOK_TESTS: "true"
   SKIP_RLC_TESTS: "true"
-
-  # Milestone & deploy variables that previously caused "unknown keys" when misplaced
   MILESTONE_GROUP_ID: "497008"
   GROUP_ACCESS_TOKEN: "group_access_token_497008"
   DEPLOYMENT_PROJECT_PATH: "deploy/ts/application/it-development-and-quality-assurance/sdlc-auto-governance/config"
   ARTIFACT: "$ARTIFACT_NAME"
 
-# -------------------------------
-# Stages (existing + K6 at top as you showed)
-# -------------------------------
-stages:
-  - fetch_milestone      # 1_fetch_milestone (existing)
-  - k6_gen               # NEW
-  - k6_run               # NEW
-  - deploy_uat           # 2_deploy_uat (existing)
-  - test                 # 4_e2e_test (existing)
-  - prepare_test_report  # 5_test_report_automation (existing)
-  - upload_test_evidence # 5_test_report_automation (existing)
-  - create_change        # 6_change_automation (existing)
-  - progress_change      # 6_change_automation (existing)
-  - deploy_prod          # 7_deploy_prod (existing)
-  - checkout             # 8_post_prod_deploy (existing)
-  - build                # 9_pages (existing)
-  - deploy               # 9_pages (existing)
 
 # ==========================================================
-# STEP 1: Generate perf/k6/sources/endpoints.byFeature.js
-#         from your Playwright endpoint test specs
+# Stages (added k6 stages at the top)
+# ==========================================================
+stages:
+  - fetch_milestone
+  - k6_gen          # NEW
+  - k6_run          # NEW
+  - deploy_uat
+  - test
+  - prepare_test_report
+  - upload_test_evidence
+  - create_change
+  - progress_change
+  - deploy_prod
+  - checkout
+  - build
+  - deploy
+
+
+# ==========================================================
+# STEP 1 — Generate endpoints.byFeature.js
 # ==========================================================
 k6_gen:
   stage: k6_gen
-  image: container-registry.ubs.net/ubs/gctojanus/devops/runner/nodejs18:1.0.232.215036   # <— your Node 18 image from screenshot #3
+  image: container-registry.ubs.net/ubs/gctojanus/devops/runner/nodejs18:1.0.232.215036
   rules:
-    # Run in two situations:
-    # 1) you explicitly set RUN_ONLY=k6 (sanity-only)
     - if: '$RUN_ONLY == "k6"'
       when: always
-    # 2) manual "Run pipeline" from the web UI
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: always
-    # otherwise skip
     - when: never
   script:
-    - echo "▶ Generating K6 endpoints (from Playwright specs)..."
-    - node --version
-    - node scripts/gen-k6-endpoints.js       # default: writes ONLY endpoints.byFeature.js
+    - echo "▶ Generating K6 endpoints from Playwright specs..."
+    - node scripts/gen-k6-endpoints.js       # <-- generates endpoints.byFeature.js only
   artifacts:
     when: always
     expire_in: 7 days
@@ -109,15 +121,15 @@ k6_gen:
       - perf/k6/sources/endpoints.byFeature.js
   allow_failure: false
 
+
 # ==========================================================
-# STEP 2: Run K6 using your ESM runner (from-playwright.http.js)
-#         Supports FEATURES/ENDPOINTS/VUS/ITERS/DURATION
+# STEP 2 — Run K6 load test
 # ==========================================================
 k6_run:
   stage: k6_run
   image:
-    name: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0      # <— official k6 v0.46 image you already use
-    entrypoint: [""]                                                      # use the container shell entrypoint
+    name: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0
+    entrypoint: [""]        # use shell
   rules:
     - if: '$RUN_ONLY == "k6"'
       when: always
@@ -126,18 +138,18 @@ k6_run:
     - when: never
   needs: ["k6_gen"]
   script:
-    - echo "▶ Running K6 (features: '${FEATURES:-ALL}', endpoints: '${ENDPOINTS:-none}', vus: $VUS, iters: $ITERS, duration: '${DURATION:-unset}')"
+    - echo "🚀 Running k6..."
     - cd perf/k6
-    # Build the command dynamically so we pass only the envs you actually set
-    - >
-      CMD="k6 run scenarios/from-playwright.http.js
-      -e VUS=$VUS
-      -e ITERS=$ITERS";
-      if [ -n "$DURATION" ]; then CMD="$CMD -e DURATION=$DURATION"; fi;
-      if [ -n "$FEATURES" ]; then CMD="$CMD -e FEATURES=$FEATURES"; fi;
-      if [ -n "$ENDPOINTS" ]; then CMD="$CMD -e ENDPOINTS=$ENDPOINTS"; fi;
-      echo "▶ $CMD";
-      eval "$CMD"
+    - |
+      CMD="k6 run scenarios/from-playwright.http.js"
+      [ -n "$VUS" ] && CMD="$CMD -e VUS=$VUS"
+      [ -n "$ITERS" ] && CMD="$CMD -e ITERS=$ITERS"
+      [ -n "$DURATION" ] && CMD="$CMD -e DURATION=$DURATION"
+      [ -n "$FEATURES" ] && CMD="$CMD -e FEATURES=\"$FEATURES\""
+      [ -n "$ENDPOINTS" ] && CMD="$CMD -e ENDPOINTS=\"$ENDPOINTS\""
+
+      echo "🚀 Running K6 (features: ${FEATURES:-ALL}, endpoints: ${ENDPOINTS:-unset}, vus: ${VUS}, iters: ${ITERS}, duration: ${DURATION:-unset})"
+      $CMD
   artifacts:
     when: always
     expire_in: 7 days
@@ -148,40 +160,9 @@ k6_run:
       - perf/k6/reports/summary.json
   allow_failure: false
 
-# ==========================================================
-# Your existing workflow block (kept as in screenshot #4)
-# You can keep or tweak as you already use it to control runs.
-# ==========================================================
-workflow:
-  name: $PIPELINE_NAME
-  rules:
-    # Run pipeline only when explicitly triggered with variables
-    - if: '$CI_PIPELINE_SOURCE == "trigger" && $SOURCE_PROJECT_ID != null && $SOURCE_PROJECT_ID != ""'
-      when: always
-    # Skip all automatic tag-based pipeline runs
-    - if: '$CI_PIPELINE_SOURCE == "tag"'
-      when: never
-    # other cases (prod example in your file)
-    - if: '$TEST_ENV == "prod"'
-      variables:
-        PIPELINE_NAME: test_playwright_prod
-      when: always
 
 
-
-
-script:
-  - echo "🚀 Running K6..."
-  - cd perf/k6
-
-  # Build K6 command dynamically
-  - |
-    CMD="k6 run scenarios/from-playwright.http.js"
-    [ -n "$VUS" ] && CMD="$CMD -e VUS=$VUS"
-    [ -n "$ITERS" ] && CMD="$CMD -e ITERS=$ITERS"
-    [ -n "$DURATION" ] && CMD="$CMD -e DURATION=$DURATION"
-    [ -n "$FEATURES" ] && CMD="$CMD -e FEATURES=\"$FEATURES\""
-    [ -n "$ENDPOINTS" ] && CMD="$CMD -e ENDPOINTS=\"$ENDPOINTS\""
-
-    echo "🚀 Running K6 (features: ${FEATURES:-ALL}, endpoints: ${ENDPOINTS:-unset}, vus: ${VUS}, iters: ${ITERS}, duration: ${DURATION:-unset})"
-    $CMD
+# =====================================================================
+# ✅ ALL your existing Playwright + deployment jobs remain untouched
+# =====================================================================
+# (No need to paste the remaining part; your file continues below...)
