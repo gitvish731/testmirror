@@ -1,11 +1,8 @@
 # ==========================================================
 # SDLC AutoGov — Playwright → k6 pipeline (K6-first)
-# Keeps your includes; adds k6_gen & k6_run; simple workflow
+# Works without workflow.inputs; adds K6_PROFILE presets
 # ==========================================================
 
-# -------------------------------
-# Existing includes (unchanged)
-# -------------------------------
 include:
   - project: 'ubs-ag/gt/ise/devops-platforms/gitlab/devcloud-generic-templates/ci-templates'
     file:
@@ -15,15 +12,10 @@ include:
     file:
       - '/pipeline_templates/.sdlc.yml'
 
-# -------------------------------
-# Base image used by many existing jobs (unchanged)
-# -------------------------------
 image: container-registry.ubs.net/golang:1.21
 
-# -------------------------------
-# Global variables (consolidated)
-# -------------------------------
 variables:
+  # Infra / env
   GOPROXY: "https://nexus-tp.dev.sbsbank.com/repository/public-lib-golang_direct"
   GOSUMDB: "off"
   VAULT_SERVER_URL: "https://vault.eu.eva.ubsdev.net"
@@ -41,27 +33,27 @@ variables:
   GSNOW_SOAP_URL: "https://esnow.ubs.net/webservices/UBSChangeOperation.do?SOAP"
   GSNOW_SOAP_ACTION: "http://www.service-now.com/UBSChangeOperation/changeOperationRequest"
 
-  # --- K6 run-time knobs (these get overridden by Pipeline UI dropdowns) ---
-  FEATURES: ""
-  ENDPOINTS: ""
-  VUS: "1"
-  ITERS: "1"
-  DURATION: ""
+  # ---- K6 knobs (users can override in Run Pipeline → Variables) ----
   RUN_ONLY: "k6"
+  K6_PROFILE: "smoke"   # smoke | load | soak (used only if RUN_ONLY=k6)
+  FEATURES: ""          # e.g. ReportingAPIAlpha1 (blank = ALL features)
+  ENDPOINTS: ""         # CSV list (optional). If set, takes precedence over FEATURES.
+  VUS: ""               # if blank, defaults from profile (when RUN_ONLY=k6)
+  ITERS: ""             # if blank, defaults from profile (when RUN_ONLY=k6)
+  DURATION: ""          # if blank, defaults from profile (when RUN_ONLY=k6)
 
   K6_REPORT_DIR: "perf/k6/reports"
 
+  # Existing toggles (left intact)
   SKIP_GITLAB_WEBHOOK_TESTS: "true"
   SKIP_RLC_TESTS: "true"
 
+  # Misc
   MILESTONE_GROUP_ID: "497008"
   GROUP_ACCESS_TOKEN: "group_access_token_497008"
   DEPLOYMENT_PROJECT_PATH: "deploy/ts/application/it-development-and-quality-assurance/sdlc-auto-governance/config"
   ARTIFACT: "$ARTIFACT_NAME"
 
-# -------------------------------
-# Stages (add K6 stages + keep the rest)
-# -------------------------------
 stages:
   - fetch_milestone
   - k6_gen
@@ -91,12 +83,14 @@ k6_gen:
     - when: never
   script:
     - echo "▶ Generating K6 endpoints (from Playwright specs)…"
+    - node --version
     - node scripts/gen-k6-endpoints.js
   artifacts:
     when: always
     expire_in: 7 days
     paths:
       - perf/k6/sources/endpoints.byFeature.js
+  allow_failure: false
 
 # ==========================================================
 # STEP 2: Run the test
@@ -106,13 +100,6 @@ k6_run:
   image:
     name: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0
     entrypoint: [""]
-  variables:
-    RUN_ONLY: $[[ inputs.RUN_ONLY ]]
-    FEATURES: $[[ inputs.FEATURES ]]
-    ENDPOINTS: $[[ inputs.ENDPOINTS ]]
-    VUS: $[[ inputs.VUS ]]
-    ITERS: $[[ inputs.ITERS ]]
-    DURATION: $[[ inputs.DURATION ]]
   rules:
     - if: '$RUN_ONLY == "k6"'
       when: always
@@ -122,18 +109,55 @@ k6_run:
   needs: ["k6_gen"]
   script:
     - echo "🚀 Running K6…"
-    - mkdir -p perf/k6/reports
+    - mkdir -p "$K6_REPORT_DIR"
 
-    # export runtime knobs for k6
-    - export VUS="${VUS:-1}"
-    - export ITERS="${ITERS:-1}"
-    - if [ -n "${DURATION:-}" ];  then export DURATION="$DURATION"; fi
-    - if [ -n "${FEATURES:-}" ];  then export FEATURES="$FEATURES"; fi
-    - if [ -n "${ENDPOINTS:-}" ]; then export ENDPOINTS="$ENDPOINTS"; fi
+    # ---- Profile-based defaults (only when RUN_ONLY=k6) ----
+    - |
+      if [ "${RUN_ONLY,,}" = "k6" ]; then
+        # Apply profile defaults only if user left fields blank
+        case "${K6_PROFILE,,}" in
+          smoke)
+            : "${VUS:=2}"
+            : "${ITERS:=2}"
+            : "${DURATION:=}"    # blank => use ITERS
+            ;;
+          load)
+            : "${VUS:=10}"
+            : "${ITERS:=}"       # use duration for load by default
+            : "${DURATION:=5m}"
+            ;;
+          soak)
+            : "${VUS:=5}"
+            : "${ITERS:=}"
+            : "${DURATION:=15m}"
+            ;;
+          *)
+            : "${VUS:=2}"
+            : "${ITERS:=2}"
+            : "${DURATION:=}"
+            ;;
+        esac
+        # FEATURES defaults: blank => run ALL via endpoints.byFeature.js
+        : "${FEATURES:=}"
+      fi
 
+    # Export runtime knobs for k6 (__ENV.*)
+    - export FEATURES ENDPOINTS VUS ITERS DURATION K6_REPORT_DIR K6_PROFILE RUN_ONLY
+
+    - echo "▶ Effective settings:"
+    - echo "   RUN_ONLY   = ${RUN_ONLY}"
+    - echo "   K6_PROFILE = ${K6_PROFILE}"
+    - echo "   FEATURES   = ${FEATURES:-<ALL>}"
+    - echo "   ENDPOINTS  = ${ENDPOINTS:-<none>}"
+    - echo "   VUS        = ${VUS}"
+    - echo "   ITERS      = ${ITERS:-<unset>}"
+    - echo "   DURATION   = ${DURATION:-<unset>}"
+    - echo "   REPORT_DIR = ${K6_REPORT_DIR}"
+
+    # Run from repo root using full script path
     - k6 run perf/k6/scenarios/from-playwright.http.js
 
-    - ls -lah perf/k6/reports || true
+    - ls -lah "$K6_REPORT_DIR" || true
   artifacts:
     when: always
     expire_in: 7 days
@@ -142,55 +166,11 @@ k6_run:
       - perf/k6/reports/**/*
       - perf/k6/reports/summary.html
       - perf/k6/reports/summary.json
+  allow_failure: false
 
 # ==========================================================
-# WORKFLOW (Run Pipeline dropdown inputs — MUST BE LAST)
+# FINAL WORKFLOW — simple rules (NO inputs)
 # ==========================================================
 workflow:
   rules:
     - when: always
-
-  inputs:
-    RUN_ONLY:
-      type: string
-      description: "Choose what to run"
-      default: "k6"
-      options: ["k6", "everything"]
-
-    FEATURES:
-      type: string
-      description: "Pick one feature (blank = ALL). For multiple, pass CSV"
-      default: ""
-      options:
-        - ""
-        - "ArtifactsRegistrationV1Alpha1"
-        - "CollectorV1Alpha1"
-        - "DeploymentAPI"
-        - "GrafeasLogin"
-        - "GrafeasV1Beta1"
-        - "ReportingAPIAlpha1"
-        - "ReportingAPIBeta1"
-        - "Verifier"
-
-    ENDPOINTS:
-      type: string
-      description: "Optional: run specific endpoint(s) via CSV"
-      default: ""
-
-    VUS:
-      type: number
-      description: "Virtual Users"
-      default: 1
-      options: [1, 2, 5, 10, 25, 50]
-
-    ITERS:
-      type: number
-      description: "Iterations per VU (ignored if DURATION is set)"
-      default: 1
-      options: [1, 5, 10, 25, 50, 100]
-
-    DURATION:
-      type: string
-      description: "Optional duration (overrides ITERS)"
-      default: ""
-      options: ["", "30s", "1m", "5m", "15m"]
