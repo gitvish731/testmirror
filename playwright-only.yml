@@ -1,0 +1,22 @@
+# Child pipeline: PLAYWRIGHT ONLY
+include:
+  - project: 'ubs-ag/gt/ise/devops-platforms/gitlab/devcloud-generic-templates/ci-templates'
+    file: 'gitlab-pipeline/.ci_id_tokens.yml'
+    ref: main
+  - project: 'ubs/gcto/gcto/dev-platform-eng-excellence/software-engineering-platform/sdlc-auto-governance/templates'
+    file: '/pipeline_templates/.sdlc.yml'
+
+  # keep only the local files that define PW jobs; omit k6 files
+  - local: '.gitlab/ci/1_fetch_milestone.yml'
+  - local: '.gitlab/ci/2_deploy_uat.yml'
+  - local: '.gitlab/ci/3_prepare_test.yml'
+  - local: '.gitlab/ci/4_e2e_test.yml'
+  - local: '.gitlab/ci/5_test_report_automation.yml'
+  - local: '.gitlab/ci/6_change_automation.yml'
+  - local: '.gitlab/ci/7_deploy_prod.yml'
+  - local: '.gitlab/ci/8_post_prod_deploy.yml'
+  - local: '.gitlab/ci/9_pages.yml'
+
+workflow:
+  rules:
+    - when: always
