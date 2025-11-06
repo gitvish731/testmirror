@@ -1,0 +1,89 @@
+script:
+  - echo "🚀 Running K6…"
+  - mkdir -p "$K6_REPORT_DIR"
+
+  # --- Profile defaults (only if user left things blank) ---
+  - |
+    case "${K6_PROFILE,,}" in
+      smoke) : "${VUS:=2}";  : "${ITERS:=}";   : "${DURATION:=}";;
+      load)  : "${VUS:=25}"; : "${ITERS:=}";   : "${DURATION:=5m}";;
+      soak)  : "${VUS:=5}";  : "${ITERS:=}";   : "${DURATION:=15m}";;
+      *)     : "${VUS:=2}";  : "${ITERS:=}";   : "${DURATION:=}";;
+    esac
+
+  # --- Environment selection for K6 only (DEV_URL / UAT_URL) ---
+  - |
+    if [ "${K6_ENV}" = "DEV" ]; then
+      BASE_URL="${DEV_URL}"
+    else
+      BASE_URL="${UAT_URL}"
+    fi
+
+  # --- Force duration precedence: if DURATION is set, drop ITERS no matter what ---
+  - |
+    if [ -n "${DURATION}" ]; then
+      unset ITERS
+      echo "🔧 Unsetting ITERS because DURATION=${DURATION} is set"
+    fi
+
+  # --- Export only after we finalized values ---
+  - export BASE_URL FEATURES ENDPOINTS VUS ITERS DURATION K6_REPORT_DIR K6_PROFILE RUN_ONLY K6_ENV
+
+  - echo "▶ Effective settings:"
+  - echo "   K6_ENV     = ${K6_ENV}"
+  - echo "   BASE_URL   = ${BASE_URL}"
+  - echo "   RUN_ONLY   = ${RUN_ONLY}"
+  - echo "   K6_PROFILE = ${K6_PROFILE}"
+  - echo "   FEATURES   = ${FEATURES:-<ALL>}"
+  - echo "   ENDPOINTS  = ${ENDPOINTS:-<none>}"
+  - echo "   VUS        = ${VUS}"
+  - echo "   ITERS      = ${ITERS:-<unset>}"
+  - echo "   DURATION   = ${DURATION:-<unset>}"
+  - echo "   REPORT_DIR = ${K6_REPORT_DIR}"
+
+  # --- Run the test ---
+  - k6 run perf/k6/scenarios/from-playwright.http.js
+
+  # --- Show outputs for debugging ---
+  - ls -lah "$K6_REPORT_DIR" || true
+
+
+
+***********************************
+
+
+import http from "k6/http";
+import { sleep } from "k6";
+import endpoints from "../sources/endpoints.byFeature.js";
+import { handleSummary } from "../vendor/handleSummary.js"; // if you use this
+
+// ===== Env knobs from CI (all strings) =====
+const BASE_URL  = (__ENV.BASE_URL || "").trim();     // injected by CI from DEV_URL/UAT_URL
+const VUS       = Number((__ENV.VUS || "1").trim());
+const DURATION  = (__ENV.DURATION || "").trim();     // e.g., "5m" or ""
+const ITERS_RAW = (__ENV.ITERS || "").trim();        // "", "10", ...
+const ITERS     = ITERS_RAW === "" ? 0 : Number(ITERS_RAW);
+
+// ===== URL helper: prefix/replace host with BASE_URL =====
+function withBase(u) {
+  if (!BASE_URL) return u;                           // fallback: no change
+  if (/^https?:\/\//i.test(u)) {                     // absolute URL → replace host
+    return u.replace(/^https?:\/\/[^/]+/i, `https://${BASE_URL}`);
+  }
+  const path = u.startsWith("/") ? u : `/${u}`;      // relative path → prefix base
+  return `https://${BASE_URL}${path}`;
+}
+
+// ===== Execution policy (DURATION wins over ITERS) =====
+export const options = DURATION
+  ? { vus: VUS, duration: DURATION }
+  : (ITERS > 0
+      ? { vus: VUS, iterations: ITERS }
+      : { vus: VUS, iterations: 1 }                 // default smoke
+    );
+
+// IMPORTANT: ensure there is NO 'export const scenarios = { per-vu-iterations ... }' below.
+// That would override 'options' and re-introduce iterations=0.
+
+
+
