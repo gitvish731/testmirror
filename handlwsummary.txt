@@ -1,6 +1,6 @@
 # ==========================================================
 # SDLC AutoGov — Playwright → k6 pipeline (K6-first)
-# Works without workflow.inputs; adds K6_PROFILE presets
+# Uses top-level structured variables to populate Run UI
 # ==========================================================
 
 include:
@@ -15,7 +15,9 @@ include:
 image: container-registry.ubs.net/golang:1.21
 
 variables:
-  # Infra / env
+  # -------------------------------
+  # Infra / env (unchanged)
+  # -------------------------------
   GOPROXY: "https://nexus-tp.dev.sbsbank.com/repository/public-lib-golang_direct"
   GOSUMDB: "off"
   VAULT_SERVER_URL: "https://vault.eu.eva.ubsdev.net"
@@ -33,22 +35,53 @@ variables:
   GSNOW_SOAP_URL: "https://esnow.ubs.net/webservices/UBSChangeOperation.do?SOAP"
   GSNOW_SOAP_ACTION: "http://www.service-now.com/UBSChangeOperation/changeOperationRequest"
 
-  # ---- K6 knobs (users can override in Run Pipeline → Variables) ----
-  RUN_ONLY: "k6"
-  K6_PROFILE: "smoke"   # smoke | load | soak (used only if RUN_ONLY=k6)
-  FEATURES: ""          # e.g. ReportingAPIAlpha1 (blank = ALL features)
-  ENDPOINTS: ""         # CSV list (optional). If set, takes precedence over FEATURES.
-  VUS: ""               # if blank, defaults from profile (when RUN_ONLY=k6)
-  ITERS: ""             # if blank, defaults from profile (when RUN_ONLY=k6)
-  DURATION: ""          # if blank, defaults from profile (when RUN_ONLY=k6)
+  # -------------------------------
+  # Playwright toggles (as in your original)
+  # These render in the Run UI with a true/false picker
+  # -------------------------------
+  SKIP_GITLAB_WEBHOOK_TESTS:
+    value: "true"
+    options: ["false", "true"]
+    description: "Skip GitLab webhook integration tests in preprod environment"
+  SKIP_RLC_TESTS:
+    value: "true"
+    options: ["false", "true"]
+    description: "Skip SDLC release checker integration tests in preprod environment"
 
+  # -------------------------------
+  # K6 controls (structured → appear in Run UI)
+  # -------------------------------
+  RUN_ONLY:
+    value: "k6"
+    options: ["k6", "everything"]
+    description: "Choose 'k6' for k6-only runs, 'everything' to allow full pipeline"
+  K6_PROFILE:
+    value: "smoke"
+    options: ["smoke", "load", "soak"]
+    description: "Preset for VUS/ITERS/DURATION when RUN_ONLY=k6 (can be overridden)"
+  FEATURES:
+    value: ""
+    description: "Pick one feature (blank = ALL). CSV allowed to run multiple."
+  ENDPOINTS:
+    value: ""
+    description: "Optional: specific endpoint names as CSV. If set, takes precedence over FEATURES."
+  VUS:
+    value: "2"
+    options: ["1", "2", "5", "10", "25", "50"]
+    description: "Virtual users (override profile default if desired)"
+  ITERS:
+    value: "2"
+    options: ["1", "2", "5", "10", "25", "50", "100"]
+    description: "Iterations per VU (ignored if DURATION is set)"
+  DURATION:
+    value: ""
+    options: ["", "30s", "1m", "5m", "15m"]
+    description: "Optional duration (overrides ITERS when set)"
+
+  # Reports dir for k6 handleSummary
   K6_REPORT_DIR: "perf/k6/reports"
 
-  # Existing toggles (left intact)
-  SKIP_GITLAB_WEBHOOK_TESTS: "true"
-  SKIP_RLC_TESTS: "true"
-
-  # Misc
+  # Misc (unchanged)
   MILESTONE_GROUP_ID: "497008"
   GROUP_ACCESS_TOKEN: "group_access_token_497008"
   DEPLOYMENT_PROJECT_PATH: "deploy/ts/application/it-development-and-quality-assurance/sdlc-auto-governance/config"
@@ -80,6 +113,8 @@ k6_gen:
       when: always
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: always
+    - if: '$CI_PIPELINE_SOURCE == "pipeline"'
+      when: always
     - when: never
   script:
     - echo "▶ Generating K6 endpoints (from Playwright specs)…"
@@ -90,10 +125,9 @@ k6_gen:
     expire_in: 7 days
     paths:
       - perf/k6/sources/endpoints.byFeature.js
-  allow_failure: false
 
 # ==========================================================
-# STEP 2: Run the test
+# STEP 2: Run the test (uses structured vars above)
 # ==========================================================
 k6_run:
   stage: k6_run
@@ -105,43 +139,26 @@ k6_run:
       when: always
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: always
+    - if: '$CI_PIPELINE_SOURCE == "pipeline"'
+      when: always
     - when: never
   needs: ["k6_gen"]
   script:
     - echo "🚀 Running K6…"
     - mkdir -p "$K6_REPORT_DIR"
 
-    # ---- Profile-based defaults (only when RUN_ONLY=k6) ----
+    # Profile-based defaults only if RUN_ONLY=k6 (users can override via UI)
     - |
       if [ "${RUN_ONLY,,}" = "k6" ]; then
-        # Apply profile defaults only if user left fields blank
         case "${K6_PROFILE,,}" in
-          smoke)
-            : "${VUS:=2}"
-            : "${ITERS:=2}"
-            : "${DURATION:=}"    # blank => use ITERS
-            ;;
-          load)
-            : "${VUS:=10}"
-            : "${ITERS:=}"       # use duration for load by default
-            : "${DURATION:=5m}"
-            ;;
-          soak)
-            : "${VUS:=5}"
-            : "${ITERS:=}"
-            : "${DURATION:=15m}"
-            ;;
-          *)
-            : "${VUS:=2}"
-            : "${ITERS:=2}"
-            : "${DURATION:=}"
-            ;;
+          smoke) : "${VUS:=2}";  : "${ITERS:=2}";  : "${DURATION:=}";;
+          load)  : "${VUS:=10}"; : "${ITERS:=}";   : "${DURATION:=5m}";;
+          soak)  : "${VUS:=5}";  : "${ITERS:=}";   : "${DURATION:=15m}";;
+          *)     : "${VUS:=2}";  : "${ITERS:=2}";  : "${DURATION:=}";;
         esac
-        # FEATURES defaults: blank => run ALL via endpoints.byFeature.js
-        : "${FEATURES:=}"
+        : "${FEATURES:=}"  # blank => run ALL via endpoints.byFeature.js
       fi
 
-    # Export runtime knobs for k6 (__ENV.*)
     - export FEATURES ENDPOINTS VUS ITERS DURATION K6_REPORT_DIR K6_PROFILE RUN_ONLY
 
     - echo "▶ Effective settings:"
@@ -154,7 +171,6 @@ k6_run:
     - echo "   DURATION   = ${DURATION:-<unset>}"
     - echo "   REPORT_DIR = ${K6_REPORT_DIR}"
 
-    # Run from repo root using full script path
     - k6 run perf/k6/scenarios/from-playwright.http.js
 
     - ls -lah "$K6_REPORT_DIR" || true
@@ -166,11 +182,7 @@ k6_run:
       - perf/k6/reports/**/*
       - perf/k6/reports/summary.html
       - perf/k6/reports/summary.json
-  allow_failure: false
 
-# ==========================================================
-# FINAL WORKFLOW — simple rules (NO inputs)
-# ==========================================================
 workflow:
   rules:
     - when: always
