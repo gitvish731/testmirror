@@ -1,0 +1,41 @@
+// ===== Env knobs from CI =====
+const BASE_URL  = (__ENV.BASE_URL || "").trim();    // set in CI from K6_ENV → DEV_URL/UAT_URL
+const VUS       = Number((__ENV.VUS || "1").trim());
+const DURATION  = (__ENV.DURATION || "").trim();    // e.g. "5m" or ""
+const ITERS_RAW = (__ENV.ITERS || "").trim();       // "", "10", ...
+const ITERS     = ITERS_RAW === "" ? 0 : Number(ITERS_RAW);
+
+// ===== URL helper: prefix/replace host with BASE_URL =====
+function withBase(u) {
+  if (!BASE_URL) return u;                          // fallback: no change
+  if (/^https?:\/\//i.test(u)) {                    // absolute URL → replace host
+    return u.replace(/^https?:\/\/[^/]+/i, `https://${BASE_URL}`);
+  }
+  const path = u.startsWith("/") ? u : `/${u}`;     // relative path → prefix base
+  return `https://${BASE_URL}${path}`;
+}
+
+// ===== Execution policy (duration wins over iterations) =====
+export const options = DURATION
+  ? { vus: VUS, duration: DURATION, thresholds: {} }               // duration mode
+  : (ITERS > 0
+      ? { vus: VUS, iterations: ITERS, thresholds: {} }            // iterations mode
+      : { vus: VUS, iterations: 1, thresholds: {} }                // default smoke
+    );
+
+
+
+
+
+// before your try { ... } block that calls http.get/http.request:
+const url = withBase(ep.url);
+
+try {
+  if (ep.method === "GET") {
+    res = http.get(url, params);                  // use resolved URL
+  } else {
+    res = http.request(ep.method, url, null, params);
+  }
+} catch (e) {
+  // ... your existing error handling
+}
