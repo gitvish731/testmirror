@@ -9,3 +9,16 @@ function withBase(u) {
   const path = u.startsWith("/") ? u : `/${u}`;                    // relative path: prefix base
   return `https://${BASE_URL}${path}`;
 }
+
+
+
+
+
+- |
+  # --- Environment selection for K6 only (using DEV_URL / UAT_URL) ---
+  if [ "${K6_ENV}" = "DEV" ]; then
+    export BASE_URL="${DEV_URL}"
+  else
+    export BASE_URL="${UAT_URL}"
+  fi
+  echo "🌍 K6_ENV=${K6_ENV} → BASE_URL=${BASE_URL}"
