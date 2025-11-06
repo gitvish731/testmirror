@@ -1,0 +1,51 @@
+# Child pipeline: K6 ONLY
+image: container-registry.ubs.net/golang:1.21
+variables:
+  RUN_ONLY: "k6"
+  K6_PROFILE: "${K6_PROFILE:-smoke}"
+  FEATURES: "${FEATURES:-}"
+  ENDPOINTS: "${ENDPOINTS:-}"
+  VUS: "${VUS:-}"
+  ITERS: "${ITERS:-}"
+  DURATION: "${DURATION:-}"
+  K6_REPORT_DIR: "perf/k6/reports"
+
+stages: [k6_gen, k6_run]
+
+k6_gen:
+  stage: k6_gen
+  image: container-registry.ubs.net/ubs/gctojanus/devops/runner/nodejs18:1.0.232.215036
+  script: [ 'node scripts/gen-k6-endpoints.js' ]
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths: [ 'perf/k6/sources/endpoints.byFeature.js' ]
+
+k6_run:
+  stage: k6_run
+  image:
+    name: container-registry.ubs.net/ubs/gctojanus/devpod-k6:0.46.0
+    entrypoint: [""]
+  needs: [ "k6_gen" ]
+  script:
+    - mkdir -p "$K6_REPORT_DIR"
+    - |
+      case "${K6_PROFILE,,}" in
+        smoke) : "${VUS:=2}";  : "${ITERS:=2}";  : "${DURATION:=}";;
+        load)  : "${VUS:=10}"; : "${ITERS:=}";   : "${DURATION:=5m}";;
+        soak)  : "${VUS:=5}";  : "${ITERS:=}";   : "${DURATION:=15m}";;
+      esac
+      : "${FEATURES:=}"
+    - export FEATURES ENDPOINTS VUS ITERS DURATION K6_REPORT_DIR
+    - k6 run perf/k6/scenarios/from-playwright.http.js
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - perf/k6/reports/
+      - perf/k6/reports/**/*
+      - perf/k6/reports/summary.html
+      - perf/k6/reports/summary.json
+
+workflow:
+  rules: [ { when: always } ]
