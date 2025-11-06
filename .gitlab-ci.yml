@@ -1,0 +1,37 @@
+# …(your existing header, variables, and k6 jobs stay as-is)
+
+# Single workflow (keep one)
+workflow:
+  name: $PIPELINE_NAME
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "tag"'
+      when: never
+    - when: always
+
+stages:
+  - launch
+  - k6_gen
+  - k6_run
+  # …(your other stages)
+
+# Manual buttons (no template contamination)
+playwright_only:
+  stage: launch
+  when: manual
+  trigger:
+    project: $CI_PROJECT_PATH
+    branch: $CI_COMMIT_REF_NAME
+    strategy: depend
+  variables:
+    CI_CONFIG_PATH: ".gitlab/ci/playwright-only.yml"
+
+k6_only_smoke:
+  stage: launch
+  when: manual
+  trigger:
+    project: $CI_PROJECT_PATH
+    branch: $CI_COMMIT_REF_NAME
+    strategy: depend
+  variables:
+    CI_CONFIG_PATH: ".gitlab/ci/k6-only.yml"
+    K6_PROFILE: "smoke"
