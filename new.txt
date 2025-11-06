@@ -1,0 +1,11 @@
+const BASE_URL = __ENV.BASE_URL || "";
+
+// Resolves relative or absolute URLs to the chosen environment host
+function withBase(u) {
+  if (!BASE_URL) return u;                                         // fallback: no change
+  if (/^https?:\/\//i.test(u)) {                                   // absolute URL: replace host
+    return u.replace(/^https?:\/\/[^/]+/i, `https://${BASE_URL}`);
+  }
+  const path = u.startsWith("/") ? u : `/${u}`;                    // relative path: prefix base
+  return `https://${BASE_URL}${path}`;
+}
