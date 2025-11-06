@@ -39,3 +39,13 @@ try {
 } catch (e) {
   // ... your existing error handling
 }
+
+
+
+
+- |
+  # --- Force duration-mode precedence: if DURATION is set, drop ITERS no matter what ---
+  if [ -n "${DURATION}" ]; then
+    unset ITERS
+    echo "🔧 Unsetting ITERS because DURATION=${DURATION} is set"
+  fi
